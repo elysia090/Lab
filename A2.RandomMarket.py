@@ -1,3 +1,4 @@
+#完全なランダムver
 import numpy as np
 import matplotlib.pyplot as plt
 
