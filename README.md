@@ -24,7 +24,7 @@
 
 
 
-#### A2 RandomMarket.py　完全な市場ランダムver
+#### A2 `RandomMarket.py`　完全な市場ランダムver
 
 この `RandomMarket.py` ファイルは、完全にランダムな市場のモデリングとシミュレーションを行うためのPythonコードです。
 以下に、`MarketModel.py` との違いを示します。
@@ -44,7 +44,7 @@
 
 
 
-#### A3 Simulated Price.py
+#### A3 `Simulated Price.py`
 
 1. **MarketModelクラス**:
     - マーケットモデルを表すクラスです。
