@@ -1,4 +1,4 @@
-#完全なランダムver
+#完全な市場ランダムver
 import numpy as np
 import matplotlib.pyplot as plt
 
