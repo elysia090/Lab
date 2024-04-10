@@ -1,0 +1,82 @@
+import pandas as pd
+import random
+import torch
+import os
+import contextlib
+from gemma.config import get_config_for_2b, get_config_for_7b
+from gemma.model import GemmaForCausalLM
+import sys
+
+# Add Gemma path
+sys.path.append("/kaggle/working/gemma_pytorch/") 
+
+# Load Gemma tokenizer
+from gemma.tokenizer import Tokenizer
+
+# Load forum messages data
+forum_messages_df = pd.read_csv('/kaggle/input/meta-kaggle/ForumMessages.csv')
+
+# Select first 5 messages for testing
+original_texts = forum_messages_df['Message'][:5]
+
+# Rewrite prompts
+rewrite_prompts = [
+    'Explain this to me like I\'m five.',
+    'Convert this into a sea shanty.',
+    'Make this rhyme.',
+]
+
+# Set up Gemma model
+VARIANT = "7b-it-quant" 
+MACHINE_TYPE = "cuda" 
+weights_dir = '/kaggle/input/gemma/pytorch/7b-it-quant/2' 
+
+# Context manager to set default tensor type
+@contextlib.contextmanager
+def _set_default_tensor_type(dtype: torch.dtype):
+    torch.set_default_dtype(dtype)
+    yield
+    torch.set_default_dtype(torch.float)
+
+# Model Config.
+model_config = get_config_for_2b() if "2b" in VARIANT else get_config_for_7b()
+model_config.tokenizer = os.path.join(weights_dir, "tokenizer.model")
+model_config.quant = "quant" in VARIANT
+
+# Model.
+device = torch.device(MACHINE_TYPE)
+with _set_default_tensor_type(model_config.get_dtype()):
+    model = GemmaForCausalLM(model_config)
+    ckpt_path = os.path.join(weights_dir, f'gemma-{VARIANT}.ckpt')
+    model.load_weights(ckpt_path)
+    model = model.to(device).eval()
+
+# Generate rewritten texts
+rewrite_data = []
+
+for original_text in original_texts:
+    rewrite_prompt = random.choice(rewrite_prompts)
+    prompt = f'{rewrite_prompt}\n{original_text}'
+    
+    # Generate rewritten text
+    with torch.no_grad():
+        rewritten_tokens = model.generate(
+            f'<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n',
+            device=device,
+            output_len=100,
+        )
+    
+    # Decode token IDs to text
+    rewritten_text = model.tokenizer.decode(rewritten_tokens.tolist()[0])
+
+    rewrite_data.append({
+        'original_text': original_text,
+        'rewrite_prompt': rewrite_prompt,
+        'rewritten_text': rewritten_text,
+    })
+
+# Convert generated data into a DataFrame
+rewrite_data_df = pd.DataFrame(rewrite_data)
+
+# Print the first row to check if it makes sense
+print(rewrite_data_df[:1].values)
