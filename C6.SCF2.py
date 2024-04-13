@@ -24,7 +24,7 @@ class StateSpaceModel:
         self.ma_params = ma_params
 
     def state_transition_function(self, state):
-        return np.dot(self.ar_params, state[-len(self.ar_params):]) + np.dot(self.ma_params, state[-len(self.ma_params):])
+        return np.dot(self.ar_params, state)
 
 class ExtendedKalmanFilter:
     def __init__(self, state_space_model, process_noise_cov):
@@ -76,15 +76,31 @@ def preprocess_data(file_path, columns):
         print(f"Error reading file {file_path}: {e}")
         return None
 
+def calculate_feature_importance(obs_data):
+    # 外部要因同士の相関行列を計算
+    correlation_matrix = np.corrcoef([obs_data[i].iloc[:, 1] for i in range(len(obs_data))])
+    # 各外部要因の重要度を計算（相関係数の絶対値の平均）
+    feature_importance = np.mean(np.abs(correlation_matrix), axis=1)
+    return feature_importance
+
+def auto_adjust_weights(obs_data):
+    # 外部要因の重要度を計算
+    feature_importance = calculate_feature_importance(obs_data)
+    # 重要度を基に、各外部要因に対する重みを決定
+    total_importance = np.sum(feature_importance)
+    weights = feature_importance / total_importance
+    return weights
+
 def initialize_models(train_data, obs_data):
-    state_space_model = StateSpaceModel([], [])  # No ARIMA parameters
+    state_space_model = StateSpaceModel([], [])  # ARIMA パラメータ不要
     initial_state = np.zeros(len(train_data.columns) + len(obs_data))
     initial_state_cov = np.eye(len(initial_state))
     process_noise_cov = np.eye(len(initial_state))
     ekf = ExtendedKalmanFilter(state_space_model, process_noise_cov)
     ekf.initialize(initial_state, initial_state_cov)
-    beta = np.ones(len(obs_data))  # Assume equal weights for all external factors initially
-    cwlem = CWLEM(beta)
+    # 自動で重み付けを調整
+    weights = auto_adjust_weights(obs_data)
+    cwlem = CWLEM(weights)
     return ekf, cwlem
 
 def main():
