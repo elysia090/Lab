@@ -41,3 +41,40 @@ if np.allclose(left_result, right_result):
     print("左辺と右辺が等しい：", left_result)
 else:
     print("左辺と右辺が等しくない")
+
+
+
+import numpy as np
+
+# 目的関数
+def objective_function(A, B):
+    return np.sum(A), -np.sum(B)  # Bを最小化するために符号を反転
+
+# 制約条件
+def constraint(A, B):
+    return np.sum(A) <= 10
+
+# 行列の集合
+matrix_set = [np.array([[1, 2], [3, 4]]), np.array([[2, 3], [4, 5]]), np.array([[3, 4], [5, 6]])]
+
+# 目的関数と制約条件を満たす最適な A と B を見つける
+best_A = None
+best_B = None
+max_objective_value_A = -np.inf
+min_objective_value_B = np.inf
+
+for A in matrix_set:
+    for B in matrix_set:
+        # 制約条件を満たすかどうかを確認
+        if constraint(A, B):
+            # 目的関数を計算
+            objective_value_A, objective_value_B = objective_function(A, B)
+            # 目的関数を最大化する A と最小化する B を更新
+            if objective_value_A > max_objective_value_A:
+                max_objective_value_A = objective_value_A
+                best_A = A
+                best_B = B
+
+print("最適な A:", best_A)
+print("最適な B:", best_B)
+
