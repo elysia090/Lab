@@ -78,3 +78,43 @@ for A in matrix_set:
 print("最適な A:", best_A)
 print("最適な B:", best_B)
 
+
+
+import numpy as np
+
+# 目的関数
+def objective_function(A, B):
+    return np.sum(A) + np.sum(B)
+
+# 制約条件
+def constraint_1(A, B):
+    return np.sum(A) + np.sum(B) <= 50
+
+def constraint_2(A, B):
+    return np.sum(A @ B) >= 100
+
+# 行列の集合
+matrix_set = [np.array([[1, 2], [3, 4]]), np.array([[2, 3], [4, 5]]), np.array([[3, 4], [5, 6]])]
+
+# 最適な A と B を見つける
+best_A = None
+best_B = None
+max_objective_value = -np.inf
+
+for A in matrix_set:
+    for B in matrix_set:
+        # 制約条件を満たすかどうかを確認
+        if constraint_1(A, B) and constraint_2(A, B):
+            # 目的関数を計算
+            objective_value = objective_function(A, B)
+            # 目的関数を最大化する A と B を更新
+            if objective_value > max_objective_value:
+                max_objective_value = objective_value
+                best_A = A
+                best_B = B
+
+print("最適な A:", best_A)
+print("最適な B:", best_B)
+print("目的関数の値:", max_objective_value)
+
+
