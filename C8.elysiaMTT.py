@@ -25,13 +25,16 @@ class FeatureImportanceCalculator:
             df = pd.concat([train_data] + obs_data, axis=1)
             df = df.loc[:, ~df.columns.duplicated()]
 
-            # Convert date column to numerical feature
-            df['date'] = pd.to_datetime(df['date']).dt.dayofyear
+            # Convert date column to datetime
+            if 'date' in df.columns:
+                if pd.api.types.is_string_dtype(df['date']):
+                    df['date'] = pd.to_datetime(df['date'])
 
-            # Check for NaN or missing values
-            if df.isnull().values.any():
-                print("Warning: Data contains NaN or missing values.")
-                return None
+            # Convert date column to numerical feature
+            df['date'] = df['date'].dt.dayofyear
+
+            # Handle missing values
+            df.dropna(inplace=True)
 
             # Compute correlation matrix
             correlation_matrix = df.corr()
@@ -47,6 +50,8 @@ class FeatureImportanceCalculator:
         except Exception as e:
             print("Error calculating feature importance:", e)
             return None
+
+
 
 class StateSpaceModel:
     def __init__(self, ar_params, ma_params):
@@ -64,8 +69,8 @@ class ExtendedKalmanFilter:
         self.state_covariance = None
 
     def initialize(self, initial_state, initial_state_cov):
-        self.state_estimation = initial_state
-        self.state_covariance = initial_state_cov
+        self.state_estimation = initial_state.astype(float)
+        self.state_covariance = initial_state_cov.astype(float)
 
     def predict(self, external_factors):
         predicted_state = self.state_space_model.state_transition_function(self.state_estimation)
@@ -82,10 +87,10 @@ class ExtendedKalmanFilter:
 
 class CWLEM:
     def __init__(self, beta):
-        self.beta = beta
+        self.beta = beta.astype(float)
 
     def predict(self, external_factors):
-        return np.dot(external_factors, self.beta)
+        return np.dot(external_factors.astype(float), self.beta)
 
 class PerformanceEvaluator:
     @staticmethod
@@ -105,14 +110,20 @@ def main():
 
     if train_data is not None and all(obs is not None for obs in obs_data):
         try:
+            print("Calculating feature importance...")
             feature_importance = FeatureImportanceCalculator.calculate_feature_importance(train_data, obs_data)
             if feature_importance is not None:
+                print("Feature importance calculation successful.")
+
+                # Initialize Extended Kalman Filter
                 state_space_model = StateSpaceModel([], [])  # ARIMA parameters not required
                 initial_state = np.zeros(len(train_data.columns) + len(obs_data))
                 initial_state_cov = np.eye(len(initial_state))
                 process_noise_cov = np.eye(len(initial_state))
                 ekf = ExtendedKalmanFilter(state_space_model, process_noise_cov)
                 ekf.initialize(initial_state, initial_state_cov)
+
+                # Initialize CWLEM for sales prediction
                 cwlem = CWLEM(feature_importance)
 
                 predicted_sales = []
@@ -124,8 +135,10 @@ def main():
                     ekf.update(observation)
                     predicted_sales.append(ekf.state_estimation[-1])
 
+                # Evaluate performance
                 rmsle = PerformanceEvaluator.calculate_rmsle(predicted_sales, true_sales)
                 print("RMSLE:", rmsle)
+
             else:
                 print("Feature importance calculation failed.")
         except Exception as e:
@@ -135,6 +148,10 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
 
 
 
