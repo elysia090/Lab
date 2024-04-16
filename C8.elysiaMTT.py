@@ -17,72 +17,35 @@ class DataLoader:
             print(f"Error reading file {file_path}: {e}")
             return None
 
-class DataProcessor:
-    @staticmethod
-    def align_time_periods(data):
-        try:
-            for i, df in enumerate(data):
-                if not isinstance(df.index, pd.DatetimeIndex):
-                    df['date'] = pd.to_datetime(df['date'])
-                    df.set_index('date', inplace=True)
-                    data[i] = df
-
-            common_start_date = max(df.index[0] for df in data)
-            common_end_date = min(df.index[-1] for df in data)
-            filtered_data = []
-            for df in data:
-                df = df.loc[common_start_date:common_end_date]
-                df = df.resample('D').mean().interpolate()  # Interpolate missing values
-                filtered_data.append(df)
-
-            return filtered_data
-        except Exception as e:
-            print("Error aligning time periods:", e)
-            return None
-
-    @staticmethod
-    def calculate_correlation_matrix(data):
-        try:
-            correlation_matrices = []
-            for df in data:
-                correlation_matrix = df.corr()
-                correlation_matrices.append(correlation_matrix)
-            return correlation_matrices
-        except Exception as e:
-            print("Error calculating correlation matrix:", e)
-            return None
-
-    @staticmethod
-    def extract_feature_importance(correlation_matrices):
-        try:
-            feature_importance = []
-            for matrix in correlation_matrices:
-                if matrix is not None and not matrix.empty:
-                    importance = matrix.iloc[0].abs()
-                    importance /= importance.sum()
-                    feature_importance.append(importance.values)
-                else:
-                    print("Correlation matrix is empty.")
-                    feature_importance.append(None)
-            return feature_importance
-        except Exception as e:
-            print("Error extracting feature importance:", e)
-            return None
-
 class FeatureImportanceCalculator:
     @staticmethod
     def calculate_feature_importance(train_data, obs_data):
         try:
-            train_data, *obs_data = DataProcessor.align_time_periods([train_data, *obs_data])
-            correlation_matrices = DataProcessor.calculate_correlation_matrix([train_data, *obs_data])
-            feature_importance = DataProcessor.extract_feature_importance(correlation_matrices)
-            if all(feature_importance):
-                return np.concatenate(feature_importance)
+            # Merge data and remove duplicates
+            df = pd.concat([train_data] + obs_data, axis=1)
+            df = df.loc[:, ~df.columns.duplicated()]
+
+            # Convert date column to numerical feature
+            df['date'] = pd.to_datetime(df['date']).dt.dayofyear
+
+            # Check for NaN or missing values
+            if df.isnull().values.any():
+                print("Warning: Data contains NaN or missing values.")
+                return None
+
+            # Compute correlation matrix
+            correlation_matrix = df.corr()
+
+            if not correlation_matrix.empty:
+                # Exclude the first row ('sales' column) and calculate feature importance
+                feature_importance = correlation_matrix.iloc[0].abs()
+                feature_importance /= feature_importance.sum()
+                return feature_importance.values[1:]  # Exclude 'sales' column
             else:
-                print("Feature importance calculation failed.")
+                print("Correlation matrix is empty.")
                 return None
         except Exception as e:
-            print("Feature importance calculation error:", e)
+            print("Error calculating feature importance:", e)
             return None
 
 class StateSpaceModel:
@@ -135,19 +98,17 @@ def main():
     obs_files = [base_path + 'holidays_events.csv',
                  base_path + 'oil.csv',
                  base_path + 'transactions.csv']
-    obs_columns = [['date','type'], ['date', 'dcoilwtico'], ['date', 'transactions']]
+    obs_columns = [['date'], ['date', 'dcoilwtico'], ['date', 'transactions']]
 
     train_data = DataLoader.load_data(train_file, ['date', 'sales'])
     obs_data = [DataLoader.load_data(file, cols) for file, cols in zip(obs_files, obs_columns)]
 
     if train_data is not None and all(obs is not None for obs in obs_data):
         try:
-            # Extract feature importance including holiday data
-            obs_data[0]['holiday'] = obs_data[0]['type'].apply(lambda x: 1 if x == 'Holiday' else 0)
             feature_importance = FeatureImportanceCalculator.calculate_feature_importance(train_data, obs_data)
             if feature_importance is not None:
                 state_space_model = StateSpaceModel([], [])  # ARIMA parameters not required
-                initial_state = np.zeros(len(train_data.columns) + sum(len(df.columns) - 1 for df in obs_data))
+                initial_state = np.zeros(len(train_data.columns) + len(obs_data))
                 initial_state_cov = np.eye(len(initial_state))
                 process_noise_cov = np.eye(len(initial_state))
                 ekf = ExtendedKalmanFilter(state_space_model, process_noise_cov)
@@ -157,8 +118,8 @@ def main():
                 predicted_sales = []
                 true_sales = train_data['sales'].values
                 for i, observation in enumerate(true_sales):
-                    external_factors = np.concatenate([obs_data[j].iloc[i].values[1:] for j in range(len(obs_data))])
-                    cwlem_prediction = cwlem.predict(external_factors)
+                    external_factors = np.array([obs_data[j].iloc[i].values[0] for j in range(len(obs_data))])
+                    cwlem_prediction = cwlem.predict(external_factors[:len(feature_importance)])
                     ekf.predict(cwlem_prediction)
                     ekf.update(observation)
                     predicted_sales.append(ekf.state_estimation[-1])
@@ -174,5 +135,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
