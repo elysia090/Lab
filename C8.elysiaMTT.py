@@ -25,16 +25,15 @@ class FeatureImportanceCalculator:
             df = pd.concat([train_data] + obs_data, axis=1)
             df = df.loc[:, ~df.columns.duplicated()]
 
-            # Convert date column to datetime
+            # Convert 'date' column to datetime
             if 'date' in df.columns:
-                if pd.api.types.is_string_dtype(df['date']):
-                    df['date'] = pd.to_datetime(df['date'])
+                df['date'] = pd.to_datetime(df['date'], errors='coerce')  # Convert to datetime, invalid values will be NaT
 
-            # Convert date column to numerical feature
-            df['date'] = df['date'].dt.dayofyear
+            # Drop rows with missing or invalid date values
+            df = df.dropna(subset=['date'])
 
-            # Handle missing values
-            df.dropna(inplace=True)
+            # Convert date column to numerical feature (day of year)
+            df['date'] = df['date'].dt.dayofyear.astype(float)
 
             # Compute correlation matrix
             correlation_matrix = df.corr()
@@ -50,8 +49,6 @@ class FeatureImportanceCalculator:
         except Exception as e:
             print("Error calculating feature importance:", e)
             return None
-
-
 
 class StateSpaceModel:
     def __init__(self, ar_params, ma_params):
@@ -86,11 +83,14 @@ class ExtendedKalmanFilter:
         self.state_covariance = np.dot((np.eye(len(self.state_covariance)) - np.dot(kalman_gain, state_transition_jacobian)), self.state_covariance)
 
 class CWLEM:
-    def __init__(self, beta):
-        self.beta = beta.astype(float)
+    def __init__(self, beta_length):
+        self.beta = np.zeros(beta_length, dtype=float)
+
+    def set_beta(self, beta):
+        self.beta[:len(beta)] = beta
 
     def predict(self, external_factors):
-        return np.dot(external_factors.astype(float), self.beta)
+        return np.dot(external_factors, self.beta)
 
 class PerformanceEvaluator:
     @staticmethod
@@ -124,13 +124,40 @@ def main():
                 ekf.initialize(initial_state, initial_state_cov)
 
                 # Initialize CWLEM for sales prediction
-                cwlem = CWLEM(feature_importance)
+                cwlem = CWLEM(len(feature_importance))
+                cwlem.set_beta(feature_importance)
 
                 predicted_sales = []
                 true_sales = train_data['sales'].values
+
                 for i, observation in enumerate(true_sales):
-                    external_factors = np.array([obs_data[j].iloc[i].values[0] for j in range(len(obs_data))])
-                    cwlem_prediction = cwlem.predict(external_factors[:len(feature_importance)])
+                    external_factors = []
+                    for obs_df in obs_data:
+                        # Check if the DataFrame contains the 'date' column
+                        if 'date' in obs_df.columns:
+                            # Filter the DataFrame to get the row corresponding to the current date
+                            obs_row = obs_df.loc[obs_df['date'] == train_data.iloc[i]['date']]
+                            # Check if any rows are found
+                            if not obs_row.empty:
+                                # Convert date string to float (day of year)
+                                try:
+                                    date_value = pd.to_datetime(obs_row.iloc[0]['date']).dayofyear
+                                    external_factors.append(float(date_value))
+                                except (ValueError, TypeError):
+                                    # Handle invalid or missing date values
+                                    print(f"Invalid or missing date value for observation {i}: {obs_row.iloc[0]['date']}")
+                                    external_factors.append(np.nan)
+                            else:
+                                # Handle missing data for the current date
+                                print(f"No data found for date {train_data.iloc[i]['date']} in observation {i}")
+                                external_factors.append(np.nan)
+                        else:
+                            # Handle missing 'date' column
+                            print("No 'date' column found in observation data.")
+                            external_factors.append(np.nan)
+
+                    print("External factors:", external_factors)  # Debugging print
+                    cwlem_prediction = cwlem.predict(external_factors)
                     ekf.predict(cwlem_prediction)
                     ekf.update(observation)
                     predicted_sales.append(ekf.state_estimation[-1])
