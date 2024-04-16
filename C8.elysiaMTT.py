@@ -17,26 +17,85 @@ class DataLoader:
             print(f"Error reading file {file_path}: {e}")
             return None
 
-class FeatureImportanceCalculator:
+class DataProcessor:
     @staticmethod
-    def calculate_feature_importance(obs_data):
+    def align_time_periods(data):
         try:
-            for i, data in enumerate(obs_data):
-                print(f"Observation data {i} shape:", data.shape)
+            # Convert index to DatetimeIndex if not already
+            for i, df in enumerate(data):
+                if not isinstance(df.index, pd.DatetimeIndex):
+                    df['date'] = pd.to_datetime(df['date'])
+                    df.set_index('date', inplace=True)
+                    data[i] = df
+                    
+            # Find common start and end dates
+            common_start_date = max(df.index[0] for df in data)
+            common_end_date = min(df.index[-1] for df in data)
             
-            # Check if all observation data have consistent shapes
-            data_shapes = [data.shape for data in obs_data]
-            if len(set(data_shapes)) != 1:
-                print("Observation data have inconsistent shapes.")
+            # Find common columns
+            common_columns = list(set.intersection(*(set(df.columns) for df in data)))
+            
+            # Filter, resample, and interpolate dataframes
+            filtered_data = []
+            for df in data:
+                df = df[common_columns]
+                df = df.loc[common_start_date:common_end_date].resample('D').mean().interpolate()
+                filtered_data.append(df)
+            
+            return filtered_data
+        except Exception as e:
+            print(f"Error aligning time periods: {e}")
+            return None
+    
+    @staticmethod
+    def calculate_correlation_matrix(train_data, obs_data):
+        try:
+            df = pd.concat([train_data, *obs_data], axis=1)
+            correlation_matrix = df.corr()
+            print("Correlation Matrix:")
+            print(correlation_matrix)
+            return correlation_matrix
+        except Exception as e:
+            print(f"Error calculating correlation matrix: {e}")
+            return None
+
+    @staticmethod
+    def extract_feature_importance(correlation_matrix):
+        try:
+            if correlation_matrix.empty:
+                print("Correlation matrix is empty.")
                 return None
             
-            clean_data = [data.dropna(axis=1) for data in obs_data]
-            correlation_matrix = np.corrcoef([clean_data[i].iloc[:, 0] for i in range(len(clean_data))])
-            feature_importance = np.mean(np.abs(correlation_matrix), axis=1)
-            return feature_importance
-        except IndexError as e:
-            print("Feature importance calculation error: single positional indexer is out-of-bounds")
+            feature_importance = correlation_matrix.iloc[0].abs()
+            feature_importance /= feature_importance.sum()
+            return feature_importance.values
+        except Exception as e:
+            print(f"Error extracting feature importance: {e}")
             return None
+
+class FeatureImportanceCalculator:
+    @staticmethod
+    def calculate_feature_importance(train_data, obs_data):
+        try:
+            train_data, *obs_data = DataProcessor.align_time_periods([train_data, *obs_data])
+            
+            # Calculate correlation matrix
+            correlation_matrix = DataProcessor.calculate_correlation_matrix(train_data, obs_data)
+            
+            if correlation_matrix is None:
+                raise ValueError("Correlation matrix calculation failed or returned None.")
+            
+            if correlation_matrix.empty:
+                print("Correlation matrix is empty.")
+                return None
+            
+            # Extract and normalize feature importance
+            feature_importance = DataProcessor.extract_feature_importance(correlation_matrix)
+            
+            if feature_importance is None:
+                raise ValueError("Feature importance calculation failed.")
+            
+            return feature_importance
         except Exception as e:
             print(f"Feature importance calculation error: {e}")
             return None
@@ -85,6 +144,34 @@ class PerformanceEvaluator:
     def calculate_rmsle(predictions, true_values):
         return np.sqrt(np.mean(np.square(np.log(predictions + 1) - np.log(true_values + 1))))
 
+def end_to_end_pipeline(train_data, obs_data):
+    try:
+        feature_importance = FeatureImportanceCalculator.calculate_feature_importance(train_data, obs_data)
+        if feature_importance is not None:
+            state_space_model = StateSpaceModel([], [])
+            initial_state = np.zeros(len(train_data.columns) + len(obs_data))
+            initial_state_cov = np.eye(len(initial_state))
+            process_noise_cov = np.eye(len(initial_state))
+            ekf = ExtendedKalmanFilter(state_space_model, process_noise_cov)
+            ekf.initialize(initial_state, initial_state_cov)
+            cwlem = CWLEM(feature_importance)
+
+            predicted_sales = []
+            true_sales = train_data['sales'].values
+            for i, observation in enumerate(true_sales):
+                external_factors = np.array([obs_data[j].iloc[i].values[0] for j in range(len(obs_data))])
+                cwlem_prediction = cwlem.predict(external_factors)
+                ekf.predict(cwlem_prediction)
+                ekf.update(observation)
+                predicted_sales.append(ekf.state_estimation[-1])
+
+            rmsle = PerformanceEvaluator.calculate_rmsle(predicted_sales, true_sales)
+            print("RMSLE:", rmsle)
+        else:
+            print("Feature importance calculation failed.")
+    except Exception as e:
+        print("An error occurred:", e)
+
 def main():
     base_path = '/kaggle/input/store-sales-time-series-forecasting/'
     train_file = base_path + 'train.csv'
@@ -96,39 +183,20 @@ def main():
     train_data = DataLoader.load_data(train_file, ['date', 'sales'])
     obs_data = [DataLoader.load_data(file, cols) for file, cols in zip(obs_files, obs_columns)]
 
+    # Debugging: Print the loaded dataframes
+    print("Train Data:")
+    print(train_data.head())
+    print("\nObservation Data:")
+    for i, df in enumerate(obs_data):
+        print(f"\nDataFrame {i+1}:")
+        print(df.head())
+
     if train_data is not None and all(obs is not None for obs in obs_data):
-        try:
-            # Extract data only from January 1, 2013, onwards
-            obs_data = [data[data['date'] >= '2013-01-01'] for data in obs_data]
-            
-            feature_importance = FeatureImportanceCalculator.calculate_feature_importance(obs_data)
-            if feature_importance is not None:
-                state_space_model = StateSpaceModel([], [])  # ARIMA parameters not required
-                initial_state = np.zeros(len(train_data.columns) + len(obs_data))
-                initial_state_cov = np.eye(len(initial_state))
-                process_noise_cov = np.eye(len(initial_state))
-                ekf = ExtendedKalmanFilter(state_space_model, process_noise_cov)
-                ekf.initialize(initial_state, initial_state_cov)
-                cwlem = CWLEM(feature_importance)
-
-                predicted_sales = []
-                true_sales = train_data['sales'].values
-                for i, observation in enumerate(true_sales):
-                    external_factors = np.array([obs_data[j].iloc[i].values[1] for j in range(len(obs_data))])
-                    cwlem_prediction = cwlem.predict(external_factors)
-                    ekf.predict(cwlem_prediction)
-                    ekf.update(observation)
-                    predicted_sales.append(ekf.state_estimation[-1])
-
-                rmsle = PerformanceEvaluator.calculate_rmsle(predicted_sales, true_sales)
-                print("RMSLE:", rmsle)
-            else:
-                print("Feature importance calculation failed.")
-        except Exception as e:
-            print("An error occurred during feature importance calculation:", e)
+        end_to_end_pipeline(train_data, obs_data)
     else:
         print("Train data or observation data is missing or empty.")
 
 if __name__ == "__main__":
     main()
+
 
