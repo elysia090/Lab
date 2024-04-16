@@ -51,17 +51,13 @@ class FeatureImportanceCalculator:
             return None
 
 class StateSpaceModel:
-    def __init__(self, ar_params, ma_params):
-        self.ar_params = ar_params
-        self.ma_params = ma_params
-
-    def state_transition_function(self, state):
-        return np.dot(self.ar_params, state)
+    def __init__(self, state_dim, process_noise_cov):
+        self.state_dim = state_dim
+        self.process_noise_cov = process_noise_cov
 
 class ExtendedKalmanFilter:
-    def __init__(self, state_space_model, process_noise_cov):
+    def __init__(self, state_space_model):
         self.state_space_model = state_space_model
-        self.process_noise_cov = process_noise_cov
         self.state_estimation = None
         self.state_covariance = None
 
@@ -70,17 +66,13 @@ class ExtendedKalmanFilter:
         self.state_covariance = initial_state_cov.astype(float)
 
     def predict(self, external_factors):
-        predicted_state = self.state_space_model.state_transition_function(self.state_estimation)
-        self.state_estimation = predicted_state + np.dot(external_factors, self.state_space_model.ar_params)
+        predicted_state = self.state_estimation  # No state transition function for the given state space model
+        self.state_estimation = predicted_state + external_factors
 
     def update(self, observation):
-        state_transition_jacobian = np.eye(len(self.state_estimation))
-        state_transition_jacobian[-1, -1] = 1
-        kalman_gain = np.dot(np.dot(self.state_covariance, state_transition_jacobian.T),
-                             np.linalg.inv(np.dot(np.dot(state_transition_jacobian, self.state_covariance), state_transition_jacobian.T) + self.process_noise_cov))
-        predicted_state = self.state_space_model.state_transition_function(self.state_estimation)
-        self.state_estimation += np.dot(kalman_gain, (observation - predicted_state))
-        self.state_covariance = np.dot((np.eye(len(self.state_covariance)) - np.dot(kalman_gain, state_transition_jacobian)), self.state_covariance)
+        kalman_gain = np.dot(self.state_covariance, np.linalg.inv(self.state_covariance + self.state_space_model.process_noise_cov))
+        self.state_estimation += np.dot(kalman_gain, (observation - self.state_estimation))
+        self.state_covariance = np.dot((np.eye(self.state_space_model.state_dim) - kalman_gain), self.state_covariance)
 
 class CWLEM:
     def __init__(self, beta_length):
@@ -116,11 +108,12 @@ def main():
                 print("Feature importance calculation successful.")
 
                 # Initialize Extended Kalman Filter
-                state_space_model = StateSpaceModel([], [])  # ARIMA parameters not required
-                initial_state = np.zeros(len(train_data.columns) + len(obs_data))
-                initial_state_cov = np.eye(len(initial_state))
-                process_noise_cov = np.eye(len(initial_state))
-                ekf = ExtendedKalmanFilter(state_space_model, process_noise_cov)
+                state_dim = len(train_data.columns) + sum(len(cols) - 1 for cols in obs_columns)
+                process_noise_cov = np.eye(state_dim)
+                state_space_model = StateSpaceModel(state_dim, process_noise_cov)
+                ekf = ExtendedKalmanFilter(state_space_model)
+                initial_state = np.zeros(state_dim)
+                initial_state_cov = np.eye(state_dim)
                 ekf.initialize(initial_state, initial_state_cov)
 
                 # Initialize CWLEM for sales prediction
@@ -132,29 +125,23 @@ def main():
 
                 for i, observation in enumerate(true_sales):
                     external_factors = []
-                    for obs_df in obs_data:
+                    for obs_df, cols in zip(obs_data, obs_columns):
                         # Check if the DataFrame contains the 'date' column
                         if 'date' in obs_df.columns:
                             # Filter the DataFrame to get the row corresponding to the current date
                             obs_row = obs_df.loc[obs_df['date'] == train_data.iloc[i]['date']]
                             # Check if any rows are found
                             if not obs_row.empty:
-                                # Convert date string to float (day of year)
-                                try:
-                                    date_value = pd.to_datetime(obs_row.iloc[0]['date']).dayofyear
-                                    external_factors.append(float(date_value))
-                                except (ValueError, TypeError):
-                                    # Handle invalid or missing date values
-                                    print(f"Invalid or missing date value for observation {i}: {obs_row.iloc[0]['date']}")
-                                    external_factors.append(np.nan)
+                                # Extract external factors from additional columns
+                                external_factors.extend(obs_row[cols[1:]].values.flatten())
                             else:
                                 # Handle missing data for the current date
                                 print(f"No data found for date {train_data.iloc[i]['date']} in observation {i}")
-                                external_factors.append(np.nan)
+                                external_factors.extend([np.nan] * (len(cols) - 1))
                         else:
                             # Handle missing 'date' column
                             print("No 'date' column found in observation data.")
-                            external_factors.append(np.nan)
+                            external_factors.extend([np.nan] * (len(cols) - 1))
 
                     print("External factors:", external_factors)  # Debugging print
                     cwlem_prediction = cwlem.predict(external_factors)
@@ -175,6 +162,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
