@@ -21,30 +21,22 @@ class DataProcessor:
     @staticmethod
     def align_time_periods(data):
         try:
-            # Convert index to DatetimeIndex if not already
             for i, df in enumerate(data):
                 if not isinstance(df.index, pd.DatetimeIndex):
                     df['date'] = pd.to_datetime(df['date'])
                     df.set_index('date', inplace=True)
                     data[i] = df
-                    
-            # Find common start and end dates
+            
             common_start_date = max(df.index[0] for df in data)
             common_end_date = min(df.index[-1] for df in data)
-            
-            # Find common columns
-            common_columns = list(set.intersection(*(set(df.columns) for df in data)))
-            
-            # Filter, resample, and interpolate dataframes
             filtered_data = []
             for df in data:
-                df = df[common_columns]
                 df = df.loc[common_start_date:common_end_date].resample('D').mean().interpolate()
                 filtered_data.append(df)
             
             return filtered_data
         except Exception as e:
-            print(f"Error aligning time periods: {e}")
+            print("Error aligning time periods:", e)
             return None
     
     @staticmethod
@@ -52,25 +44,23 @@ class DataProcessor:
         try:
             df = pd.concat([train_data, *obs_data], axis=1)
             correlation_matrix = df.corr()
-            print("Correlation Matrix:")
-            print(correlation_matrix)
             return correlation_matrix
         except Exception as e:
-            print(f"Error calculating correlation matrix: {e}")
+            print("Error calculating correlation matrix:", e)
             return None
-
+    
     @staticmethod
     def extract_feature_importance(correlation_matrix):
         try:
-            if correlation_matrix.empty:
+            if correlation_matrix is not None and not correlation_matrix.empty:
+                feature_importance = correlation_matrix.iloc[0].abs()
+                feature_importance /= feature_importance.sum()
+                return feature_importance.values
+            else:
                 print("Correlation matrix is empty.")
                 return None
-            
-            feature_importance = correlation_matrix.iloc[0].abs()
-            feature_importance /= feature_importance.sum()
-            return feature_importance.values
         except Exception as e:
-            print(f"Error extracting feature importance: {e}")
+            print("Error extracting feature importance:", e)
             return None
 
 class FeatureImportanceCalculator:
@@ -78,26 +68,15 @@ class FeatureImportanceCalculator:
     def calculate_feature_importance(train_data, obs_data):
         try:
             train_data, *obs_data = DataProcessor.align_time_periods([train_data, *obs_data])
-            
-            # Calculate correlation matrix
             correlation_matrix = DataProcessor.calculate_correlation_matrix(train_data, obs_data)
-            
-            if correlation_matrix is None:
-                raise ValueError("Correlation matrix calculation failed or returned None.")
-            
-            if correlation_matrix.empty:
-                print("Correlation matrix is empty.")
-                return None
-            
-            # Extract and normalize feature importance
             feature_importance = DataProcessor.extract_feature_importance(correlation_matrix)
-            
-            if feature_importance is None:
-                raise ValueError("Feature importance calculation failed.")
-            
-            return feature_importance
+            if feature_importance is not None:
+                return feature_importance
+            else:
+                print("Feature importance calculation failed.")
+                return None
         except Exception as e:
-            print(f"Feature importance calculation error: {e}")
+            print("Feature importance calculation error:", e)
             return None
 
 class StateSpaceModel:
@@ -144,11 +123,28 @@ class PerformanceEvaluator:
     def calculate_rmsle(predictions, true_values):
         return np.sqrt(np.mean(np.square(np.log(predictions + 1) - np.log(true_values + 1))))
 
-def end_to_end_pipeline(train_data, obs_data):
-    try:
+def main():
+    base_path = '/kaggle/input/store-sales-time-series-forecasting/'
+    train_file = base_path + 'train.csv'
+    obs_files = [base_path + 'holidays_events.csv',
+                 base_path + 'oil.csv',
+                 base_path + 'transactions.csv']
+    obs_columns = [['date'], ['date', 'dcoilwtico'], ['date', 'transactions']]
+
+    train_data = DataLoader.load_data(train_file, ['date', 'sales'])
+    obs_data = [DataLoader.load_data(file, cols) for file, cols in zip(obs_files, obs_columns)]
+
+    print("Train Data:")
+    print(train_data.head())
+    print("\nObservation Data:")
+    for i, df in enumerate(obs_data):
+        print(f"\nDataFrame {i+1}:")
+        print(df.head())
+
+    if train_data is not None and all(obs is not None for obs in obs_data):
         feature_importance = FeatureImportanceCalculator.calculate_feature_importance(train_data, obs_data)
         if feature_importance is not None:
-            state_space_model = StateSpaceModel([], [])
+            state_space_model = StateSpaceModel([], [])  # ARIMA parameters not required
             initial_state = np.zeros(len(train_data.columns) + len(obs_data))
             initial_state_cov = np.eye(len(initial_state))
             process_noise_cov = np.eye(len(initial_state))
@@ -167,32 +163,6 @@ def end_to_end_pipeline(train_data, obs_data):
 
             rmsle = PerformanceEvaluator.calculate_rmsle(predicted_sales, true_sales)
             print("RMSLE:", rmsle)
-        else:
-            print("Feature importance calculation failed.")
-    except Exception as e:
-        print("An error occurred:", e)
-
-def main():
-    base_path = '/kaggle/input/store-sales-time-series-forecasting/'
-    train_file = base_path + 'train.csv'
-    obs_files = [base_path + 'holidays_events.csv',
-                 base_path + 'oil.csv',
-                 base_path + 'transactions.csv']
-    obs_columns = [['date'], ['date', 'dcoilwtico'], ['date', 'transactions']]
-
-    train_data = DataLoader.load_data(train_file, ['date', 'sales'])
-    obs_data = [DataLoader.load_data(file, cols) for file, cols in zip(obs_files, obs_columns)]
-
-    # Debugging: Print the loaded dataframes
-    print("Train Data:")
-    print(train_data.head())
-    print("\nObservation Data:")
-    for i, df in enumerate(obs_data):
-        print(f"\nDataFrame {i+1}:")
-        print(df.head())
-
-    if train_data is not None and all(obs is not None for obs in obs_data):
-        end_to_end_pipeline(train_data, obs_data)
     else:
         print("Train data or observation data is missing or empty.")
 
