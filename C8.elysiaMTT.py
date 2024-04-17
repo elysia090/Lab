@@ -1,82 +1,144 @@
 import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 
-class ElysiaMethod:
-    def __init__(self):
-        pass
-    
-    def predict(self, X, y):
-        # エリシア法を適用して予測値を計算
-        return np.dot(np.linalg.pinv(X), y)
+class ModelUpdater:
+    @staticmethod
+    def preprocess_data(file_path, columns):
+        try:
+            data = pd.read_csv(file_path, usecols=columns)
+            return data
+        except FileNotFoundError:
+            print(f"File not found: {file_path}")
+            return None
+        except pd.errors.EmptyDataError:
+            print(f"File is empty: {file_path}")
+            return None
+        except Exception as e:
+            print(f"Error reading file {file_path}: {e}")
+            return None
 
-class CliffordWidebandLinearEstimation:
-    def __init__(self):
-        pass
+class StateSpaceModel:
+    def __init__(self, ar_params, ma_params):
+        self.ar_params = ar_params
+        self.ma_params = ma_params
 
-    def estimate(self, X, y):
-        # クリフォード広帯域線形推定法を適用して予測値を計算
-        return np.dot(np.linalg.pinv(X), y)
+    def state_transition_function(self, state):
+        return np.dot(self.ar_params, state)
 
 class ExtendedKalmanFilter:
-    def __init__(self, process_noise_cov):
+    def __init__(self, state_space_model, process_noise_cov):
+        self.state_space_model = state_space_model
         self.process_noise_cov = process_noise_cov
         self.state_estimation = None
         self.state_covariance = None
 
     def initialize(self, initial_state, initial_state_cov):
-        # 初期化
         self.state_estimation = initial_state
         self.state_covariance = initial_state_cov
 
-    def predict(self, state_transition_function, external_factors):
-        # 予測
-        predicted_state = state_transition_function(self.state_estimation)
-        self.state_estimation = predicted_state
+    def predict(self, external_factors):
+        predicted_state = self.state_space_model.state_transition_function(self.state_estimation)
+        self.state_estimation = predicted_state + np.dot(external_factors, self.state_space_model.ar_params)
 
-    def update(self, observation, observation_function, observation_jacobian):
-        # 更新
-        kalman_gain = self.calculate_kalman_gain(observation_jacobian)
-        predicted_state = observation_function(self.state_estimation)
-        innovation = observation - predicted_state
-        self.state_estimation += np.dot(kalman_gain, innovation)
-        self.state_covariance = self.update_covariance(kalman_gain, observation_jacobian)
+    def update(self, observation):
+        state_transition_jacobian = np.eye(len(self.state_estimation))
+        state_transition_jacobian[-1, -1] = 1
+        kalman_gain = np.dot(np.dot(self.state_covariance, state_transition_jacobian.T),
+                             np.linalg.inv(np.dot(np.dot(state_transition_jacobian, self.state_covariance), state_transition_jacobian.T) + self.process_noise_cov))
+        predicted_state = self.state_space_model.state_transition_function(self.state_estimation)
+        self.state_estimation += np.dot(kalman_gain, (observation - predicted_state))
+        self.state_covariance = np.dot((np.eye(len(self.state_covariance)) - np.dot(kalman_gain, state_transition_jacobian)), self.state_covariance)
 
-    def calculate_kalman_gain(self, observation_jacobian):
-        # カルマンゲインを計算
-        return np.dot(np.dot(self.state_covariance, observation_jacobian.T),
-                      np.linalg.inv(np.dot(np.dot(observation_jacobian, self.state_covariance), observation_jacobian.T) + self.process_noise_cov))
+class LinearEstimationMethod:
+    def __init__(self, beta):
+        self.beta = beta
 
-    def update_covariance(self, kalman_gain, observation_jacobian):
-        # 共分散行列を更新
-        return np.dot((np.eye(len(self.state_covariance)) - np.dot(kalman_gain, observation_jacobian)), self.state_covariance)
+    def predict(self, external_factors):
+        return np.dot(external_factors, self.beta)
+
+class ElysiaMethod:
+    def predict(self, X, y):
+        return np.dot(np.linalg.pinv(X), y)
 
 class PerformanceEvaluator:
     @staticmethod
     def calculate_rmsle(predictions, true_values):
-        # RMSLEを計算
         return np.sqrt(np.mean(np.square(np.log(predictions + 1) - np.log(true_values + 1))))
 
+def preprocess_data(file_path, columns):
+    try:
+        data = pd.read_csv(file_path, usecols=columns)
+        return data
+    except FileNotFoundError:
+        print(f"File not found: {file_path}")
+        return None
+    except pd.errors.EmptyDataError:
+        print(f"File is empty: {file_path}")
+        return None
+    except Exception as e:
+        print(f"Error reading file {file_path}: {e}")
+        return None
+
+def calculate_feature_importance(obs_data):
+    correlation_matrix = np.corrcoef([obs_data[i].iloc[:, 1] for i in range(len(obs_data))])
+    feature_importance = np.mean(np.abs(correlation_matrix), axis=1)
+    return feature_importance
+
+def auto_adjust_weights(obs_data):
+    feature_importance = calculate_feature_importance(obs_data)
+    total_importance = np.sum(feature_importance)
+    weights = feature_importance / total_importance
+    return weights
+
+def initialize_models(train_data, obs_data):
+    state_space_model = StateSpaceModel([], [])  # ARIMA Parameters not needed
+    initial_state = np.zeros(len(train_data.columns) + len(obs_data))
+    initial_state_cov = np.eye(len(initial_state))
+    process_noise_cov = np.eye(len(initial_state))
+    ekf = ExtendedKalmanFilter(state_space_model, process_noise_cov)
+    ekf.initialize(initial_state, initial_state_cov)
+    weights = auto_adjust_weights(obs_data)
+    cwlem = LinearEstimationMethod(weights)
+    elysia = ElysiaMethod()
+    return ekf, cwlem, elysia
+
 def main():
-    # モデルのパラメータやデータを準備
+    base_path = '/kaggle/input/store-sales-time-series-forecasting/'
+    train_file = base_path + 'train.csv'
+    obs_files = [base_path + 'holidays_events.csv',
+                 base_path + 'oil.csv',
+                 base_path + 'transactions.csv']
+    obs_columns = [['date', 'type'], ['date', 'dcoilwtico'], ['date', 'transactions']]
 
-    # モデルの初期化
-    ekf = ExtendedKalmanFilter(process_noise_cov)
+    train_data = preprocess_data(train_file, ['date', 'sales'])
+    obs_data = [preprocess_data(file, cols) for file, cols in zip(obs_files, obs_columns)]
 
-    # 予測と更新
-    predicted_values = []
-    for i in range(len(X)):
-        external_factors = X[i]
-        ekf.predict(state_transition_function, external_factors)
-        ekf.update(observation[i], observation_function, observation_jacobian)
-        predicted_values.append(ekf.state_estimation[-1])
+    if train_data is not None and all(obs is not None for obs in obs_data):
+        ekf, cwlem, elysia = initialize_models(train_data, obs_data)
 
-    # 性能評価
-    rmsle = PerformanceEvaluator.calculate_rmsle(predicted_values, y)
-    print("RMSLE:", rmsle)
+        predicted_sales = []
+        true_sales = train_data['sales'].values
+        for i, observation in enumerate(true_sales):
+            external_factors = np.array([obs_data[j].iloc[i].values[1] for j in range(len(obs_data))])
+            cwlem_prediction = cwlem.predict(external_factors)
+            ekf.predict(cwlem_prediction)
+            ekf.update(observation)
+            predicted_sales.append(ekf.state_estimation[-1])
+
+        rmsle = PerformanceEvaluator.calculate_rmsle(predicted_sales, true_sales)
+        print("RMSLE:", rmsle)
+
+        plt.plot(true_sales, label='True Sales')
+        plt.plot(predicted_sales, label='Predicted Sales')
+        plt.xlabel('Time')
+        plt.ylabel('Sales')
+        plt.title('True vs Predicted Sales')
+        plt.legend()
+        plt.show()
+
+    else:
+        print("Train data or observation data is missing or empty.")
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
