@@ -44,6 +44,28 @@ class PerformanceEvaluator:
     def calculate_rmsle(predictions, true_values):
         return np.sqrt(np.mean(np.square(np.log(predictions + 1) - np.log(true_values + 1))))
 
+class MeanSquareErrorOptimizer:
+    def __init__(self):
+        pass
+
+    def optimize(self, ekf, cl_method, observations):
+        predictions = []
+        true_values = []
+        for i, observation in enumerate(observations):
+            external_factors = np.array([obs_data[j].iloc[i].values[1] for j in range(len(obs_data))])
+            ekf.predict(external_factors)
+            ekf.update(observation)
+            prediction = cl_method.predict(ekf.state_estimation[:-1])
+            predictions.append(prediction)
+            true_values.append(observation)
+
+        predictions = np.array(predictions)
+        true_values = np.array(true_values)
+
+        # 最小二乗法でパラメータを最適化
+        h_optimal = np.linalg.lstsq(predictions, true_values, rcond=None)[0]
+        return h_optimal
+
 def load_data(file_path, columns):
     try:
         data = pd.read_csv(file_path, usecols=columns)
@@ -83,15 +105,24 @@ def main():
     if train_data is not None and all(obs is not None for obs in obs_data):
         ekf, cl_method = initialize_models(train_data, obs_data)
 
-        predicted_sales = []
-        true_sales = train_data['sales'].values
-        for i, observation in enumerate(true_sales):
+        mse_optimizer = MeanSquareErrorOptimizer()
+        h_optimal = mse_optimizer.optimize(ekf, cl_method, train_data['sales'].values)
+
+        # 最適化されたパラメータを適用
+        cl_method.h = h_optimal
+
+        # 予測を生成
+        predictions = []
+        for i, observation in enumerate(train_data['sales'].values):
             external_factors = np.array([obs_data[j].iloc[i].values[1] for j in range(len(obs_data))])
             ekf.predict(external_factors)
             ekf.update(observation)
-            predicted_sales.append(cl_method.predict(ekf.state_estimation[:-1]))
+            prediction = cl_method.predict(ekf.state_estimation[:-1])
+            predictions.append(prediction)
 
-        rmsle = PerformanceEvaluator.calculate_rmsle(predicted_sales, true_sales)
+        # RMSLEを計算
+        true_sales = train_data['sales'].values
+        rmsle = PerformanceEvaluator.calculate_rmsle(np.array(predictions), true_sales)
         print("RMSLE:", rmsle)
 
     else:
@@ -99,4 +130,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
