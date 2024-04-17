@@ -2,9 +2,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-class ModelUpdater:
+class DataLoader:
     @staticmethod
-    def preprocess_data(file_path, columns):
+    def load_data(file_path, columns):
         try:
             data = pd.read_csv(file_path, usecols=columns)
             return data
@@ -19,12 +19,11 @@ class ModelUpdater:
             return None
 
 class StateSpaceModel:
-    def __init__(self, ar_params, ma_params):
+    def __init__(self, ar_params):
         self.ar_params = ar_params
-        self.ma_params = ma_params
 
-    def state_transition_function(self, state):
-        return np.dot(self.ar_params, state)
+    def state_transition_function(self, state, external_factors):
+        return np.dot(self.ar_params, state) + external_factors
 
 class ExtendedKalmanFilter:
     def __init__(self, state_space_model, process_noise_cov):
@@ -38,15 +37,15 @@ class ExtendedKalmanFilter:
         self.state_covariance = initial_state_cov
 
     def predict(self, external_factors):
-        predicted_state = self.state_space_model.state_transition_function(self.state_estimation)
-        self.state_estimation = predicted_state + np.dot(external_factors, self.state_space_model.ar_params)
+        predicted_state = self.state_space_model.state_transition_function(self.state_estimation, external_factors)
+        self.state_estimation = predicted_state
 
     def update(self, observation):
         state_transition_jacobian = np.eye(len(self.state_estimation))
         state_transition_jacobian[-1, -1] = 1
         kalman_gain = np.dot(np.dot(self.state_covariance, state_transition_jacobian.T),
                              np.linalg.inv(np.dot(np.dot(state_transition_jacobian, self.state_covariance), state_transition_jacobian.T) + self.process_noise_cov))
-        predicted_state = self.state_space_model.state_transition_function(self.state_estimation)
+        predicted_state = self.state_space_model.state_transition_function(self.state_estimation, 0)  # Updated line
         self.state_estimation += np.dot(kalman_gain, (observation - predicted_state))
         self.state_covariance = np.dot((np.eye(len(self.state_covariance)) - np.dot(kalman_gain, state_transition_jacobian)), self.state_covariance)
 
@@ -58,27 +57,14 @@ class LinearEstimationMethod:
         return np.dot(external_factors, self.beta)
 
 class ElysiaMethod:
-    def predict(self, X, y):
+    @staticmethod
+    def predict(X, y):
         return np.dot(np.linalg.pinv(X), y)
 
 class PerformanceEvaluator:
     @staticmethod
     def calculate_rmsle(predictions, true_values):
         return np.sqrt(np.mean(np.square(np.log(predictions + 1) - np.log(true_values + 1))))
-
-def preprocess_data(file_path, columns):
-    try:
-        data = pd.read_csv(file_path, usecols=columns)
-        return data
-    except FileNotFoundError:
-        print(f"File not found: {file_path}")
-        return None
-    except pd.errors.EmptyDataError:
-        print(f"File is empty: {file_path}")
-        return None
-    except Exception as e:
-        print(f"Error reading file {file_path}: {e}")
-        return None
 
 def calculate_feature_importance(obs_data):
     correlation_matrix = np.corrcoef([obs_data[i].iloc[:, 1] for i in range(len(obs_data))])
@@ -92,7 +78,7 @@ def auto_adjust_weights(obs_data):
     return weights
 
 def initialize_models(train_data, obs_data):
-    state_space_model = StateSpaceModel([], [])  # ARIMA Parameters not needed
+    state_space_model = StateSpaceModel([])  # ARIMA Parameters not needed
     initial_state = np.zeros(len(train_data.columns) + len(obs_data))
     initial_state_cov = np.eye(len(initial_state))
     process_noise_cov = np.eye(len(initial_state))
@@ -100,8 +86,7 @@ def initialize_models(train_data, obs_data):
     ekf.initialize(initial_state, initial_state_cov)
     weights = auto_adjust_weights(obs_data)
     cwlem = LinearEstimationMethod(weights)
-    elysia = ElysiaMethod()
-    return ekf, cwlem, elysia
+    return ekf, cwlem
 
 def main():
     base_path = '/kaggle/input/store-sales-time-series-forecasting/'
@@ -111,11 +96,11 @@ def main():
                  base_path + 'transactions.csv']
     obs_columns = [['date', 'type'], ['date', 'dcoilwtico'], ['date', 'transactions']]
 
-    train_data = preprocess_data(train_file, ['date', 'sales'])
-    obs_data = [preprocess_data(file, cols) for file, cols in zip(obs_files, obs_columns)]
+    train_data = DataLoader.load_data(train_file, ['date', 'sales'])
+    obs_data = [DataLoader.load_data(file, cols) for file, cols in zip(obs_files, obs_columns)]
 
     if train_data is not None and all(obs is not None for obs in obs_data):
-        ekf, cwlem, elysia = initialize_models(train_data, obs_data)
+        ekf, cwlem = initialize_models(train_data, obs_data)
 
         predicted_sales = []
         true_sales = train_data['sales'].values
@@ -125,6 +110,11 @@ def main():
             ekf.predict(cwlem_prediction)
             ekf.update(observation)
             predicted_sales.append(ekf.state_estimation[-1])
+
+        # Elysia Method
+        X = np.array(...)  # Prepare X data
+        y = np.array(...)  # Prepare y data
+        elysia_prediction = ElysiaMethod.predict(X, y)
 
         rmsle = PerformanceEvaluator.calculate_rmsle(predicted_sales, true_sales)
         print("RMSLE:", rmsle)
@@ -142,3 +132,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
