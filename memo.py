@@ -7,6 +7,10 @@ class CliffordElement:
         self.vector = vector
         self.bivector = bivector
 
+# 直交性を保つ外積の計算
+def outer_product(v1, v2):
+    return np.outer(v1, v2) - np.outer(v2, v1)
+
 # 畳み込み演算の定義
 def convolve_clifford(x, w):
     # スカラー要素の演算
@@ -16,7 +20,11 @@ def convolve_clifford(x, w):
     y_vector = x.scalar * w.vector + w.scalar * x.vector
     
     # 外積によるバイバーシャン数（2重ベクトル）の演算
-    y_bivector = np.outer(x.vector, w.vector)
+    y_bivector = outer_product(x.vector, w.vector)
+    
+    # 直交性を保つようにバイバーシャン数要素を調整
+    y_bivector -= np.outer(x.bivector, w.vector)
+    y_bivector -= np.outer(x.vector, w.bivector)
     
     return CliffordElement(y_scalar, y_vector, y_bivector)
 
@@ -39,4 +47,3 @@ print("畳み込み結果：")
 print("スカラー：", result.scalar)
 print("ベクトル：", result.vector)
 print("バイバーシャン数：", result.bivector)
-
