@@ -137,7 +137,7 @@ def main(layer_num, unit_num, lr, batch_size, epochs):
 
 # Run the main function
 if __name__ == "__main__":
-    layer_num = 5
+    layer_num = 1
     unit_num = 64
     lr = 0.001
     batch_size = 512
