@@ -35,17 +35,23 @@ def load_mnist_dataset(batch_size):
     test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(test_image, test_dataset.targets), batch_size=batch_size, shuffle=False)
     return train_loader, test_loader
 
+# Binary activation function
+class BinaryActivation(nn.Module):
+    def __init__(self, threshold=0.0):
+        super(BinaryActivation, self).__init__()
+        self.threshold = threshold
 
+    def forward(self, x):
+        return torch.sign(x - self.threshold)
 
-# BitLinear layer with ED representation
-class BitLinearED(nn.Module):
+# Binary linear layer with ED representation
+class BinaryLinearED(nn.Module):
     def __init__(self, in_features, out_features):
-        super(BitLinearED, self).__init__()
+        super(BinaryLinearED, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.weight = nn.Parameter(torch.Tensor(out_features, in_features))
         self.bias = nn.Parameter(torch.Tensor(out_features))
-        self.register_buffer('binary_weight', None)  # バイナリ化された重みを保存するためのバッファ
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -53,34 +59,26 @@ class BitLinearED(nn.Module):
         nn.init.constant_(self.bias, 0)
 
     def forward(self, x):
-        # バイナリ化された重みがまだ計算されていない場合は計算する
-        if self.binary_weight is None:
-            self.binary_weight = torch.sign(self.weight)
-        # 重みのバイナリ化と線形変換の実行
-        return nn.functional.linear(x, self.binary_weight, self.bias)
+        # Convert weights to binary using ED representation
+        binary_weight = torch.sign(self.weight)
+        return nn.functional.linear(x, binary_weight, self.bias)
 
-    def extra_repr(self):
-        return 'in_features={}, out_features={}, bias={}'.format(
-            self.in_features, self.out_features, self.bias is not None
-        )
-
-# BitNet×ED model with BitLinearED and Binary activation function
-class BitNetXED(nn.Module):
+# BitNet model with ED representation and Sigmoid activation
+class BitNetED(nn.Module):
     def __init__(self, input_size, output_size, layer_num, unit_num):
-        super(BitNetXED, self).__init__()
+        super(BitNetED, self).__init__()
         self.layers = nn.ModuleList()
-        self.layers.append(BitLinearED(input_size, unit_num))
+        self.layers.append(nn.Linear(input_size, unit_num))
+        self.layers.append(nn.Sigmoid())  # Sigmoid activation after binary linear transformation
         for _ in range(layer_num):
-            self.layers.append(nn.ReLU())  # ReLUを追加
-            self.layers.append(BitLinearED(unit_num, unit_num))
-            self.layers.append(nn.ReLU())  # ReLUを追加
-        self.layers.append(BitLinearED(unit_num, output_size))
+            self.layers.append(BinaryLinearED(unit_num, unit_num))
+            self.layers.append(nn.Sigmoid())  # Sigmoid activation after binary linear transformation
+        self.layers.append(nn.Linear(unit_num, output_size))
 
     def forward(self, x):
         for layer in self.layers:
             x = layer(x)
         return x
-
 
 # Model training
 def train_and_test_model(model, train_loader, test_loader, criterion, optimizer, epochs):
@@ -155,8 +153,8 @@ def main(layer_num, unit_num, lr, batch_size, epochs):
 # Run the main function
 if __name__ == "__main__":
     layer_num = 1
-    unit_num = 32
+    unit_num = 512
     lr = 0.001
     batch_size = 512
-    epochs = 30
+    epochs = 20
     main(layer_num, unit_num, lr, batch_size, epochs)
