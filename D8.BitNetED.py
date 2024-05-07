@@ -35,14 +35,7 @@ def load_mnist_dataset(batch_size):
     test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(test_image, test_dataset.targets), batch_size=batch_size, shuffle=False)
     return train_loader, test_loader
 
-# Binary activation function
-class BinaryActivation(nn.Module):
-    def __init__(self, threshold=0.0):
-        super(BinaryActivation, self).__init__()
-        self.threshold = threshold
 
-    def forward(self, x):
-        return torch.sign(x - self.threshold)
 
 # BitLinear layer with ED representation
 class BitLinearED(nn.Module):
