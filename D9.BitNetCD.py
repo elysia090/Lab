@@ -1,14 +1,12 @@
-import os
 import random
-import time
-
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
-from tqdm import tqdm
-from matplotlib import pyplot as plt
+import matplotlib.pyplot as plt
+import time
 
 # Set seeds for reproducibility
 SEED = 10
@@ -19,115 +17,119 @@ torch.manual_seed(SEED)
 # Set device
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+# Define CustomNet model with regular ReLU activation
+class CustomNet(nn.Module):
+    def __init__(self, input_channels, output_size, hidden_units):
+        super(CustomNet, self).__init__()
+        self.conv1 = nn.Conv2d(input_channels, 16, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)
+        self.fc1 = nn.Linear(32 * 7 * 7, hidden_units)
+        self.fc2 = nn.Linear(hidden_units, output_size)
+        self.relu = nn.ReLU()  # Regular ReLU activation
+
+    def forward(self, x):
+        x = self.relu(self.conv1(x))
+        x = F.max_pool2d(x, kernel_size=2, stride=2)
+        x = self.relu(self.conv2(x))
+        x = F.max_pool2d(x, kernel_size=2, stride=2)
+        x = x.view(-1, 32 * 7 * 7)
+        x = self.relu(self.fc1(x))  # Regular ReLU activation for FC1
+        x = self.fc2(x)
+        return F.log_softmax(x, dim=1)
+
+
 # Data preprocessing and loading
-def load_cifar10_dataset(batch_size):
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # Normalize to [-1, 1]
-    ])
-    train_dataset = datasets.CIFAR10("data", train=True, download=True, transform=transform)
-    test_dataset = datasets.CIFAR10("data", train=False, download=True, transform=transform)
+def load_mnist_dataset(batch_size):
+    transform = transforms.Compose([transforms.ToTensor()])
+    train_dataset = datasets.MNIST("data", train=True, download=True, transform=transform)
+    test_dataset = datasets.MNIST("data", train=False, download=True, transform=transform)
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     return train_loader, test_loader
 
-# Binary activation function
-class BinaryActivation(nn.Module):
-    def __init__(self, threshold=0.0):
-        super(BinaryActivation, self).__init__()
-        self.threshold = threshold
+# Set hyperparameters
+input_channels = 1  # MNIST has single channel images
+output_size = 10  # 10 classes for MNIST digits
+hidden_units = 1000  # Number of units in the hidden fully connected layer
+batch_size = 512
+learning_rate = 0.001
+num_epochs = 50
 
-    def forward(self, x):
-        return torch.sign(x - self.threshold)
+# Load MNIST dataset
+train_loader, test_loader = load_mnist_dataset(batch_size)
 
-# Binary linear layer with ED representation
-class BinaryLinearED(nn.Module):
-    def __init__(self, in_features, out_features):
-        super(BinaryLinearED, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = nn.Parameter(torch.Tensor(out_features, in_features))
-        self.bias = nn.Parameter(torch.Tensor(out_features))
-        self.reset_parameters()
+# Initialize CustomNet model
+model = CustomNet(input_channels, output_size, hidden_units).to(device)
 
-    def reset_parameters(self):
-        nn.init.normal_(self.weight, mean=0.0, std=0.01)
-        nn.init.constant_(self.bias, 0)
+# Define loss function and optimizer
+criterion = nn.NLLLoss()
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-    def forward(self, x):
-        # Convert weights to binary using ED representation
-        binary_weight = torch.sign(self.weight)
-        return nn.functional.linear(x, binary_weight, self.bias)
+# Lists to store accuracy values
+accuracy_values = []
+test_accuracy_values = []  
 
-# BitNet model with ED representation and Sigmoid activation
-class BitNetED(nn.Module):
-    def __init__(self, input_size, output_size, layer_num, unit_num):
-        super(BitNetED, self).__init__()
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1)  # Input channels: 3, Output channels: 32
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)  # Max pooling layer
-        self.layers = nn.ModuleList()
-        self.layers.append(nn.Linear(32 * 16 * 16, unit_num))  # Adjust input size after convolutions
-        self.layers.append(nn.Sigmoid())  # Sigmoid activation after binary linear transformation
-        for _ in range(layer_num):
-            self.layers.append(BinaryLinearED(unit_num, unit_num))
-            self.layers.append(nn.Sigmoid())  # Sigmoid activation after binary linear transformation
-        self.layers.append(nn.Linear(unit_num, output_size))
-
-    def forward(self, x):
-        x = self.pool(nn.functional.relu(self.conv1(x)))  # Convolution -> ReLU -> Max pooling
-        x = x.view(-1, 32 * 16 * 16)  # Reshape for fully connected layer
-        for layer in self.layers:
-            x = layer(x)
-        return x
-
-# Model training
-def train_model(model, train_loader, test_loader, criterion, optimizer, epochs):
-    model.to(device)
+# Training loop
+start_time = time.time()
+for epoch in range(num_epochs):
     model.train()
+    running_loss = 0.0
+    for batch_idx, (data, target) in enumerate(train_loader):
+        data, target = data.to(device), target.to(device)
 
-    for epoch in tqdm(range(epochs)):
-        total_loss = 0.0
-        correct = 0
-        total = 0
+        optimizer.zero_grad()
+        output = model(data)
+        loss = criterion(output, target)
+        loss.backward()
 
-        for inputs, labels in train_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
+        optimizer.step()
 
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+        running_loss += loss.item()
 
-            total_loss += loss.item()
-            _, predicted = torch.max(outputs, 1)
-            correct += (predicted == labels).sum().item()
-            total += labels.size(0)
+    # Evaluation on test set
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for data, target in test_loader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            _, predicted = torch.max(output, 1)
+            total += target.size(0)
+            correct += (predicted == target).sum().item()
 
-        print(f"Epoch [{epoch+1}/{epochs}], Loss: {total_loss / len(train_loader):.4f}, Accuracy: {correct / total:.4f}")
+        # Calculate test accuracy and store
+        test_accuracy = 100 * correct / total
+        test_accuracy_values.append(test_accuracy)  # Store test accuracy
 
-# Main function
-def main(layer_num, unit_num, lr, batch_size, epochs):
-    train_loader, test_loader = load_cifar10_dataset(batch_size)
+    # Calculate training accuracy and store
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for data, target in train_loader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            _, predicted = torch.max(output, 1)
+            total += target.size(0)
+            correct += (predicted == target).sum().item()
+    
+    train_accuracy = 100 * correct / total
+    accuracy_values.append(train_accuracy)  # Store training accuracy
 
-    model = BitNetED(input_size=32 * 16 * 16, output_size=10, layer_num=layer_num, unit_num=unit_num)
+end_time = time.time()
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+print(f"Finished Training CustomNet in {end_time - start_time:.2f}s")
+print(f"Final Training Accuracy: {train_accuracy:.2f}")
+print(f"Test Accuracy: {test_accuracy:.2f}")
 
-    start_time = time.time()
-    train_model(model, train_loader, test_loader, criterion, optimizer, epochs)
-    end_time = time.time()
-
-    print(f"Finished Training BitNetED in {end_time - start_time:.2f}s")
-
-# Run the main function
-if __name__ == "__main__":
-    layer_num = 1
-    unit_num = 64
-    lr = 0.001
-    batch_size = 128
-    epochs = 20
-    main(layer_num, unit_num, lr, batch_size, epochs)
-
+# Plot accuracy graph
+plt.plot(range(1, num_epochs + 1), accuracy_values, marker='o', label='Training Accuracy')
+plt.plot(range(1, num_epochs + 1), test_accuracy_values, marker='s', label='Test Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy (%)')
+plt.title('Accuracy over Epochs')
+plt.grid(True)
+plt.legend()
+plt.show()
