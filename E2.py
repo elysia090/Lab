@@ -59,7 +59,7 @@ class ED(torch.nn.Module):
         p, n = x[0].clone(), x[1].clone()
         for layer in self.layers:
             p, n = layer(p, n)
-        return p, n  # 直接クラスのスコアを返す
+        return F.log_softmax(p, dim=1)  # Apply log softmax
     
     def parameters(self):
         return [param for layer in self.layers for param in layer.parameters()]
@@ -87,11 +87,15 @@ class MNISTLoader:
         test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False)
         return train_loader, test_loader
 
+# Lists to store accuracy values
+accuracy_values = []
+test_accuracy_values = []  
+
 # Training loop
 def train(model, train_loader, test_loader, num_epochs, optimizer):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    criterion = torch.nn.CrossEntropyLoss()  # CrossEntropyLoss を損失関数として使用
+    criterion = torch.nn.NLLLoss()
     
     for epoch in range(num_epochs):
         model.train()  # Set the model to training mode
@@ -107,8 +111,7 @@ def train(model, train_loader, test_loader, num_epochs, optimizer):
             optimizer.zero_grad()
             positive_inputs = inputs.clone().reshape(inputs.shape[0], -1)
             negative_inputs = inputs.clone().reshape(inputs.shape[0], -1)
-            outputs, _ = model((positive_inputs, negative_inputs))  # モデルの出力を取得
-            
+            outputs = model((positive_inputs, negative_inputs))
             loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
@@ -119,6 +122,7 @@ def train(model, train_loader, test_loader, num_epochs, optimizer):
             correct += predicted.eq(targets).sum().item()
         
         train_accuracy = correct / total
+        accuracy_values.append(train_accuracy)
         
         # Evaluation on test set
         model.eval()  # Set the model to evaluation mode
@@ -131,13 +135,13 @@ def train(model, train_loader, test_loader, num_epochs, optimizer):
                 
                 positive_inputs = inputs.clone().reshape(inputs.shape[0], -1)
                 negative_inputs = inputs.clone().reshape(inputs.shape[0], -1)
-                outputs, _ = model((positive_inputs, negative_inputs))  # モデルの出力を取得
-                
+                outputs = model((positive_inputs, negative_inputs))
                 _, predicted = outputs.max(1)
                 test_total += targets.size(0)
                 test_correct += predicted.eq(targets).sum().item()
         
         test_accuracy = test_correct / test_total
+        test_accuracy_values.append(test_accuracy)
         
         # Print training statistics
         print(f'Epoch [{epoch+1}/{num_epochs}], '
