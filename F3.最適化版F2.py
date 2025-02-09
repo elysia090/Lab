@@ -14,6 +14,14 @@ GPU‐only Immediate Dominator Calculation using PyCUDA
 3. GPU 固定点反復カーネル (update_dom_shared_opt) により、dominators の固定点反復を実施
 4. GPU 即時支配者計算カーネル (compute_idom) により、各頂点の即時支配者を計算（v==root は -1）
 5. 結果をホスト側へ転送し、各フェーズの計算時間と結果を出力（print の時間は含まない）
+
+メモ：
+compute_predecessors:
+各頂点ごとに隣接リストを読み取って前駆リストを構築する処理は、各頂点の処理が独立しているため、たとえばマルチスレッドまたはGPUで各頂点の処理を並列に行い、各頂点ごとに局所バッファに結果を書き出した後でマージすることで並列化が可能。
+
+prepare_graph_arrays:
+各頂点の前駆リストの長さを計算してからの排他的スキャンは、典型的な並列プリフィックスサム問題であり、GPUなどで高速に実装できます。また、リストからの連結処理もあらかじめ各頂点ごとの領域が確定していれば並列コピーで実現可能。
+
 """
 
 import numpy as np
