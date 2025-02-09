@@ -60,20 +60,20 @@ mod_init = SourceModule(init_kernel_code, options=["--use_fast_math"])
 init_preproc = mod_init.get_function("init_preproc")
 
 # ----------------------------------------------------
-# 3. 永続型カーネル (固定点反復 + 即時 dominator 計算) の最適化版
-#    ・各スレッドで自身のビットをレジスタに保持
-#    ・不要な同期呼び出しを削減（各反復毎に１度の__syncwarp()のみ）
-#    ※ 将来的に、warp shuffle命令やCooperative Groupsの利用によるさらなる最適化も検討可能
+# 3. 永続型カーネル (固定点反復 + 即時 dominator 計算)
+#    restrict 指定子と __ldg() による読み出しの最適化
+#    ※ n <= warp size (例: n≦32) を前提
 # ----------------------------------------------------
 persistent_idom_kernel_code = r'''
 extern "C"
 __global__ void persistent_idom_kernel(int n, int root, unsigned int U,
-                                         const int *pred_offsets, const int *pred_list,
+                                         const int * __restrict__ pred_offsets,
+                                         const int * __restrict__ pred_list,
                                          int *idom, unsigned int *dom_out)
 {
     int v = threadIdx.x;
     extern __shared__ unsigned int s_dom[];
-    
+
     unsigned int my_bit = (1u << v);
     
     if (v < n)
@@ -85,10 +85,10 @@ __global__ void persistent_idom_kernel(int n, int root, unsigned int U,
         bool local_changed = false;
         if (v < n && v != root) {
             unsigned int newDom = U;
-            int start = pred_offsets[v];
-            int end = pred_offsets[v+1];
+            int start = __ldg(&pred_offsets[v]);
+            int end   = __ldg(&pred_offsets[v+1]);
             for (int i = start; i < end; i++) {
-                int u = pred_list[i];
+                int u = __ldg(&pred_list[i]);
                 newDom &= s_dom[u];
             }
             newDom |= my_bit;
@@ -97,7 +97,7 @@ __global__ void persistent_idom_kernel(int n, int root, unsigned int U,
                 local_changed = true;
             }
         }
-        __syncwarp();
+        __syncwarp();  
         unsigned int ballot = __ballot_sync(0xFFFFFFFF, local_changed);
         if (ballot == 0)
             break;
@@ -134,7 +134,7 @@ def bitmask_to_set(mask):
     return s
 
 # ----------------------------------------------------
-# 5. メイン処理 (最適化版)
+# 5. メイン処理 (さらに最適化版)
 # ----------------------------------------------------
 def main():
     # グラフ定義 (例: 5 頂点)
@@ -151,7 +151,7 @@ def main():
     results = {}
     t0 = time.time()
     
-    # グラフ前処理をGPU上で実施（ホストとの転送なし）
+    # グラフ前処理をGPU上で実施（ホストとの転送を削減）
     pred_list_gpu, pred_offsets_gpu = prepare_graph_arrays_vectorized(graph)
     t1 = time.time()
     results["GPU-based Graph Preprocessing"] = (t1 - t0) * 1000
@@ -169,7 +169,8 @@ def main():
     gray_gpu   = cuda.mem_alloc(gray_host.nbytes)
     idom_gpu   = cuda.mem_alloc(idom_host.nbytes)
     
-    # ※ 必要に応じ、複数ストリームによる非同期転送・カーネル起動のオーバーラッピングも検討可能
+    # ※ 必要に応じ、複数ストリームやCUDA Graphs API を用いて
+    #     ホスト→デバイス転送・カーネル起動のオーバーラッピングによる最適化も検討可能
     
     # GPU 前処理カーネルの実行
     block_size_init = 128
@@ -185,8 +186,8 @@ def main():
     results["GPU Preprocessing Kernel"] = start_event.time_till(end_event)
     
     # 永続型カーネルの実行
-    # pred_list_gpu, pred_offsets_gpu はすでにGPU上にあるため、ホスト→GPU転送は不要
-    pred_list_ptr = int(pred_list_gpu.data.ptr)
+    # pred_list_gpu, pred_offsets_gpu はすでにGPU上にあるためホスト→GPU転送は不要
+    pred_list_ptr    = int(pred_list_gpu.data.ptr)
     pred_offsets_ptr = int(pred_offsets_gpu.data.ptr)
     
     block_size_persistent = n if n > 0 else 1
@@ -194,10 +195,10 @@ def main():
     shared_mem_size = block_size_persistent * np.uint32(0).nbytes
     persistent_start = time.time()
     persistent_idom_kernel(np.int32(n), np.int32(root), np.uint32(U),
-                           np.intp(pred_offsets_ptr), np.intp(pred_list_ptr),
-                           idom_gpu, dom_gpu,
-                           block=(block_size_persistent, 1, 1), grid=(grid_size_persistent, 1),
-                           shared=shared_mem_size)
+                             np.intp(pred_offsets_ptr), np.intp(pred_list_ptr),
+                             idom_gpu, dom_gpu,
+                             block=(block_size_persistent, 1, 1), grid=(grid_size_persistent, 1),
+                             shared=shared_mem_size)
     cuda.Context.synchronize()
     persistent_end = time.time()
     results["Persistent Kernel"] = (persistent_end - persistent_start) * 1000
