@@ -313,3 +313,5 @@ if __name__ == '__main__':
     total_end = time.time()
     print("全体実行時間: {:.3f} ms".format((total_end - total_start)*1000))
 
+　　# 全体実行時間はprintも含まれていることに留意すること 
+
