@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+GPU‐only Immediate Dominator Calculation using PyCUDA
 
-- グラフは辞書形式（例：5頂点）
-- 各頂点の dominator set は 32ビット整数（ビットマスク）で表現
-- GPU 上で、初期化カーネルにより dominator set の初期設定と GrayCode 計算を非同期・並列実行
-- 固定点反復は、ブロック内で共有メモリとブロック単位の変更集約を用いて早期終了判定するカーネルで実施
-- ホスト側前処理はピン留めメモリ、非同期転送、ストリームを活用して最適化
-- 各フェーズの計算時間をミリ秒単位で測定し、出力（print）の時間は計測に含めない
+【前提】
+- グラフは 0～n-1 の頂点番号が DFS 順序（または近似）になっていると仮定（例: 5頂点）
+- 各頂点の dominator set は 32ビット整数（ビットマスク）で表現（n <= 32）
+- 初期 dominator set の計算、固定点反復、即時支配者の計算を可能な限り CUDA 上で実施
+
+【処理の流れ】
+1. ホスト側でグラフの前駆リストを作成し、ピン留めメモリとして GPU に転送
+2. GPU 前処理カーネル (init_preproc) により、各頂点の初期 dominator set および GrayCode ラベルを並列計算
+3. GPU 固定点反復カーネル (update_dom_shared_opt) により、dominators の固定点反復を実施
+4. GPU 即時支配者計算カーネル (compute_idom) により、各頂点の即時支配者を計算（v==root は -1）
+5. 結果をホスト側へ転送し、各フェーズの計算時間と結果を出力（print の時間は含まない）
 """
 
 import numpy as np
@@ -29,7 +35,7 @@ def compute_predecessors(graph):
 
 def prepare_graph_arrays(graph):
     """
-    各頂点の前駆リストをフラットな配列と各頂点の開始位置配列に変換
+    各頂点の前駆リストをフラットな配列と、各頂点の開始位置配列に変換
     戻り値: (pred_list_np, pred_offsets_np)
     """
     n = len(graph)
@@ -59,7 +65,7 @@ __global__ void init_preproc(int n, int root, unsigned int U,
     if (v >= n) return;
     // GrayCode 計算: v XOR (v >> 1)
     gray[v] = v ^ (v >> 1);
-    // dominator set 初期化：root は自分のみ、他は全ビット1
+    // dominator set 初期化：root は自分のみ、その他は全ビット1
     if (v == root)
         dom[v] = (1 << v);
     else
@@ -139,45 +145,40 @@ mod_update = SourceModule(update_kernel_code, options=["--use_fast_math"])
 update_dom_shared_opt = mod_update.get_function("update_dom_shared_opt")
 
 # ====================================================
-# 4. ホスト側後処理：DFS 順序と即時支配者決定
+# 4. GPU 即時支配者計算カーネル：各頂点の dominator set から即時支配者を計算
 # ====================================================
-def dfs_order(graph, root):
-    """根からの DFS 順序を計算し、各頂点に順序番号を割り当てる"""
-    order = {}
-    visited = set()
-    counter = 0
-    def dfs(v):
-        nonlocal counter
-        visited.add(v)
-        order[v] = counter
-        counter += 1
-        for w in graph[v]:
-            if w not in visited:
-                dfs(w)
-    dfs(root)
-    return order
+# このカーネルでは、各頂点 v (v != root) について、
+# 「dom[v] に含まれる候補の中で最大の頂点番号（v自身を除く）を即時支配者として選ぶ」
+# なお、グラフが DFS 順序になっていると仮定します。
+idom_kernel_code = r'''
+extern "C"
+__global__ void compute_idom(int n, const unsigned int *dom, int root, int *idom)
+{
+    int v = blockDim.x * blockIdx.x + threadIdx.x;
+    if (v >= n) return;
+    if (v == root) {
+        idom[v] = -1;
+        return;
+    }
+    int candidate = -1;
+    unsigned int dmask = dom[v];
+    // vは dominator set に含まれているが除外
+    for (int d = 0; d < n; d++) {
+        if (d == v) continue;
+        if (dmask & (1u << d)) {
+            if (d > candidate) candidate = d;
+        }
+    }
+    idom[v] = candidate;
+}
+'''
 
-def compute_immediate_dominators(dom, order, root, n):
-    """
-    各頂点 v (v ≠ root) について、dom[v] から v を除く候補の中で、
-    DFS 順序が最大の頂点を即時支配者として選択
-    """
-    idom = {}
-    for v in range(n):
-        if v == root:
-            continue
-        candidates = []
-        for d in range(n):
-            if d == v:
-                continue
-            if dom[v] & (1 << d):
-                candidates.append(d)
-        if candidates:
-            idom[v] = max(candidates, key=lambda d: order[d])
-        else:
-            idom[v] = None
-    return idom
+mod_idom = SourceModule(idom_kernel_code, options=["--use_fast_math"])
+compute_idom = mod_idom.get_function("compute_idom")
 
+# ====================================================
+# 5. ホスト側後処理：結果の受信（DFS 順序計算は不要と仮定）
+# ====================================================
 def bitmask_to_set(mask):
     """ビットマスクを集合に変換（デバッグ用）"""
     s = set()
@@ -190,7 +191,7 @@ def bitmask_to_set(mask):
     return s
 
 # ====================================================
-# 5. メイン処理（計算部分のみの時間計測）と最終出力（printは計測対象外）
+# 6. メイン処理と実行時間計測（計算時間のみ：ms 単位、出力は最後）
 # ====================================================
 def main():
     # --- グラフ定義（例: 5頂点） ---
@@ -204,7 +205,7 @@ def main():
     root = 0
     n = len(graph)
     
-    results = {}  # 各フェーズの計算時間を記録
+    results = {}  # 各フェーズの計算時間記録
     
     # ホスト側前処理：グラフ配列作成
     t0 = time.time()
@@ -243,14 +244,14 @@ def main():
                  block=(block_size_init, 1, 1), grid=(grid_size_init, 1), stream=stream)
     end_event.record(stream)
     stream.synchronize()
-    results["GPU Preprocessing Kernel"] = start_event.time_till(end_event)  # ms
+    results["GPU Preprocessing Kernel"] = start_event.time_till(end_event)
     
     # GPU 固定点反復ループ（最適化版カーネル、非同期）
     block_size = 128
     grid_size = (n + block_size - 1) // block_size
     shared_mem_size = block_size * np.uint32(0).nbytes
     iteration = 0
-    compute_start = time.time()  # 計算部分の開始時刻
+    compute_start = time.time()
     while True:
         iteration += 1
         changed_host[0] = 0
@@ -264,32 +265,26 @@ def main():
         stream.synchronize()
         if changed_host[0] == 0:
             break
-    compute_end = time.time()  # 計算部分の終了時刻
-    results["GPU Fixed-Point Iteration Loop"] = (compute_end - compute_start)*1000  # ms
+    compute_end = time.time()
+    results["GPU Fixed-Point Iteration Loop"] = (compute_end - compute_start)*1000
     results["Iteration Count"] = iteration
     
-    # GPU から結果取得（非同期）
+    # GPU から dominator set 結果取得（非同期）
     cuda.memcpy_dtoh_async(dom_host, dom_gpu, stream)
     stream.synchronize()
     
-    # ホスト側 DFS 順序計算
-    t2 = time.time()
-    order = dfs_order(graph, root)
-    t3 = time.time()
-    results["Host DFS Order Calculation"] = (t3 - t2)*1000  # ms
-    
-    # ホスト側 即時支配者決定
-    t4 = time.time()
-    idom = compute_immediate_dominators(dom_host, order, root, n)
-    t5 = time.time()
-    results["Host Immediate Dominator Calculation"] = (t5 - t4)*1000  # ms
-    
-    # GPU 前処理結果の GrayCode の取得（非同期）
-    cuda.memcpy_dtoh_async(gray_host, gray_gpu, stream)
+    # GPU 即時支配者計算カーネル呼び出し
+    idom_host = cuda.pagelocked_empty(n, dtype=np.int32)
+    block_size_idom = 128
+    grid_size_idom = (n + block_size_idom - 1) // block_size_idom
+    start_event.record(stream)
+    compute_idom(np.int32(n), dom_gpu, np.int32(root), cuda.Out(idom_host),
+                 block=(block_size_idom, 1, 1), grid=(grid_size_idom, 1), stream=stream)
+    end_event.record(stream)
     stream.synchronize()
+    results["GPU Immediate Dominator Kernel"] = start_event.time_till(end_event)
     
-    # 計算部分の終了後の時刻を保存（出力は含めない）
-    total_compute_time = (time.time() - t0)*1000  # ms
+    total_compute_time = (time.time() - t0)*1000  # ms（出力時間は含まない）
     
     # --- 以下、出力部（計算時間には含めない） ---
     print("\n==== Execution Time Results (ms) ====")
@@ -304,16 +299,14 @@ def main():
     for v in range(n):
         print("  v = {:2d}: {}".format(v, sorted(bitmask_to_set(dom_host[v]))))
     
-    print("\n==== DFS Order ====")
-    print(order)
-    
     print("\n==== Immediate Dominators (idom) ====")
-    for v in sorted(idom.keys()):
-        print("  v = {:2d}: idom = {}".format(v, idom[v]))
+    for v in range(n):
+        print("  v = {:2d}: idom = {}".format(v, idom_host[v]))
     
     print("\n==== GrayCode Labels ====")
     for v in range(n):
         print("  v = {:2d}: gray = {}".format(v, gray_host[v]))
-
+    
 if __name__ == '__main__':
     main()
+
