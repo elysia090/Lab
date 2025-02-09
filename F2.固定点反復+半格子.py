@@ -1,10 +1,9 @@
+
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
 
-このコードは、各ブロック（GPUのブロック単位）ごとに対象頂点の dominator set を共有メモリにロードし、
-局所的な固定点反復を実施してからグローバルメモリに書き戻すことで、
-グローバル同期の頻度を下げ、メモリアクセスの高速化を図るものです。
+"""
 
 dominator tree の計算自体が、コンパイラ最適化やプログラム解析の分野で古典的かつ難解な問題とされ、
 従来は Lengauer–Tarjan アルゴリズムなどが使われていました。
@@ -12,14 +11,18 @@ dominator tree の計算自体が、コンパイラ最適化やプログラム�
 これを並列化し、さらに固定点反復とビットベクトル（半格子の性質）による表現に置き換えることで、
 問題の本質に対して新しいアプローチを提示しています。
 
-※ 各 dominator set は、頂点数 n (n ≤ 32) を前提に 32bit 整数（ビットマスク）で表現しています。
-
+・グラフは辞書形式で定義（例：頂点数 n ≤ 32）
+・各頂点の dominator set は 32 ビット整数（ビットマスク）で表現
+・前処理として、各頂点の初期 dominator set の設定とサイクリックグレイコードの計算を GPU 上で並列実行
+・その後、共有メモリを用いた局所固定点反復カーネルで dominator set を更新する
+・各フェーズの実行時間をミリ秒単位で計測する
 """
 
 import numpy as np
 import pycuda.autoinit
 import pycuda.driver as cuda
 from pycuda.compiler import SourceModule
+import time
 
 # ====================================================
 # 1. ホスト側の前処理（グラフ前駆リストの作成など）
@@ -193,7 +196,7 @@ def bitmask_to_set(mask):
     return s
 
 # ====================================================
-# 5. メイン処理
+# 5. メイン処理と実行時間計測（ミリ秒単位）
 # ====================================================
 def main():
     # --- グラフ定義（例: 5頂点） ---
@@ -212,27 +215,26 @@ def main():
     root = 0
     n = len(graph)
     
-    # --- 前処理：グラフ配列の準備 ---
+    # --- ホスト側前処理 ---
+    t0 = time.time()
     pred_list_np, pred_offsets_np = prepare_graph_arrays(graph)
+    t1 = time.time()
+    print("ホスト側 グラフ前処理時間: {:.3f} ms".format((t1 - t0) * 1000))
     
     # --- GPU 用初期化：dom と gray の並列前処理 ---
-    # ここで U = (1<<n) - 1
-    U = (1 << n) - 1
-    # dom_host は一旦確保（サイズ n, dtype uint32）
+    U = (1 << n) - 1  # 全ビット1
     dom_host = np.empty(n, dtype=np.uint32)
-    # gray 用配列（各頂点の GrayCode ラベル、int32）
     gray_host = np.empty(n, dtype=np.int32)
     
-    # GPU メモリへ転送用バッファ
+    # GPU メモリへのバッファ確保
     dom_gpu = cuda.mem_alloc(dom_host.nbytes)
     gray_gpu = cuda.mem_alloc(gray_host.nbytes)
-    # 初期化カーネルでセットするので、内容は初期化不要
     
-    # --- 変更フラグ用バッファ ---
+    # 変更フラグ用バッファ
     changed_host = np.zeros(1, dtype=np.int32)
     changed_gpu = cuda.mem_alloc(changed_host.nbytes)
     
-    # --- グラフ前駆情報の GPU 転送 ---
+    # GPU 前駆情報の転送
     pred_list_gpu = cuda.mem_alloc(pred_list_np.nbytes)
     cuda.memcpy_htod(pred_list_gpu, pred_list_np)
     pred_offsets_gpu = cuda.mem_alloc(pred_offsets_np.nbytes)
@@ -241,16 +243,23 @@ def main():
     # --- GPU 前処理カーネル呼び出し（初期 dominator set & GrayCode 計算） ---
     block_size_init = 128
     grid_size_init = (n + block_size_init - 1) // block_size_init
+    start_event = cuda.Event()
+    end_event = cuda.Event()
+    start_event.record()
     init_preproc(np.int32(n), np.int32(root), np.uint32(U), 
                  dom_gpu, gray_gpu,
                  block=(block_size_init, 1, 1), grid=(grid_size_init, 1))
-    # ※ 結果は後で dominator 固定点反復で使用
+    end_event.record()
+    end_event.synchronize()
+    kernel_time = start_event.time_till(end_event)  # ミリ秒単位
+    print("GPU 前処理カーネル時間: {:.3f} ms".format(kernel_time))
     
     # --- GPU 固定点反復ループ（共有メモリ版） ---
     block_size = 128
     grid_size = (n + block_size - 1) // block_size
     shared_mem_size = block_size * np.uint32(0).nbytes  # 各ブロックで block_size 個の uint32
     iteration = 0
+    gpu_loop_start = time.time()
     while True:
         iteration += 1
         changed_host[0] = 0
@@ -265,7 +274,8 @@ def main():
         cuda.memcpy_dtoh(changed_host, changed_gpu)
         if changed_host[0] == 0:
             break
-    print("GPU 固定点反復終了（反復回数 =", iteration, ")")
+    gpu_loop_end = time.time()
+    print("GPU 固定点反復終了（反復回数 = {}, ループ時間 = {:.3f} ms）".format(iteration, (gpu_loop_end - gpu_loop_start)*1000))
     
     # --- GPU から結果の dominator set を取得 ---
     cuda.memcpy_dtoh(dom_host, dom_gpu)
@@ -275,11 +285,17 @@ def main():
         print("  v = {:2d}: {}".format(v, sorted(bitmask_to_set(dom_host[v]))))
     
     # --- ホスト側 DFS 順序の計算 ---
+    dfs_start = time.time()
     order = dfs_order(graph, root)
+    dfs_end = time.time()
+    print("ホスト側 DFS 順序計算時間: {:.3f} ms".format((dfs_end - dfs_start)*1000))
     print("DFS 順序:", order)
     
     # --- 即時支配者の決定 ---
+    idom_start = time.time()
     idom = compute_immediate_dominators(dom_host, order, root, n)
+    idom_end = time.time()
+    print("ホスト側 即時支配者決定時間: {:.3f} ms".format((idom_end - idom_start)*1000))
     print("即時支配者 (idom):")
     for v in sorted(idom.keys()):
         print("  v = {:2d}: idom = {}".format(v, idom[v]))
@@ -292,5 +308,8 @@ def main():
         print("  v = {:2d}: gray = {}".format(v, gray_result[v]))
     
 if __name__ == '__main__':
+    total_start = time.time()
     main()
+    total_end = time.time()
+    print("全体実行時間: {:.3f} ms".format((total_end - total_start)*1000))
 
