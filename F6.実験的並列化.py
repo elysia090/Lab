@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-最適化された GPU-only Immediate Dominator Calculation with Persistent Kernel and Vectorized Graph Preprocessing
 
 【最適化ポイント】
 - グラフ前処理部分でリスト内包表記を用いてループオーバーヘッドを低減
