@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-
-【最適化ポイント】
-- グラフ前処理部分でリスト内包表記を用いてループオーバーヘッドを低減
-- CuPy の処理結果を非同期転送＋CUDAストリームで取得（CUDAピン留めメモリへの転送効率向上）
-- 固定点反復カーネルでは、n<=warp size（例：n≦32）を前提として __syncwarp() を使用し、
-  ブロック全体の同期(__syncthreads())のオーバーヘッドを削減
+  - グラフ前処理はGPU上で完結してホストとデバイス間の転送を削減
+  - 永続型カーネル内では不要な同期呼び出しを削減し、各スレッドでのシフト演算を事前計算
+  - 必要に応じて、複数ストリームやCUDA Graphsによるオーバーラッピングも検討可能
 """
 
 import numpy as np
@@ -17,7 +14,7 @@ from pycuda.compiler import SourceModule
 import time
 
 # ----------------------------------------------------
-# 1. グラフ前処理 (ホスト側)
+# 1. グラフ前処理 (GPU上で完結)
 # ----------------------------------------------------
 def graph_to_edge_list(graph):
     """辞書形式のグラフ {vertex: [neighbors]} をエッジリスト (src, dst) に変換"""
@@ -27,47 +24,22 @@ def graph_to_edge_list(graph):
 
 def prepare_graph_arrays_vectorized(graph):
     """
-    グラフを前処理して以下の配列を作成:
-      - pred_list_np: 各頂点の前駆頂点をまとめたフラット配列（宛先でソート済み）
-      - pred_offsets_np: 各頂点の前駆頂点リストの開始オフセット
+    グラフをGPU上で前処理して以下のCuPy配列を作成:
+      - sorted_src_gpu: 各頂点の前駆頂点をまとめたフラット配列（宛先でソート済み）
+      - offsets_gpu: 各頂点の前駆頂点リストの開始オフセット
+    ホストとデバイス間の転送を削減するため、結果はGPU上に保持します。
     """
     src, dst = graph_to_edge_list(graph)
     n = len(graph)
-    
-    # CuPy により GPU 上で計算
     src_gpu = cp.asarray(src)
     dst_gpu = cp.asarray(dst)
     order = cp.argsort(dst_gpu)
     sorted_src_gpu = src_gpu[order]
     sorted_dst_gpu = dst_gpu[order]
-    # cp.arange の結果が int64 にならないように、dtype を合わせる
     offsets_gpu = cp.searchsorted(sorted_dst_gpu, cp.arange(n + 1, dtype=sorted_dst_gpu.dtype))
-    # 型が int32 であることを保証（ピン留めメモリの型と一致させる）
     if offsets_gpu.dtype != cp.int32:
         offsets_gpu = offsets_gpu.astype(cp.int32)
-    
-    # 非同期転送のための CUDA ストリーム作成
-    stream = cuda.Stream()
-    # CUDA ピン留めメモリに転送（非同期転送）
-    pred_list_np = cuda.pagelocked_empty(int(sorted_src_gpu.size), dtype=np.int32)
-    cp.cuda.runtime.memcpyAsync(
-        pred_list_np.ctypes.data, 
-        sorted_src_gpu.data.ptr, 
-        int(sorted_src_gpu.nbytes), 
-        cp.cuda.runtime.memcpyDeviceToHost, 
-        stream.handle)
-    stream.synchronize()  # 転送完了待ち
-
-    pred_offsets_np = cuda.pagelocked_empty(int(offsets_gpu.size), dtype=np.int32)
-    cp.cuda.runtime.memcpyAsync(
-        pred_offsets_np.ctypes.data, 
-        offsets_gpu.data.ptr, 
-        int(offsets_gpu.nbytes), 
-        cp.cuda.runtime.memcpyDeviceToHost, 
-        stream.handle)
-    stream.synchronize()
-    
-    return pred_list_np, pred_offsets_np
+    return sorted_src_gpu, offsets_gpu
 
 # ----------------------------------------------------
 # 2. GPU 前処理カーネル (init_preproc)
@@ -80,15 +52,18 @@ __global__ void init_preproc(int n, int root, unsigned int U,
     int v = blockDim.x * blockIdx.x + threadIdx.x;
     if (v >= n) return;
     gray[v] = v ^ (v >> 1);
-    dom[v] = (v == root) ? (1u << v) : U;
+    unsigned int my_bit = (1u << v);
+    dom[v] = (v == root) ? my_bit : U;
 }
 '''
 mod_init = SourceModule(init_kernel_code, options=["--use_fast_math"])
 init_preproc = mod_init.get_function("init_preproc")
 
 # ----------------------------------------------------
-# 3. 最適化された持続型カーネル (固定点反復 + 即時 dominator 計算)
-# (n <= warp size の場合に __syncwarp() を使用)
+# 3. 永続型カーネル (固定点反復 + 即時 dominator 計算) の最適化版
+#    ・各スレッドで自身のビットをレジスタに保持
+#    ・不要な同期呼び出しを削減（各反復毎に１度の__syncwarp()のみ）
+#    ※ 将来的に、warp shuffle命令やCooperative Groupsの利用によるさらなる最適化も検討可能
 # ----------------------------------------------------
 persistent_idom_kernel_code = r'''
 extern "C"
@@ -99,12 +74,14 @@ __global__ void persistent_idom_kernel(int n, int root, unsigned int U,
     int v = threadIdx.x;
     extern __shared__ unsigned int s_dom[];
     
+    unsigned int my_bit = (1u << v);
+    
     if (v < n)
-        s_dom[v] = (v == root) ? (1u << v) : U;
-    __syncwarp();  
+        s_dom[v] = (v == root) ? my_bit : U;
+    
+    __syncwarp();
     
     for (int iter = 0; iter < 10000; iter++) {
-        __syncwarp();
         bool local_changed = false;
         if (v < n && v != root) {
             unsigned int newDom = U;
@@ -114,7 +91,7 @@ __global__ void persistent_idom_kernel(int n, int root, unsigned int U,
                 int u = pred_list[i];
                 newDom &= s_dom[u];
             }
-            newDom |= (1u << v);
+            newDom |= my_bit;
             if (newDom != s_dom[v]) {
                 s_dom[v] = newDom;
                 local_changed = true;
@@ -157,7 +134,7 @@ def bitmask_to_set(mask):
     return s
 
 # ----------------------------------------------------
-# 5. メイン処理
+# 5. メイン処理 (最適化版)
 # ----------------------------------------------------
 def main():
     # グラフ定義 (例: 5 頂点)
@@ -174,15 +151,15 @@ def main():
     results = {}
     t0 = time.time()
     
-    # グラフ前処理 (CuPy による GPU 上での計算＋非同期転送)
-    pred_list_np, pred_offsets_np = prepare_graph_arrays_vectorized(graph)
+    # グラフ前処理をGPU上で実施（ホストとの転送なし）
+    pred_list_gpu, pred_offsets_gpu = prepare_graph_arrays_vectorized(graph)
     t1 = time.time()
-    results["Host Graph Preprocessing (GPU-based)"] = (t1 - t0) * 1000
+    results["GPU-based Graph Preprocessing"] = (t1 - t0) * 1000
     
     # dominator セット初期値 U（各ビットが 1 の集合）
     U = (1 << n) - 1
     
-    # ピン留めメモリの確保 (ホスト)
+    # ピン留めメモリの確保（ホスト）
     dom_host   = cuda.pagelocked_empty(n, dtype=np.uint32)
     gray_host  = cuda.pagelocked_empty(n, dtype=np.int32)
     idom_host  = cuda.pagelocked_empty(n, dtype=np.int32)
@@ -192,13 +169,7 @@ def main():
     gray_gpu   = cuda.mem_alloc(gray_host.nbytes)
     idom_gpu   = cuda.mem_alloc(idom_host.nbytes)
     
-    # 非同期転送用のストリーム作成
-    stream = cuda.Stream()
-    pred_list_gpu = cuda.mem_alloc(pred_list_np.nbytes)
-    cuda.memcpy_htod_async(pred_list_gpu, pred_list_np, stream)
-    pred_offsets_gpu = cuda.mem_alloc(pred_offsets_np.nbytes)
-    cuda.memcpy_htod_async(pred_offsets_gpu, pred_offsets_np, stream)
-    stream.synchronize()
+    # ※ 必要に応じ、複数ストリームによる非同期転送・カーネル起動のオーバーラッピングも検討可能
     
     # GPU 前処理カーネルの実行
     block_size_init = 128
@@ -213,20 +184,23 @@ def main():
     end_event.synchronize()
     results["GPU Preprocessing Kernel"] = start_event.time_till(end_event)
     
-    # 持続型カーネルの実行
-    # ※ n <= warp size (例: n≦32) を前提としているため、ブロックサイズは n
+    # 永続型カーネルの実行
+    # pred_list_gpu, pred_offsets_gpu はすでにGPU上にあるため、ホスト→GPU転送は不要
+    pred_list_ptr = int(pred_list_gpu.data.ptr)
+    pred_offsets_ptr = int(pred_offsets_gpu.data.ptr)
+    
     block_size_persistent = n if n > 0 else 1
     grid_size_persistent  = 1
     shared_mem_size = block_size_persistent * np.uint32(0).nbytes
     persistent_start = time.time()
     persistent_idom_kernel(np.int32(n), np.int32(root), np.uint32(U),
-                           pred_offsets_gpu, pred_list_gpu,
+                           np.intp(pred_offsets_ptr), np.intp(pred_list_ptr),
                            idom_gpu, dom_gpu,
                            block=(block_size_persistent, 1, 1), grid=(grid_size_persistent, 1),
                            shared=shared_mem_size)
     cuda.Context.synchronize()
     persistent_end = time.time()
-    results["Persistent Kernel (Fixed-Point + Immediate Dominator)"] = (persistent_end - persistent_start) * 1000
+    results["Persistent Kernel"] = (persistent_end - persistent_start) * 1000
     
     # 結果の取得
     cuda.memcpy_dtoh(dom_host, dom_gpu)
