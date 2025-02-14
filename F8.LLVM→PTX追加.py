@@ -22,6 +22,8 @@ import numpy as np
 import cupy as cp
 import pycuda.autoinit
 import pycuda.driver as cuda
+from pycuda.compiler import SourceModule
+
 
 from llvmlite import ir, binding
 
