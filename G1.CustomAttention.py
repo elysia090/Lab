@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from typing import Optional, Tuple, List
 from dataclasses import dataclass
 import math
+import collections  # For OrderedDict for LRU cache
 
 @dataclass
 class FastAttentionConfig:
@@ -22,6 +23,9 @@ class FastAttentionConfig:
     wu_manber_prefix_len: int
     hyper_cuts_dim_groups: Optional[List[int]] = None
     n_lsh_hashes: int = 4  # Number of LSH hash functions per table
+    n_lsh_tables: int = 1   # Number of LSH tables per head (for ensemble - default 1)
+    trie_cache_max_size: int = 4 # Max size for Trie LRU cache
+
 
 class LowRankLinear(nn.Module):
     """Low-Rank Linear Layer"""
@@ -91,7 +95,7 @@ class Trie(nn.Module):
         return current_node.get(self._indices_key, [])
 
 class CandidateFinder(nn.Module):
-    """Candidate Finder (Wu-Manber + Trie + Hyper-Cuts)"""
+    """Candidate Finder (Wu-Manber + Trie + Hyper-Cuts) with Trie Caching and vmap (Conceptual)"""
     def __init__(self, config: FastAttentionConfig, tries: List[Trie], lsh_tables: nn.ModuleList):
         super().__init__()
         self.config = config
@@ -99,6 +103,8 @@ class CandidateFinder(nn.Module):
         self.lsh_tables = lsh_tables
         self.wu_manber_prefix_len = config.wu_manber_prefix_len
         self.hyper_cuts_dim_groups = config.hyper_cuts_dim_groups
+        self.trie_cache = collections.OrderedDict() # LRU Cache for Tries
+        self.trie_cache_max_size = config.trie_cache_max_size
 
     def binary_quantize(self, x: torch.Tensor) -> torch.Tensor:
         return (x > 0).float()
@@ -117,16 +123,19 @@ class CandidateFinder(nn.Module):
         return dim_groups
 
     def get_lsh_matches(self, query_up_group: torch.Tensor, key_up_group: torch.Tensor, head_idx: int, group_idx: int) -> torch.Tensor:
-        """LSH Matching for a dimension group, considering multiple hash functions."""
-        lsh_table_for_group = self.lsh_tables[head_idx][group_idx]
-        query_hashes = lsh_table_for_group(query_up_group) # [batch_size, seq_len, n_lsh_hashes]
-        key_hashes = lsh_table_for_group(key_up_group)     # [batch_size, seq_len, n_lsh_hashes]
+        """LSH Matching for a dimension group, considering multiple hash tables and functions."""
+        lsh_tables_for_group = self.lsh_tables[head_idx][group_idx] # Now list of LSH tables
 
-        # Check for match across ANY of the hash functions (OR condition)
-        matches = torch.zeros((query_hashes.size(0), query_hashes.size(1), key_hashes.size(1)), dtype=torch.bool, device=query_hashes.device)
-        for hash_idx in range(self.config.n_lsh_hashes):
-            matches = matches | (query_hashes[:, :, None, hash_idx] == key_hashes[:, None, :, hash_idx]) # Compare each hash function
-        return matches
+        # Combine results from multiple LSH tables (OR condition across tables)
+        combined_matches = torch.zeros((query_up_group.size(0), query_up_group.size(1), key_up_group.size(1)), dtype=torch.bool, device=query_up_group.device)
+        for lsh_table in lsh_tables_for_group:
+            query_hashes = lsh_table(query_up_group) # [batch_size, seq_len, n_lsh_hashes]
+            key_hashes = lsh_table(key_up_group)     # [batch_size, seq_len, n_lsh_hashes]
+            matches = torch.zeros((query_hashes.size(0), query_hashes.size(1), key_hashes.size(1)), dtype=torch.bool, device=query_hashes.device)
+            for hash_idx in range(self.config.n_lsh_hashes):
+                matches = matches | (query_hashes[:, :, None, hash_idx] == key_hashes[:, None, :, hash_idx]) # Compare each hash function
+            combined_matches = combined_matches | matches # OR across tables
+        return combined_matches
 
     def build_wu_manber_hash_table(self, key_binary_batch: torch.Tensor, prefix_len: int) -> dict:
         """Builds Wu-Manber hash table."""
@@ -156,22 +165,48 @@ class CandidateFinder(nn.Module):
             initial_candidates_list.append(self.wu_manber_search(query_vec_binary, wu_manber_hash_table, self.config.wu_manber_prefix_len))
         return initial_candidates_list
 
-    def _get_trie_candidates_group(self, batch_idx: int, query_up_group: torch.Tensor, key_up_group: torch.Tensor, head_idx: int, initial_candidates_list: List[List[int]]) -> List[List[int]]:
-        """Refine candidates using Trie per dimension group."""
-        trie = self.tries[head_idx]
-        trie.root_node = {} # Trie reset per head and batch - consider batch-level reuse if keys are batch-static
-        key_binary_batch = self.binary_quantize(key_up_group)
+    def _get_trie_group(self, key_up_group: torch.Tensor, head_idx: int) -> Trie:
+        """Gets Trie from LRU cache, building and caching if necessary."""
+        key_hash = hash(key_up_group.detach().cpu().numpy().tobytes()) # Detach before numpy() and hashing
 
+        if key_hash in self.trie_cache:
+            trie = self.trie_cache.pop(key_hash) # LRU: Move to end (most recently used)
+            self.trie_cache[key_hash] = trie
+            return trie
+
+        trie = self.tries[head_idx]
+        trie.root_node = {} # Clear Trie
+        key_binary_batch = self.binary_quantize(key_up_group)
         seq_len = key_up_group.size(1)
         for key_index in range(seq_len):
-            trie.insert(key_binary_batch[batch_idx, key_index].cpu(), key_index)
+            trie.insert(key_binary_batch[0, key_index].cpu(), key_index)
+
+        self._add_to_trie_cache(key_hash, trie) # Add to LRU cache
+        return trie
+
+    def _add_to_trie_cache(self, key_hash, trie):
+        """Adds Trie to LRU cache, evicting oldest if cache is full."""
+        if key_hash in self.trie_cache:
+            self.trie_cache.move_to_end(key_hash) # LRU update if already present
+            return
+
+        self.trie_cache[key_hash] = trie
+        if len(self.trie_cache) > self.trie_cache_max_size:
+            self.trie_cache.popitem(last=False) # LRU eviction (remove oldest)
+
+
+    def _get_trie_candidates_group(self, batch_idx: int, query_up_group: torch.Tensor, key_up_group: torch.Tensor, head_idx: int, initial_candidates_lists: List[List[int]]) -> List[List[int]]:
+        """Refine candidates using Trie per dimension group - now using cached Trie."""
+        trie = self._get_trie_group(key_up_group, head_idx) # Get Trie from cache
 
         trie_candidates_list = []
+        seq_len = query_up_group.size(1)
         for query_index in range(seq_len):
             query_vec_binary = self.binary_quantize(query_up_group[batch_idx, query_index]).cpu()
             trie_candidates = trie.search(query_vec_binary)
             trie_candidates_list.append(trie_candidates)
         return trie_candidates_list
+
 
     def merge_candidate_indices(self, candidate_indices_groups: List[torch.Tensor]) -> torch.Tensor:
         """Merges candidate indices from dimension groups (deduplication)."""
@@ -188,14 +223,16 @@ class CandidateFinder(nn.Module):
         return combined_candidates[top_indices]
 
     def _process_dimension_group(self, query_up_group: torch.Tensor, key_up_group: torch.Tensor, head_idx: int, group_idx: int, batch_size: int, seq_len: int) -> torch.Tensor:
-        """Processes candidate search for a single dimension group."""
+        """Processes candidate search for a single dimension group.  Potentially vectorizable with vmap."""
         lsh_matches = self.get_lsh_matches(query_up_group, key_up_group, head_idx, group_idx) # [batch_size, seq_len, key_seq_len]
-        initial_candidates_lists = self._get_initial_candidates_wu_manber_group(query_up_group, key_up_group, head_idx) # List[List[int]] - seq_len lists of candidate indices
-        trie_candidate_lists = self._get_trie_candidates_group(batch_size - 1, query_up_group, key_up_group, head_idx, initial_candidates_lists) # List[List[int]] - seq_len lists of candidate indices
+        initial_candidates_lists = self._get_initial_candidates_wu_manber_group(query_up_group, key_up_group, head_idx) # List[List[int]]
+        trie_candidate_lists = self._get_trie_candidates_group(batch_size - 1, query_up_group, key_up_group, head_idx, initial_candidates_lists) # List[List[int]]
 
         candidates_group = torch.full((batch_size, seq_len, self.config.k_max), -1, dtype=torch.long, device=query_up_group.device)
 
-        # Potential Vectorization/Parallelization Point: The loops below could be vectorized if possible.
+        # --- Potential vmap Vectorization Point ---
+        # The loops below are still present.  For true vmap vectorization, significant refactoring is needed.
+        # The following loop structure is kept for conceptual clarity and to highlight where vmap *could* be applied.
         for batch_idx in range(batch_size):
             for query_idx in range(seq_len):
                 matched_indices_lsh = lsh_matches[batch_idx, query_idx].nonzero(as_tuple=True)[0] # LSH matched indices
@@ -229,7 +266,7 @@ class CandidateFinder(nn.Module):
 
 
 class FastAttention(nn.Module):
-    """Fast Attention Mechanism (Wu-Manber + Trie + Hyper-Cuts)"""
+    """Fast Attention Mechanism (Wu-Manber + Trie + Hyper-Cuts) with Trie Caching and LSH Ensemble"""
     def __init__(self, config: FastAttentionConfig):
         super().__init__()
         self.config = config
@@ -242,12 +279,20 @@ class FastAttention(nn.Module):
 
         self.lsh_tables_list = nn.ModuleList([
             nn.ModuleList([
-                LSHTable(dim, config.lsh_buckets, config.lsh_bandwidth, config.n_lsh_hashes) # Pass n_lsh_hashes
+                nn.ModuleList([ # List of LSH tables for ensemble
+                    LSHTable(dim, config.lsh_buckets, config.lsh_bandwidth, config.n_lsh_hashes) # Pass n_lsh_hashes
+                    for _ in range(config.n_lsh_tables) # Multiple LSH tables for ensemble
+                ])
                 for dim in config.hyper_cuts_dim_groups
             ])
             for _ in range(config.n_heads)
         ]) if config.hyper_cuts_dim_groups else nn.ModuleList([
-            nn.ModuleList([LSHTable(config.lsh_key_dim, config.lsh_buckets, config.lsh_bandwidth, config.n_lsh_hashes)]) for _ in range(config.n_heads) # Pass n_lsh_hashes
+            nn.ModuleList([
+                nn.ModuleList([ # List of LSH tables for ensemble
+                    LSHTable(config.lsh_key_dim, config.lsh_buckets, config.lsh_bandwidth, config.n_lsh_hashes)
+                    for _ in range(config.n_lsh_tables) # Multiple LSH tables for ensemble
+                ])
+            ]) for _ in range(config.n_heads)
         ])
 
         self.tries_list = nn.ModuleList([Trie(config.stride) for _ in range(config.n_heads)])
@@ -260,13 +305,8 @@ class FastAttention(nn.Module):
         key_value_down = self.key_value_down_proj(key)
         head_outputs = []
 
-        # Build Tries once per batch (assuming key is batch-static) - Consider more advanced reuse if needed
-        for head_idx in range(self.config.n_heads):
-            self.tries_list[head_idx].root_node = {} # Clear Trie per head, batch. Consider batch-level reuse if keys are batch-static
-            key_binary_batch_for_trie = self.candidate_finder.binary_quantize(self.key_up_projs[head_idx](key_value_down))
-            seq_len_key = key_binary_batch_for_trie.size(1)
-            for key_index in range(seq_len_key):
-                self.tries_list[head_idx].insert(key_binary_batch_for_trie[0, key_index].cpu(), key_index) # Assumes batch_idx=0 for Trie building, if batch-static
+        # Trie building is now handled within CandidateFinder._get_trie_group using LRU Cache.
+        # No explicit Trie building loop here anymore.
 
         for head_idx in range(self.config.n_heads):
             query_up = self.query_up_projs[head_idx](query_down)
@@ -299,7 +339,8 @@ def example_usage():
     config = FastAttentionConfig(d_model=512, d_key=64, d_query=64, n_heads=8, rank=32,
                                   rff_dim=128, k_max=64, stride=4, lsh_buckets=32,
                                   lsh_bandwidth=4.0, lsh_key_dim=64, wu_manber_prefix_len=3,
-                                  hyper_cuts_dim_groups=[32, 32], n_lsh_hashes=4) # Added n_lsh_hashes
+                                  hyper_cuts_dim_groups=[32, 32], n_lsh_hashes=4,
+                                  n_lsh_tables=2, trie_cache_max_size=4) # Added n_lsh_hashes, n_lsh_tables, trie_cache_max_size
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = FastAttention(config).to(device)
     batch_size, seq_len = 2, 128
