@@ -12,7 +12,7 @@ from typing import Optional, Tuple, List, Dict
 ##############################################
 
 def optimized_sqrt(n: int) -> float:
-    if n & (n - 1) == 0:  # power-of-two check
+    if n & (n - 1) == 0:
         k = n.bit_length() - 1
         return 2 ** (k / 2)
     return math.sqrt(n)
@@ -24,7 +24,7 @@ def fma(a: float, b: float, c: float) -> float:
         return a * b + c
 
 ##############################################
-# Fast Attention Components
+# Fast Attention Components (Transformer-like Encoder Layer)
 ##############################################
 
 @dataclass
@@ -36,16 +36,16 @@ class FastAttentionConfig:
     rank: int             # Rank for low-rank approximations.
     rff_dim: int          # Output dimension for random Fourier features.
     k_max: int            # Maximum candidate keys per query.
-    stride: int           # Stride length for Trie (used as trie_stride).
+    stride: int           # Stride length for Trie.
     lsh_buckets: int      # Number of LSH buckets.
     lsh_bandwidth: float  # Bandwidth for LSH.
     lsh_key_dim: int      # LSH input dimension.
     wu_manber_prefix_len: int  # Prefix length for Wu-Manber search.
-    hyper_cuts_dim_groups: Optional[List[int]] = None  # Feature groups.
+    hyper_cuts_dim_groups: Optional[List[int]] = None
     n_lsh_hashes: int = 4
     dropout: float = 0.1
     intermediate_dim: int = 2048
-    use_rff: bool = True  # Whether to use RFF.
+    use_rff: bool = True
 
 class LowRankLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int, rank: int):
@@ -158,7 +158,6 @@ class CandidateFinder(nn.Module):
         return cand_lists
 
     def merge_candidate_indices_groups(self, cand_tensors: List[torch.Tensor]) -> torch.Tensor:
-        # Concatenate the candidate tensors along the last dimension.
         merged = torch.cat(cand_tensors, dim=-1)
         merged, _ = torch.sort(merged)
         return torch.unique_consecutive(merged, dim=-1)
@@ -182,7 +181,6 @@ class CandidateFinder(nn.Module):
         B, L, _ = query_up.size()
         query_groups = self.split_features_by_dim_groups(query_up)
         key_groups = self.split_features_by_dim_groups(key_up)
-        # Pass the list of candidate tensors directly.
         cand_list = [self._process_dimension_group_candidates(q_grp, k_grp, head_idx)
                      for q_grp, k_grp in zip(query_groups, key_groups)]
         if cand_list:
@@ -411,30 +409,36 @@ def optimize_candidate_search_hyperparams_for_layer(layer: FastAttentionEncoderL
     print("Optimized hyperparameters for this layer:", optimized_params)
 
 ##############################################
-# Main: Build Transformer, Optimize Each Layer, and Forward Pass
+# Transformer-like Encoder with GRPO Optimization on Every Hidden Layer
 ##############################################
 
 def main():
+    # Create configuration.
     config = FastAttentionConfig(
         d_model=512, d_key=64, d_query=64, n_heads=8, rank=32,
         rff_dim=128, k_max=64, stride=4, lsh_buckets=32,
         lsh_bandwidth=4.0, lsh_key_dim=64, wu_manber_prefix_len=3,
         hyper_cuts_dim_groups=[32, 32], n_lsh_hashes=4, dropout=0.1, intermediate_dim=2048, use_rff=True)
     
-    num_layers = 2
+    # Build a Transformer-like encoder with multiple hidden layers.
+    num_layers = 6  # for example, 6 encoder layers
     layers = nn.ModuleList([FastAttentionEncoderLayer(config) for _ in range(num_layers)])
+    
+    # Simulated validation data.
     validation_data = torch.randn(2, 128, config.d_model)
     
+    # Apply GRPO optimization to each hidden layer.
     for idx, layer in enumerate(layers):
-        print(f"\nOptimizing hyperparameters for Layer {idx}")
+        print(f"\nOptimizing GRPO hyperparameters for hidden layer {idx}")
         optimize_candidate_search_hyperparams_for_layer(layer, validation_data, num_episodes=10)
     
+    # End-to-end forward pass through the Transformer-like encoder.
     src = torch.randn(2, 128, config.d_model)
     src_mask = torch.ones(2, 128, 128, dtype=torch.bool)
     output = src
     for layer in layers:
         output = layer(output, src_mask)
-    print("\nFinal Transformer output shape:", output.shape)
+    print("\nFinal Transformer-like output shape:", output.shape)
 
 if __name__ == "__main__":
     main()
