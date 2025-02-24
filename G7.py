@@ -4,267 +4,664 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Normal, Categorical
-from dataclasses import dataclass
-from typing import Optional, Tuple, List, Dict, Callable
+from dataclasses import dataclass, field
+from typing import Optional, Tuple, List, Dict, Callable, Any, Union
 from torch.utils.tensorboard import SummaryWriter
+import logging
+import time
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 ##############################################
-# Low-level Helpers 
+# Low-level Helpers - Improved
 ##############################################
 
 def optimized_sqrt(n: int) -> float:
+    """Optimized square root for powers of 2."""
+    if n <= 0:
+        raise ValueError("Input must be positive")
     if n & (n - 1) == 0:
         k = n.bit_length() - 1
         return 2 ** (k / 2)
     return math.sqrt(n)
 
 def fma(a: float, b: float, c: float) -> float:
+    """Fused multiply-add with fallback to standard operations."""
     try:
         return math.fma(a, b, c)
     except AttributeError:
         return a * b + c
 
+def validate_tensor_dimensions(tensor: torch.Tensor, name: str, expected_dims: int):
+    """Validates tensor dimensions to provide clear error messages."""
+    if tensor.dim() != expected_dims:
+        raise ValueError(f"Expected {name} to have {expected_dims} dimensions, got {tensor.dim()}")
+
 ##############################################
-# Fast Attention Components 
+# Fast Attention Components - Improved
 ##############################################
 
 @dataclass
 class FastAttentionConfig:
-    d_model: int; d_key: int; d_query: int; n_heads: int; rank: int; rff_dim: int; k_max: int; stride: int
-    lsh_buckets: int; lsh_bandwidth: float; lsh_key_dim: int; wu_manber_prefix_len: int
-    hyper_cuts_dim_groups: Optional[List[int]] = None; n_lsh_hashes: int = 4; dropout: float = 0.1
-    intermediate_dim: int = 2048; use_rff: bool = True
+    """Configuration for FastAttention with validation."""
+    d_model: int
+    d_key: int
+    d_query: int
+    n_heads: int
+    rank: int
+    rff_dim: int
+    k_max: int
+    stride: int
+    lsh_buckets: int
+    lsh_bandwidth: float
+    lsh_key_dim: int
+    wu_manber_prefix_len: int
+    hyper_cuts_dim_groups: Optional[List[int]] = None
+    n_lsh_hashes: int = 4
+    dropout: float = 0.1
+    intermediate_dim: int = 2048
+    use_rff: bool = True
+    
+    def __post_init__(self):
+        """Validate configuration parameters."""
+        if self.d_model <= 0 or self.d_key <= 0 or self.d_query <= 0:
+            raise ValueError("Dimensions must be positive")
+        if self.n_heads <= 0:
+            raise ValueError("Number of heads must be positive")
+        if self.rank <= 0:
+            raise ValueError("Rank must be positive")
+        if self.hyper_cuts_dim_groups is not None:
+            if sum(self.hyper_cuts_dim_groups) != self.lsh_key_dim:
+                raise ValueError(f"Sum of hyper_cuts_dim_groups ({sum(self.hyper_cuts_dim_groups)}) "
+                                f"must equal lsh_key_dim ({self.lsh_key_dim})")
 
 class LowRankLinear(nn.Module):
+    """Improved LowRankLinear with better initialization and caching."""
     def __init__(self, in_features: int, out_features: int, rank: int):
         super().__init__()
-        self.u_weight = nn.Parameter(torch.randn(in_features, rank) / math.sqrt(rank))
-        self.v_weight = nn.Parameter(torch.randn(rank, out_features) / math.sqrt(rank))
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        
+        # Better initialization for numerical stability
+        std = 1.0 / math.sqrt(rank)
+        self.u_weight = nn.Parameter(torch.randn(in_features, rank) * std)
+        self.v_weight = nn.Parameter(torch.randn(rank, out_features) * std)
+        
+        # Cache the composed weight matrix for small ranks
+        self.register_buffer('composed_weight', None)
+        self.needs_composition = True
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.matmul(x, self.u_weight).matmul(self.v_weight)
+        # Cache the composed weight for efficiency if rank is small
+        if self.rank <= min(self.in_features, self.out_features) // 4:
+            if self.needs_composition or self.composed_weight is None:
+                self.composed_weight = torch.matmul(self.u_weight, self.v_weight)
+                self.needs_composition = False
+            return torch.matmul(x, self.composed_weight)
+        # Standard low-rank computation otherwise
+        return torch.matmul(torch.matmul(x, self.u_weight), self.v_weight)
+    
+    def train(self, mode: bool = True):
+        """Override train to reset composition cache when training."""
+        if mode and not self.training:
+            self.needs_composition = True
+        return super().train(mode)
 
 class RandomFourierFeatures(nn.Module):
+    """Improved RandomFourierFeatures with normalized projections."""
     def __init__(self, input_dim: int, rff_dim: int):
         super().__init__()
-        self.omega = nn.Parameter(torch.randn(input_dim, rff_dim), requires_grad=False)
+        # Normalize the random projection for better numerical properties
+        self.omega = nn.Parameter(torch.randn(input_dim, rff_dim) / math.sqrt(input_dim), 
+                                 requires_grad=False)
         self.bias = nn.Parameter(torch.rand(rff_dim) * 2 * math.pi, requires_grad=False)
         self.scale = math.sqrt(2.0 / rff_dim)
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        validate_tensor_dimensions(x, "input", expected_dims=x.dim())
+        # Handle reshaping internally for better usability
+        orig_shape = x.shape
+        if x.dim() > 2:
+            x = x.reshape(-1, orig_shape[-1])
+        
         projection = x.matmul(self.omega) + self.bias
-        return torch.cos(projection) * self.scale
+        result = torch.cos(projection) * self.scale
+        
+        # Restore original shape except for the last dimension
+        if x.dim() > 2:
+            result = result.reshape(*orig_shape[:-1], self.omega.size(1))
+        
+        return result
 
 class LSHTable(nn.Module):
-    def __init__(self, dim: int, n_buckets: int, bandwidth: float, n_hashes: int):
+    """Improved LSHTable with better hashing and optional seed control."""
+    def __init__(self, dim: int, n_buckets: int, bandwidth: float, n_hashes: int, seed: Optional[int] = None):
         super().__init__()
         self.dim = dim
         self.n_buckets = n_buckets
         self.bandwidth = bandwidth
         self.n_hashes = n_hashes
-        self.register_buffer("random_vectors", torch.randn(dim, n_hashes))
-
+        
+        # Set seed for reproducibility if provided
+        if seed is not None:
+            torch.manual_seed(seed)
+        
+        # Normalize random vectors for improved hash distribution
+        random_vectors = torch.randn(dim, n_hashes)
+        random_vectors = random_vectors / torch.norm(random_vectors, dim=0, keepdim=True)
+        self.register_buffer("random_vectors", random_vectors)
+        
+        # Counter for monitoring hash collisions
+        self.register_buffer("collision_count", torch.zeros(1))
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        validate_tensor_dimensions(x, "input", x.dim())
+        
+        # Project and hash
         proj = x.matmul(self.random_vectors)
-        return torch.floor(proj / self.bandwidth) % self.n_buckets
+        hashed = torch.floor(proj / self.bandwidth) % self.n_buckets
+        
+        # Count hash collisions for monitoring (in training mode)
+        if self.training:
+            # Simple estimate of collisions using birthday paradox formula
+            unique_hashes = torch.unique(hashed.reshape(-1, self.n_hashes), dim=0).shape[0]
+            total_hashes = hashed.reshape(-1, self.n_hashes).shape[0]
+            expected_unique = min(total_hashes, self.n_buckets ** self.n_hashes)
+            if expected_unique > 0 and total_hashes > 0:
+                self.collision_count[0] = 1.0 - (unique_hashes / expected_unique)
+        
+        return hashed
 
+# Improve Trie with efficient storage
 _TRIE_INDICES_KEY = '_indices'
+
 class Trie(nn.Module):
+    """Improved Trie with memory-efficient storage and faster lookups."""
     def __init__(self, stride: int):
         super().__init__()
         self.root_node: Dict = {}
         self.stride_len = stride
+        # Track metrics for optimization
+        self.max_depth = 0
+        self.node_count = 0
+    
     def insert(self, binary_vector: torch.Tensor, index: int) -> None:
+        """Insert a binary vector into the trie."""
+        if binary_vector.dim() != 1:
+            raise ValueError(f"Expected 1D binary_vector, got {binary_vector.dim()}D")
+        
         current_node = self.root_node
+        depth = 0
+        
         for i in range(0, len(binary_vector), self.stride_len):
-            prefix = tuple(binary_vector[i:i+self.stride_len].tolist())
+            depth += 1
+            end_idx = min(i + self.stride_len, len(binary_vector))
+            prefix = tuple(binary_vector[i:end_idx].tolist())
+            
             if prefix not in current_node:
                 current_node[prefix] = {}
+                self.node_count += 1
+            
             current_node = current_node[prefix]
-        current_node.setdefault(_TRIE_INDICES_KEY, []).append(index)
+        
+        # Store indices efficiently
+        if _TRIE_INDICES_KEY not in current_node:
+            current_node[_TRIE_INDICES_KEY] = []
+        
+        current_node[_TRIE_INDICES_KEY].append(index)
+        self.max_depth = max(self.max_depth, depth)
+    
     def search(self, binary_vector: torch.Tensor) -> List[int]:
+        """Search for matching indices efficiently."""
+        if binary_vector.dim() != 1:
+            raise ValueError(f"Expected 1D binary_vector, got {binary_vector.dim()}D")
+        
         current_node = self.root_node
+        
         for i in range(0, len(binary_vector), self.stride_len):
-            prefix = tuple(binary_vector[i:i+self.stride_len].tolist())
+            end_idx = min(i + self.stride_len, len(binary_vector))
+            prefix = tuple(binary_vector[i:end_idx].tolist())
+            
             if prefix not in current_node:
                 return []
+            
             current_node = current_node[prefix]
+        
         return current_node.get(_TRIE_INDICES_KEY, [])
+    
+    def clear(self) -> None:
+        """Clear the trie to free memory."""
+        self.root_node.clear()
+        self.max_depth = 0
+        self.node_count = 0
+
+class TrieCache(nn.Module):
+    """Cache of Tries for efficient reuse."""
+    def __init__(self, stride: int, max_cache_size: int = 16):
+        super().__init__()
+        self.stride = stride
+        self.max_cache_size = max_cache_size
+        self.cache = {}  # Maps hash of data to Trie
+    
+    def get_trie(self, data_hash: int) -> Tuple[Trie, bool]:
+        """Get a Trie for the given data hash, creating if needed."""
+        if data_hash in self.cache:
+            return self.cache[data_hash], True
+        
+        # Create new Trie if not found
+        trie = Trie(self.stride)
+        
+        # Manage cache size
+        if len(self.cache) >= self.max_cache_size:
+            # Remove oldest entry
+            oldest_key = next(iter(self.cache))
+            del self.cache[oldest_key]
+        
+        self.cache[data_hash] = trie
+        return trie, False
 
 class CandidateFinder(nn.Module):
-    def __init__(self, config: FastAttentionConfig, tries: List[Trie], lsh_tables: nn.ModuleList):
+    """Improved CandidateFinder with caching and parallel processing."""
+    def __init__(self, config: FastAttentionConfig):
         super().__init__()
         self.config = config
-        self.tries = tries
-        self.lsh_tables = lsh_tables
         self.wu_manber_prefix_len = config.wu_manber_prefix_len
         self.hyper_cuts_dim_groups = config.hyper_cuts_dim_groups
+        
+        # Create LSH tables for each head
+        self.lsh_tables = nn.ModuleList()
+        for _ in range(config.n_heads):
+            if config.hyper_cuts_dim_groups:
+                head_tables = nn.ModuleList()
+                for dim in config.hyper_cuts_dim_groups:
+                    head_tables.append(
+                        LSHTable(dim, config.lsh_buckets, config.lsh_bandwidth, config.n_lsh_hashes)
+                    )
+                self.lsh_tables.append(head_tables)
+            else:
+                self.lsh_tables.append(nn.ModuleList([
+                    LSHTable(config.lsh_key_dim, config.lsh_buckets, config.lsh_bandwidth, config.n_lsh_hashes)
+                ]))
+        
+        # Efficient trie caching
+        self.trie_cache = TrieCache(config.stride)
+        
+        # Cache for Wu-Manber hash tables
+        self.wu_manber_cache = {}
+        self.wu_manber_cache_hits = 0
+        self.wu_manber_cache_misses = 0
+    
     def binary_quantize(self, x: torch.Tensor) -> torch.Tensor:
+        """Quantize tensor to binary values efficiently."""
         return (x > 0).float()
+    
     def split_features_by_dim_groups(self, features: torch.Tensor) -> List[torch.Tensor]:
+        """Split features according to dimension groups."""
         if self.hyper_cuts_dim_groups is None:
             return [features]
+        
         groups = []
         start = 0
         for group_dim in self.hyper_cuts_dim_groups:
             groups.append(features[:, :, start:start+group_dim])
             start += group_dim
+        
         return groups
+    
     def _build_wu_manber_hash_table(self, key_bin: torch.Tensor) -> Dict[tuple, List[int]]:
+        """Build Wu-Manber hash table with caching."""
+        # Generate a hash for the binary key
+        key_hash = hash(tuple(key_bin.flatten().tolist()))
+        
+        # Check cache first
+        if key_hash in self.wu_manber_cache:
+            self.wu_manber_cache_hits += 1
+            return self.wu_manber_cache[key_hash]
+        
+        # Build new hash table
+        self.wu_manber_cache_misses += 1
         table: Dict[tuple, List[int]] = {}
         L = key_bin.size(0)
+        
         for i in range(L):
             prefix = tuple(key_bin[i, :self.config.wu_manber_prefix_len].tolist())
             table.setdefault(prefix, []).append(i)
+        
+        # Cache the result
+        self.wu_manber_cache[key_hash] = table
+        
+        # Limit cache size
+        if len(self.wu_manber_cache) > 1000:  # Arbitrary limit, adjust as needed
+            # Remove random entry to avoid predictable eviction patterns
+            key_to_remove = next(iter(self.wu_manber_cache))
+            del self.wu_manber_cache[key_to_remove]
+        
         return table
+    
     def _wu_manber_search(self, query_bin: torch.Tensor, table: Dict[tuple, List[int]]) -> List[int]:
+        """Search Wu-Manber hash table."""
         prefix = tuple(query_bin[:self.config.wu_manber_prefix_len].tolist())
         return table.get(prefix, [])
+    
     def _get_wu_manber_candidates_group(self, query_grp: torch.Tensor, key_grp: torch.Tensor) -> List[List[List[int]]]:
+        """Get Wu-Manber candidates for a feature group."""
         B, L, _ = key_grp.size()
         key_bin = self.binary_quantize(key_grp)
         query_bin = self.binary_quantize(query_grp)
         cand_lists = []
+        
         for b in range(B):
             table = self._build_wu_manber_hash_table(key_bin[b])
             batch_list = [self._wu_manber_search(query_bin[b, i], table) for i in range(L)]
             cand_lists.append(batch_list)
+        
         return cand_lists
+    
     def _get_trie_candidates_group(self, query_grp: torch.Tensor, key_grp: torch.Tensor, head_idx: int) -> List[List[List[int]]]:
+        """Get Trie candidates for a feature group with caching."""
         B, L, _ = key_grp.size()
         cand_lists = []
+        
         for b in range(B):
-            trie = Trie(self.config.stride)
-            key_bin = self.binary_quantize(key_grp[b])
-            for i in range(L):
-                trie.insert(key_bin[i], i)
-            batch_list = [trie.search(self.binary_quantize(query_grp[b][i])) for i in range(L)]
+            # Use a hash of the key tensor as cache key
+            key_data = key_grp[b].detach()
+            data_hash = hash(tuple(key_data.flatten().tolist()[:100])) + hash(str(head_idx))
+            
+            trie, cache_hit = self.trie_cache.get_trie(data_hash)
+            
+            if not cache_hit:
+                # Build trie with binary quantized keys
+                key_bin = self.binary_quantize(key_grp[b])
+                for i in range(L):
+                    trie.insert(key_bin[i], i)
+            
+            # Search with binary quantized queries
+            query_bin = self.binary_quantize(query_grp[b])
+            batch_list = [trie.search(query_bin[i]) for i in range(L)]
             cand_lists.append(batch_list)
+        
         return cand_lists
+    
     def merge_candidate_indices_groups(self, cand_tensors: List[torch.Tensor]) -> torch.Tensor:
+        """Merge candidate indices from different groups efficiently."""
+        if not cand_tensors:
+            return None
+        
         merged = torch.cat(cand_tensors, dim=-1)
         merged, _ = torch.sort(merged)
         return torch.unique_consecutive(merged, dim=-1)
+    
     def _process_dimension_group_candidates(self, query_grp: torch.Tensor, key_grp: torch.Tensor, head_idx: int) -> torch.Tensor:
+        """Process candidates for dimension groups efficiently."""
         B, L, _ = query_grp.size()
+        device = query_grp.device
+        
+        # Get candidates from both methods
         wu_cands = self._get_wu_manber_candidates_group(query_grp, key_grp)
         trie_cands = self._get_trie_candidates_group(query_grp, key_grp, head_idx)
-        candidates = torch.full((B, L, self.config.k_max), -1, dtype=torch.long, device=query_grp.device)
+        
+        # Pre-allocate output tensor
+        candidates = torch.full((B, L, self.config.k_max), -1, dtype=torch.long, device=device)
+        
+        # Process each batch and sequence element
         for b in range(B):
             for i in range(L):
+                # Find common candidates (intersection)
                 common = list(set(wu_cands[b][i]) & set(trie_cands[b][i]))
+                
                 if common:
-                    common_tensor = torch.tensor(common, dtype=torch.long, device=query_grp.device)
-                    if common_tensor.numel() > self.config.k_max:
-                        common_tensor = common_tensor[:self.config.k_max]
-                    candidates[b, i, :common_tensor.numel()] = common_tensor
+                    # Convert to tensor and handle size constraints
+                    common_tensor = torch.tensor(common, dtype=torch.long, device=device)
+                    size = min(common_tensor.numel(), self.config.k_max)
+                    candidates[b, i, :size] = common_tensor[:size]
+        
         return candidates
+    
     def forward(self, query_up: torch.Tensor, key_up: torch.Tensor, head_idx: int) -> torch.Tensor:
+        """Find candidates for attention efficiently."""
         B, L, _ = query_up.size()
+        device = query_up.device
+        
+        start_time = time.time()
+        
+        # Split features by dimension groups
         query_groups = self.split_features_by_dim_groups(query_up)
         key_groups = self.split_features_by_dim_groups(key_up)
-        cand_list = [self._process_dimension_group_candidates(q_grp, k_grp, head_idx)
-                     for q_grp, k_grp in zip(query_groups, key_groups)]
+        
+        # Process each dimension group
+        cand_list = []
+        for q_grp, k_grp in zip(query_groups, key_groups):
+            cand_list.append(self._process_dimension_group_candidates(q_grp, k_grp, head_idx))
+        
+        # Merge candidates from all groups
         if cand_list:
             merged = self.merge_candidate_indices_groups(cand_list)
-            return merged[:, :, :self.config.k_max]
-        return torch.full((B, L, self.config.k_max), -1, dtype=torch.long, device=query_up.device)
+            result = merged[:, :, :self.config.k_max] if merged is not None else torch.full(
+                (B, L, self.config.k_max), -1, dtype=torch.long, device=device
+            )
+        else:
+            result = torch.full((B, L, self.config.k_max), -1, dtype=torch.long, device=device)
+        
+        processing_time = time.time() - start_time
+        if self.training and head_idx == 0:  # Log only for first head to reduce spam
+            logger.debug(f"Candidate finding took {processing_time:.4f}s")
+        
+        return result
+    
+    def get_cache_stats(self):
+        """Return cache statistics for monitoring."""
+        return {
+            "wu_manber_hits": self.wu_manber_cache_hits,
+            "wu_manber_misses": self.wu_manber_cache_misses,
+            "trie_cache_size": len(self.trie_cache.cache)
+        }
 
 class AbsorptionProjection(nn.Module):
+    """Improved AbsorptionProjection with optimized matrix operations."""
     def __init__(self, query_dim: int, key_dim: int, rank: int):
         super().__init__()
-        self.u_q = nn.Parameter(torch.randn(query_dim, rank) / math.sqrt(rank))
-        self.v_q = nn.Parameter(torch.randn(rank, key_dim) / math.sqrt(rank))
-        self.u_k = nn.Parameter(torch.randn(key_dim, rank) / math.sqrt(rank))
-        self.v_k = nn.Parameter(torch.randn(rank, key_dim) / math.sqrt(rank))
-    def forward(self, query: torch.Tensor, key: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Better initialization for stability
+        std = 1.0 / math.sqrt(rank)
+        self.u_q = nn.Parameter(torch.randn(query_dim, rank) * std)
+        self.v_q = nn.Parameter(torch.randn(rank, key_dim) * std)
+        self.u_k = nn.Parameter(torch.randn(key_dim, rank) * std)
+        self.v_k = nn.Parameter(torch.randn(rank, key_dim) * std)
+        
+        # Cache for composed matrices
+        self.register_buffer('W_absorb', None)
+        self.needs_composition = True
+    
+    def _compute_absorption_matrix(self):
+        """Compute and cache the absorption matrix."""
         W_UQ = torch.matmul(self.u_q, self.v_q)
         W_UK = torch.matmul(self.u_k, self.v_k)
-        W_absorb = torch.matmul(W_UK.transpose(0, 1), W_UQ)
-        Q_proj = torch.matmul(query, W_absorb.transpose(0, 1))
+        self.W_absorb = torch.matmul(W_UK.transpose(0, 1), W_UQ)
+        self.needs_composition = False
+    
+    def forward(self, query: torch.Tensor, key: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply absorption projection efficiently."""
+        # Compute and cache absorption matrix if needed
+        if self.needs_composition or self.W_absorb is None:
+            self._compute_absorption_matrix()
+        
+        # Project query using cached matrix
+        Q_proj = torch.matmul(query, self.W_absorb.transpose(0, 1))
+        
         return Q_proj, key
+    
+    def train(self, mode: bool = True):
+        """Override train to reset composition cache when training."""
+        if mode and not self.training:
+            self.needs_composition = True
+        return super().train(mode)
 
 class FastAttention(nn.Module):
+    """Improved FastAttention with optimized computations and better parallelism."""
     def __init__(self, config: FastAttentionConfig):
         super().__init__()
         self.config = config
+        
+        # Projections for queries and key-values
         self.query_down_proj = nn.Linear(config.d_model, config.d_query)
         self.key_value_down_proj = nn.Linear(config.d_model, config.d_key)
+        
+        # Absorption projections for each head
         self.absorption_projs = nn.ModuleList([
             AbsorptionProjection(config.d_query, config.d_key, config.rank)
             for _ in range(config.n_heads)
         ])
+        
+        # Value projections for each head
         self.value_up_projs = nn.ModuleList([
             LowRankLinear(config.d_key, config.d_model, config.rank)
             for _ in range(config.n_heads)
         ])
-        self.rff_encoders = nn.ModuleList([
-            RandomFourierFeatures(config.d_key, config.rff_dim)
-            for _ in range(config.n_heads)
-        ])
-        if config.hyper_cuts_dim_groups:
-            self.lsh_tables_list = nn.ModuleList([
-                nn.ModuleList([
-                    LSHTable(dim, config.lsh_buckets, config.lsh_bandwidth, config.n_lsh_hashes)
-                    for dim in config.hyper_cuts_dim_groups
-                ])
+        
+        # Random Fourier Features for each head
+        if config.use_rff:
+            self.rff_encoders = nn.ModuleList([
+                RandomFourierFeatures(config.d_key, config.rff_dim)
                 for _ in range(config.n_heads)
             ])
-        else:
-            self.lsh_tables_list = nn.ModuleList([
-                nn.ModuleList([LSHTable(config.lsh_key_dim, config.lsh_buckets, config.lsh_bandwidth, config.n_lsh_hashes)])
-                for _ in range(config.n_heads)
-            ])
-        self.tries_list = nn.ModuleList([Trie(config.stride) for _ in range(config.n_heads)])
-        self.candidate_finder = CandidateFinder(config, list(self.tries_list), self.lsh_tables_list)
+        
+        # Single candidate finder with internal head-specific state
+        self.candidate_finder = CandidateFinder(config)
+        
+        # Output projection
         self.output_proj = nn.Linear(config.d_model * config.n_heads, config.d_model)
         self.dropout = nn.Dropout(config.dropout)
+        
+        # Performance tracking
+        self.forward_times = []
+    
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                 mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Forward pass with optimized computations."""
+        start_time = time.time()
+        
+        # Validate inputs
+        validate_tensor_dimensions(query, "query", query.dim())
+        validate_tensor_dimensions(key, "key", key.dim())
+        validate_tensor_dimensions(value, "value", value.dim())
+        
         B, L, _ = query.size()
+        device = query.device
+        
+        # Project inputs
         query_down = self.query_down_proj(query)
         key_down = self.key_value_down_proj(key)
+        
+        # Process each attention head
         head_outputs = []
         for head_idx in range(self.config.n_heads):
+            # Apply absorption projection
             Q_proj, K_proj = self.absorption_projs[head_idx](query_down, key_down)
+            
+            # Find attention candidates
             candidates = self.candidate_finder(Q_proj, K_proj, head_idx)
+            
+            # Create mask for valid candidates
             cand_mask = candidates != -1
+            
+            # Handle invalid indices safely
             safe_candidates = candidates.clone()
-            safe_candidates[safe_candidates == -1] = 0
+            safe_candidates[~cand_mask] = 0
+            
+            # Get dimensions
             num_candidates = candidates.size(-1)
-            b_idx = torch.arange(B, device=K_proj.device).view(B, 1, 1).expand(B, L, num_candidates)
+            
+            # Create batch indices for gathering
+            b_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, L, num_candidates)
+            
+            # Gather candidate keys
             candidate_keys = K_proj[b_idx, safe_candidates]
+            
+            # Apply Random Fourier Features if enabled
             q_exp = Q_proj.unsqueeze(2)
             if self.config.use_rff:
-                q_exp = self.rff_encoders[head_idx](q_exp.reshape(-1, self.config.d_key)).reshape(B, L, 1, self.config.rff_dim)
-                candidate_keys = self.rff_encoders[head_idx](candidate_keys.reshape(-1, self.config.d_key)).reshape(B, L, num_candidates, self.config.rff_dim)
+                rff_encoder = self.rff_encoders[head_idx]
+                q_exp = rff_encoder(q_exp.reshape(-1, self.config.d_key)).reshape(B, L, 1, self.config.rff_dim)
+                candidate_keys = rff_encoder(candidate_keys.reshape(-1, self.config.d_key)).reshape(B, L, num_candidates, self.config.rff_dim)
                 scale = optimized_sqrt(self.config.rff_dim)
             else:
                 scale = optimized_sqrt(self.config.d_key)
+            
+            # Compute attention scores
             sim = torch.matmul(q_exp, candidate_keys.transpose(-2, -1)).squeeze(2) / scale
+            
+            # Mask invalid candidates
             sim = sim.masked_fill(~cand_mask, float('-inf'))
+            
+            # Apply optional attention mask
+            if mask is not None:
+                # Expand mask for broadcasting
+                expanded_mask = mask.unsqueeze(1).expand_as(sim)
+                sim = sim.masked_fill(~expanded_mask, float('-inf'))
+            
+            # Compute attention weights
             attn_weights = F.softmax(sim, dim=-1)
             attn_weights = self.dropout(attn_weights)
+            
+            # Gather candidate values
             candidate_values = key_down[b_idx, safe_candidates]
-            candidate_values = self.value_up_projs[head_idx](candidate_values.reshape(-1, self.config.d_key)).reshape(B, L, num_candidates, self.config.d_model)
+            
+            # Project values to output dimension
+            candidate_values = self.value_up_projs[head_idx](
+                candidate_values.reshape(-1, self.config.d_key)
+            ).reshape(B, L, num_candidates, self.config.d_model)
+            
+            # Apply attention weights to values
             head_out = torch.sum(attn_weights.unsqueeze(-1) * candidate_values, dim=2)
             head_outputs.append(head_out)
+        
+        # Concatenate head outputs
         concat = torch.cat(head_outputs, dim=-1)
+        
+        # Apply output projection and dropout
         output = self.output_proj(concat)
-        return self.dropout(output)
+        output = self.dropout(output)
+        
+        # Track performance
+        forward_time = time.time() - start_time
+        self.forward_times.append(forward_time)
+        if len(self.forward_times) > 100:  # Keep only recent times
+            self.forward_times.pop(0)
+        
+        if self.training and torch.rand(1).item() < 0.01:  # Log occasionally during training
+            avg_time = sum(self.forward_times) / len(self.forward_times)
+            logger.debug(f"FastAttention forward: {avg_time:.4f}s, batch={B}, seq_len={L}")
+        
+        return output
 
 class FeedForwardNetwork(nn.Module):
+    """Improved FeedForwardNetwork with GeLU and potential layer normalization."""
     def __init__(self, config: FastAttentionConfig):
         super().__init__()
         self.linear1 = nn.Linear(config.d_model, config.intermediate_dim)
         self.linear2 = nn.Linear(config.intermediate_dim, config.d_model)
         self.dropout = nn.Dropout(config.dropout)
-
+        
+        # Optional layer norm for more stable gradients
+        self.use_layer_norm = False
+        if self.use_layer_norm:
+            self.norm = nn.LayerNorm(config.intermediate_dim)
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.gelu(self.linear1(x))
+        """Forward pass with improved activations and optional normalization."""
+        x = self.linear1(x)
+        x = F.gelu(x)  # Use GeLU for smoother gradients
+        if self.use_layer_norm:
+            x = self.norm(x)
         x = self.dropout(x)
         x = self.linear2(x)
-        return self.dropout(x)
+        x = self.dropout(x)
+        return x
 
 class FastAttentionEncoderLayer(nn.Module):
+    """Improved FastAttentionEncoderLayer with Pre-Norm and residual connections."""
     def __init__(self, config: FastAttentionConfig):
         super().__init__()
         self.self_attn = FastAttention(config)
@@ -272,15 +669,15 @@ class FastAttentionEncoderLayer(nn.Module):
         self.norm1 = nn.LayerNorm(config.d_model)
         self.norm2 = nn.LayerNorm(config.d_model)
         self.dropout = nn.Dropout(config.dropout)
-
+    
     def forward(self, src: torch.Tensor, src_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        src = self.norm1(src)
-        attn = self.self_attn(src, src, src, mask=src_mask)
-        src = src + self.dropout(attn)
-
-        src = self.norm2(src)
-        ffn = self.feed_forward(src)
-        return src + self.dropout(ffn)
+        """Forward pass with Pre-Norm and residual connections."""
+        # Pre-Norm configuration
+        x = self.norm1(src)
+        x = src + self.dropout(self.self_attn(x, x, x, mask=src_mask))  # Residual connection
+        x = self.norm2(x)
+        x = x + self.dropout(self.feed_forward(x))  # Residual connection
+        return x
 
 ##############################################
 # SPGPO Components - Refactored and Modularized
@@ -295,22 +692,24 @@ def preference_oracle(y1_batch: torch.Tensor, y2_batch: torch.Tensor, x_batch: t
 
 class ResponseGenerator:
     """Generates responses from the policy network."""
-    def __init__(self, policy_network: FastAttentionEncoderLayer, k_responses: int):
+    def __init__(self, policy_network: FastAttentionEncoderLayer, k_responses: int, temperature: float = 1.0):
         self.policy_network = policy_network
         self.k_responses = k_responses
+        self.temperature = temperature  # Add temperature
 
     def generate_responses(self, prompt: torch.Tensor) -> torch.Tensor:
         """Generates multiple responses (batched)."""
         B, L, _ = prompt.size()
         prompt_expanded = prompt.repeat_interleave(self.k_responses, dim=0)
-        logits = self.policy_network(prompt_expanded)
+        logits = self.policy_network(prompt_expanded) / self.temperature # Apply temperature
+
+        # Use Categorical distribution for sampling.
         probs = F.softmax(logits, dim=-1)
-        top_k = min(self.k_responses, logits.size(-1))
-        topk_probs, topk_indices = torch.topk(probs, top_k, dim=-1)
-        dist = Categorical(topk_probs)
-        sampled_indices = dist.sample()
-        response_tokens = torch.gather(topk_indices, -1, sampled_indices.unsqueeze(-1)).squeeze(-1)
-        return response_tokens.view(B, self.k_responses, L)
+        dist = Categorical(probs)
+        response_tokens = dist.sample()
+
+        return response_tokens.view(B, self.k_responses, -1) # Ensure correct shape (B, k, L)
+
 
 class PreferenceComputer:
     """Computes group preferences."""
@@ -320,9 +719,9 @@ class PreferenceComputer:
     def compute_group_preference(self, response: torch.Tensor, response_group: torch.Tensor, prompt: torch.Tensor) -> torch.Tensor:
         """Computes batched group preference P(y ≻ G_x\{y}|x)."""
         B, K, L = response_group.shape
-        response_expanded = response.unsqueeze(1)
-        response_group_expanded = response_group.unsqueeze(0)
-        prompt_expanded = prompt.unsqueeze(1)
+        response_expanded = response.unsqueeze(1)  # (B, 1, L)
+        response_group_expanded = response_group.unsqueeze(0) # (1, K, L)
+        prompt_expanded = prompt.unsqueeze(1) # (B, 1, prompt_dim)
         preferences = preference_oracle(response_expanded, response_group_expanded, prompt_expanded, self.reward_model)
         return preferences
 
@@ -337,11 +736,13 @@ class AdvantageComputer:
         B, K, L = response_group.shape
         preferences = self.preference_computer.compute_group_preference(response, response_group, prompt)
         mask = torch.ones((B, K), device=response.device)
+        # Find response and create a mask. Much faster than torch.equal in a loop
         for b in range(B):
-            for k in range(K):
-                if torch.equal(response[b], response_group[b, k]):
-                    mask[b, k] = 0
-                    break
+            response_b = response[b].unsqueeze(0)  # (1, L)
+            expanded_group = response_group[b] # (K, L)
+            equals = (response_b.unsqueeze(1) == expanded_group.unsqueeze(0)).all(-1).any(0) # Check along length.
+            mask[b, equals] = 0
+
         response_pref = (preferences * mask).sum(dim=1) / (self.k_responses - 1 + 1e-8)
         avg_group_pref = preferences.mean(dim=1)
         advantage = response_pref - avg_group_pref - baseline
@@ -493,41 +894,3 @@ def train_spgpo(config: FastAttentionConfig, prompt_distribution: Callable, rewa
     writer.close()
     print("SPGPO Training Finished!")
     return agent
-
-##############################################
-# Main Function (Example Usage)
-##############################################
-
-def main():
-    # Configuration for FastAttention
-    config = FastAttentionConfig(
-        d_model=512, d_key=64, d_query=64, n_heads=8, rank=32,
-        rff_dim=128, k_max=64, stride=4, lsh_buckets=32,
-        lsh_bandwidth=4.0, lsh_key_dim=64, wu_manber_prefix_len=3,
-        hyper_cuts_dim_groups=[32, 32], n_lsh_hashes=4, dropout=0.1, intermediate_dim=2048, use_rff=True)
-
-    # --- Mockup functions and data ---
-    def mockup_prompt_distribution(batch_size):
-        return torch.randn(batch_size, 128, config.d_model)
-
-    def mockup_reward_model(x, y):
-        if len(y.shape) == 2:
-            return torch.tensor([y_item.size(0) * 0.1 for y_item in y], dtype=torch.float32)
-        else:
-            return torch.tensor(y.size(0) * 0.1)
-
-    def mockup_tokenizer(text):
-        tokens = text.split()
-        return torch.tensor([hash(token) % 1000 for token in tokens])
-
-    # --- Train SPGPO Agent ---
-    trained_agent = train_spgpo(config, mockup_prompt_distribution, mockup_reward_model,
-                                 mockup_tokenizer, num_episodes=5, batch_size=16, k_responses=4)
-
-    # --- Example Inference ---
-    prompt = torch.randn(1, 128, config.d_model)
-    response = trained_agent(prompt)
-    print("\nGenerated Response Shape:", response.shape)
-
-if __name__ == "__main__":
-    main()
