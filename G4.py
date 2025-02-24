@@ -8,12 +8,12 @@ from typing import List, Tuple, Dict
 import time
 
 # 定数
-BITS_PER_MASK: int = 64
-MAX_MASK_COUNT: int = 10
+BITS_PER_MASK = 64
+MAX_MASK_COUNT = 10
 
-# CFG（制御フローグラフ）を構築するクラス (変更なし)
+# CFG構築クラス (変更なし)
 class CFGBuilder(ast.NodeVisitor):
-    def __init__(self) -> None:
+    def __init__(self):
         self.cfg: Dict[int, List[int]] = defaultdict(list)
         self.predecessors: Dict[int, List[int]] = defaultdict(list)
         self.current_node: int = 0
@@ -89,15 +89,8 @@ class CFGBuilder(ast.NodeVisitor):
                 elif isinstance(value, ast.AST):
                     self.visit(value)
 
-def build_cfg(source_code: str) -> Tuple[Dict[int, List[int]], Dict[int, List[int]], Dict[int, ast.AST], int]:
-    """ソースコードからCFGを構築する"""
-    tree = ast.parse(source_code)
-    builder = CFGBuilder()
-    builder.visit(tree)
-    return builder.cfg, builder.predecessors, builder.labels, builder.node_count
-
-def prepare_predecessor_data(cfg: Dict[int, List[int]], predecessors: Dict[int, List[int]], num_nodes: int) -> Tuple[np.ndarray, np.ndarray]:
-    """CFGから先行ノードリストとオフセットを生成する"""
+# その他の関数 (変更なし)
+def prepare_predecessor_data(cfg, predecessors, num_nodes):
     pred_list: List[int] = []
     pred_offsets: List[int] = [0]
     offset: int = 0
@@ -108,20 +101,28 @@ def prepare_predecessor_data(cfg: Dict[int, List[int]], predecessors: Dict[int, 
         pred_offsets.append(offset)
     return np.array(pred_list, dtype=np.int32), np.array(pred_offsets, dtype=np.int32)
 
-def prepare_gpu_data(predecessors: np.ndarray, pred_offsets: np.ndarray, num_nodes: int) -> Tuple[cuda.DeviceAllocation, cuda.DeviceAllocation, cuda.DeviceAllocation, int, int]:
-    """GPUにデータを転送し、カーネル実行に必要な情報を準備する"""
-    predecessors_gpu = cuda.to_device(predecessors)
-    pred_offsets_gpu = cuda.to_device(pred_offsets)
-    mask_count = (num_nodes + BITS_PER_MASK - 1) // BITS_PER_MASK
-    if mask_count > MAX_MASK_COUNT:
-        raise ValueError(f"mask_count ({mask_count}) exceeds MAX_MASK_COUNT ({MAX_MASK_COUNT})")
-    dom = np.zeros((num_nodes, mask_count), dtype=np.uint64)
-    dom[0, 0] = 1
-    dom_gpu = cuda.to_device(dom)
-    num_preds = len(predecessors)
-    return dom_gpu, predecessors_gpu, pred_offsets_gpu, num_nodes, num_preds, mask_count
+def build_dominator_tree(dom, num_nodes, mask_count):
+    from collections import defaultdict
+    tree: dict[int, list[int]] = defaultdict(list)
+    BITS_PER_MASK = 64
 
-cuda_kernel_code: str = f"""
+    for node in range(1, num_nodes):
+        idom = None
+        for i in range(num_nodes):
+            mask_index = i // BITS_PER_MASK
+            bit_index = i % BITS_PER_MASK
+            if mask_index < mask_count:
+                dom_value = np.uint64(dom[node][mask_index])
+                bit_value = np.uint64(1 << bit_index)
+                if (dom_value & bit_value) != 0 and i != node:
+                    if idom is None or (np.uint64(dom[idom][mask_index]) & bit_value) == 0:
+                        idom = i
+        if idom is not None:
+            tree[idom].append(node)
+    return tree
+
+# CUDAカーネル (変更なし)
+cuda_code = f"""
 #define BITS_PER_MASK {BITS_PER_MASK}
 #define MAX_MASK_COUNT {MAX_MASK_COUNT}
 
@@ -135,6 +136,7 @@ __global__ void compute_dominator(
 {{
     int node = blockIdx.x * blockDim.x + threadIdx.x;
     if (node >= num_nodes) return;
+
     if (mask_count > MAX_MASK_COUNT) return;
 
     if (node == 0) {{
@@ -168,22 +170,37 @@ __global__ void compute_dominator(
 }}
 """
 
-def run_gpu_dominator_kernel(
-    dom_gpu: cuda.DeviceAllocation,
-    predecessors_gpu: cuda.DeviceAllocation,
-    pred_offsets_gpu: cuda.DeviceAllocation,
-    num_nodes: int,
-    num_preds: int,
-    mask_count: int
-) -> Tuple[np.ndarray, float]:
-    """GPUカーネルを実行してドミネーターを計算し、計算時間を返す"""
-    module = SourceModule(cuda_kernel_code)
+# メイン関数 (計測部分を修正)
+def compute_dominators_on_gpu(source_code: str):
+    """GPUを使用してドミネーターを計算し、ドミネーターツリーを返す"""
+    # 1. CFGの構築
+    tree = ast.parse(source_code)
+    builder = CFGBuilder()
+    builder.visit(tree)
+    num_nodes = builder.node_count
+
+    # 2. 先行ノードリストの準備
+    predecessors, pred_offsets = prepare_predecessor_data(builder.cfg, builder.predecessors, num_nodes)
+    num_preds = len(predecessors)
+
+    # 3. ドミネーター集合の初期化
+    mask_count = (num_nodes + BITS_PER_MASK - 1) // BITS_PER_MASK
+    if mask_count > MAX_MASK_COUNT:
+        raise ValueError(f"mask_count ({mask_count}) exceeds MAX_MASK_COUNT ({MAX_MASK_COUNT})")
+    dom = np.zeros((num_nodes, mask_count), dtype=np.uint64)
+    dom[0, 0] = 1
+
+    # 4. GPUメモリ転送 + カーネル実行 + 結果取得 (計測)
+    start_time = time.time()
+    predecessors_gpu = cuda.to_device(predecessors)
+    pred_offsets_gpu = cuda.to_device(pred_offsets)
+    dom_gpu = cuda.to_device(dom)
+
+    module = SourceModule(cuda_code)
     compute_dominator = module.get_function("compute_dominator")
     block_size = 256
     grid_size = (num_nodes + block_size - 1) // block_size
-    dom = np.zeros((num_nodes, mask_count), dtype=np.uint64) # 結果格納用NumPy配列を事前に用意
 
-    start_time = time.time()
     for _ in range(num_nodes):
         old_dom = dom.copy()
         compute_dominator(
@@ -191,41 +208,18 @@ def run_gpu_dominator_kernel(
             np.int32(num_nodes), np.int32(num_preds), np.int32(mask_count),
             block=(block_size, 1, 1), grid=(grid_size, 1)
         )
-        cuda.memcpy_dtoh(dom, dom_gpu) # 結果をGPUからホストへコピー
+        cuda.memcpy_dtoh(dom, dom_gpu)
         if np.array_equal(old_dom, dom):
             break
     end_time = time.time()
-    return dom, (end_time - start_time) * 1000
 
-def build_dominator_tree(dom: np.ndarray, num_nodes: int, mask_count: int) -> Dict[int, List[int]]:
-    """ドミネーター集合からドミネーターツリーを構築する (変更なし)"""
-    tree: Dict[int, List[int]] = defaultdict(list)
-    for node in range(1, num_nodes):
-        idom = None
-        for i in range(num_nodes):
-            mask_index = i // BITS_PER_MASK
-            bit_index = i % BITS_PER_MASK
-            if mask_index < mask_count:
-                dom_value = np.uint64(dom[node][mask_index])
-                bit_value = np.uint64(1 << bit_index)
-                if (dom_value & bit_value) != 0 and i != node:
-                    if idom is None or (np.uint64(dom[idom][mask_index]) & bit_value) == 0:
-                        idom = i
-        if idom is not None:
-            tree[idom].append(node)
-    return tree
+    # 5. ドミネーターツリー構築 (計測対象外)
+    dom_tree = build_dominator_tree(dom, num_nodes, mask_count)
 
-def compute_dominators_on_gpu(source_code: str) -> Tuple[np.ndarray, Dict[int, List[int]], float]:
-    """GPUを使用してドミネーターを計算し、ドミネーターツリーと計算時間を返す"""
-    cfg, predecessors_dict, labels, num_nodes = build_cfg(source_code)
-    predecessors, pred_offsets = prepare_predecessor_data(cfg, predecessors_dict, num_nodes)
-    gpu_data = prepare_gpu_data(predecessors, pred_offsets, num_nodes)
-    dom, elapsed_time_ms = run_gpu_dominator_kernel(*gpu_data)
-    dom_tree = build_dominator_tree(dom, num_nodes, gpu_data[-1]) # mask_countを渡す
-    return dom, dom_tree, elapsed_time_ms
+    return dom, dom_tree, (end_time - start_time) * 1000  # 計算時間 (ms) を返す
 
 
-# テスト用コード（計測付き）
+# テスト & 計測
 if __name__ == "__main__":
     source_code_nested = """
 def nested_example(a, b, c):
@@ -255,8 +249,9 @@ def nested_example(a, b, c):
     average_time = total_time / num_runs
     print(f"{num_runs}回の実行の平均時間: {average_time:.3f} ms")
 
+
     # 最初の実行結果を表示
-    dominators_nested, dom_tree_nested, _ = compute_dominators_on_gpu(source_code_nested)
+    dominators_nested, dom_tree_nested, _ = compute_dominators_on_gpu(source_code_nested) #時間情報は破棄
     print("ドミネーター結果（ビットマスク）:")
     for i, dom in enumerate(dominators_nested):
         print(f"Node {i}: {dom.tolist()}")
