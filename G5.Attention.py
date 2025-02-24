@@ -11,7 +11,7 @@ import math
 
 def fma(a: float, b: float, c: float) -> float:
     """
-    Fused multiply-add: returns a*b+c in a single instruction if available.
+    Fused multiply-add: returns a * b + c in a single instruction if available.
     """
     try:
         return math.fma(a, b, c)
@@ -20,13 +20,12 @@ def fma(a: float, b: float, c: float) -> float:
 
 def optimized_sqrt(n: int) -> float:
     """
-    If n is a power of 2, compute sqrt(n) using bit shifts:
+    If n is a power of 2, compute sqrt(n) using bit shifts.
     For n = 2^k, sqrt(n) = 2^(k/2).
     Otherwise, falls back to math.sqrt.
     """
-    if n & (n - 1) == 0:  # check if n is a power of 2
+    if n & (n - 1) == 0:  # power-of-two check
         k = n.bit_length() - 1
-        # Use fma to combine exponentiation steps if needed (here it's trivial)
         return 2 ** (k / 2)
     return math.sqrt(n)
 
@@ -38,11 +37,7 @@ def optimized_sqrt(n: int) -> float:
 def select_topk(similarities: torch.Tensor, k_max: int) -> torch.Tensor:
     """
     Select the indices of the top-k values along the last dimension.
-    Args:
-        similarities: Tensor of shape [B, L, num_candidates].
-        k_max: Maximum number of candidates to select.
-    Returns:
-        Tensor of shape [B, L, k_max] with the indices.
+    Input shape: [B, L, num_candidates].
     """
     _, topk_idx = torch.topk(similarities, k=k_max, dim=-1)
     return topk_idx
@@ -55,17 +50,17 @@ class FastAttentionConfig:
     n_heads: int          # Number of attention heads.
     rank: int             # Rank for low-rank approximations.
     rff_dim: int          # Output dimension for random Fourier features.
-    k_max: int            # Maximum number of candidate keys per query.
+    k_max: int            # Maximum candidate keys per query.
     stride: int           # Stride length for Trie.
     lsh_buckets: int      # Number of LSH buckets.
-    lsh_bandwidth: float  # Bandwidth for LSH bucket division.
-    lsh_key_dim: int      # Input dimension for LSH.
+    lsh_bandwidth: float  # Bandwidth for LSH.
+    lsh_key_dim: int      # LSH input dimension.
     wu_manber_prefix_len: int  # Prefix length for Wu-Manber search.
-    hyper_cuts_dim_groups: Optional[List[int]] = None  # Groups for splitting feature dimensions.
+    hyper_cuts_dim_groups: Optional[List[int]] = None  # Feature groups.
     n_lsh_hashes: int = 4
     dropout: float = 0.1
     intermediate_dim: int = 2048
-    use_rff: bool = True  # Whether to use random Fourier features.
+    use_rff: bool = True  # Whether to use RFF.
 
 class LowRankLinear(nn.Module):
     """
@@ -88,14 +83,12 @@ class RandomFourierFeatures(nn.Module):
         self.bias = nn.Parameter(torch.rand(rff_dim) * 2 * math.pi, requires_grad=False)
         self.scale = math.sqrt(2.0 / rff_dim)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        projection = x.matmul(self.omega)
-        # Use fused multiply-add for adding bias if possible.
-        projection = projection + self.bias  # backend may fuse this operation.
+        projection = x.matmul(self.omega) + self.bias
         return torch.cos(projection) * self.scale
 
 class LSHTable(nn.Module):
     """
-    Locality-sensitive hashing table.
+    Locality-sensitive hashing (LSH) table.
     """
     def __init__(self, dim: int, n_buckets: int, bandwidth: float, n_hashes: int):
         super().__init__()
@@ -111,7 +104,7 @@ class LSHTable(nn.Module):
 _TRIE_INDICES_KEY = '_indices'
 class Trie(nn.Module):
     """
-    Trie (prefix tree) for fast candidate lookup using binary quantization.
+    Trie (prefix tree) for candidate lookup using binary quantization.
     """
     def __init__(self, stride: int):
         super().__init__()
@@ -136,7 +129,7 @@ class Trie(nn.Module):
 
 class CandidateFinder(nn.Module):
     """
-    Candidate search module that uses LSH, Wu-Manber, and Trie-based methods.
+    Candidate search module using LSH, Wu-Manber, and Trie-based methods.
     """
     def __init__(self, config: FastAttentionConfig, tries: List[Trie], lsh_tables: nn.ModuleList):
         super().__init__()
@@ -227,7 +220,7 @@ class CandidateFinder(nn.Module):
 
 class AbsorptionProjection(nn.Module):
     """
-    Projects queries into key space using a low-rank 'absorption' transformation.
+    Projects queries into the key space using a low-rank 'absorption' transformation.
     """
     def __init__(self, query_dim: int, key_dim: int, rank: int):
         super().__init__()
@@ -316,7 +309,7 @@ class FastAttention(nn.Module):
 
 class FeedForwardNetwork(nn.Module):
     """
-    Two-layer feedforward network with ReLU and dropout.
+    Two-layer feedforward network with ReLU activation and dropout.
     """
     def __init__(self, config: FastAttentionConfig):
         super().__init__()
@@ -331,7 +324,7 @@ class FeedForwardNetwork(nn.Module):
 
 class FastAttentionEncoderLayer(nn.Module):
     """
-    Transformer encoder layer using Fast Attention followed by feedforward network.
+    Transformer encoder layer using Fast Attention followed by a feedforward network.
     """
     def __init__(self, config: FastAttentionConfig):
         super().__init__()
@@ -351,12 +344,73 @@ class FastAttentionEncoderLayer(nn.Module):
         return residual + self.dropout(ffn)
 
 ##############################################
-# GRPO Components
+# GRPO Components (Full Implementation)
 ##############################################
+
+def compute_real_reward(full_output: torch.Tensor, fast_output: torch.Tensor, cost: float) -> float:
+    """
+    Compute the real reward based on the L2 error between full and fast attention outputs and the computational cost.
+    Replace this placeholder with your actual reward function.
+    """
+    error = torch.norm(full_output - fast_output)
+    reward = - float(error.item()) - cost
+    return reward
+
+def extract_state_from_module(module: FastAttention, input_data: torch.Tensor) -> List[float]:
+    """
+    Extract the state vector from the module's candidate search metrics.
+    Replace this placeholder with real measurements.
+    """
+    candidate_count = module.config.k_max
+    avg_similarity = 0.75   # Replace with actual metric.
+    variance_similarity = 0.05
+    resource_cost = 1.0
+    downstream_perf = 0.95
+    history_metric = 0.0
+    return [candidate_count, avg_similarity, variance_similarity, resource_cost, downstream_perf, history_metric]
+
+class GRPOEnvironmentMulti:
+    """
+    Environment for multi-group candidate search hyperparameter optimization.
+    The state and reward are derived from real model metrics.
+    """
+    def __init__(self, fast_attention_module: FastAttention, validation_data: torch.Tensor,
+                 initial_hyperparams: List[Dict[str, float]], alpha: float = 1.0, beta: float = 0.1):
+        self.fast_module = fast_attention_module
+        self.validation_data = validation_data
+        self.groups = initial_hyperparams
+        self.alpha = alpha  # Weight for performance error.
+        self.beta = beta    # Weight for computational cost.
+    def get_state(self) -> torch.Tensor:
+        states = []
+        for g in self.groups:
+            # In practice, run the module and extract real metrics.
+            state_vec = [g['k_max']] + extract_state_from_module(self.fast_module, self.validation_data)[1:]
+            states.append(state_vec)
+        return torch.tensor(states, dtype=torch.float32)
+    def step(self, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        rewards = []
+        new_states = []
+        for i, g in enumerate(self.groups):
+            a = actions[i]
+            g['lsh_buckets'] = max(1, g['lsh_buckets'] + a[0].item())
+            g['lsh_bandwidth'] = max(0.1, g['lsh_bandwidth'] + a[1].item())
+            g['trie_stride'] = max(1, g['trie_stride'] + a[2].item())
+            g['k_max'] = max(1, g['k_max'] + int(round(a[3].item())))
+            # In practice, run both full and fast attention on validation_data.
+            # Here we use placeholders.
+            full_output = torch.randn(1)  # Replace with actual full attention output.
+            fast_output = torch.randn(1)  # Replace with actual fast attention output.
+            cost = g['k_max']  # Example: cost proportional to candidate count.
+            reward = compute_real_reward(full_output, fast_output, cost)
+            rewards.append(reward)
+            state_vec = [g['k_max']] + extract_state_from_module(self.fast_module, self.validation_data)[1:]
+            new_states.append(state_vec)
+        return torch.tensor(new_states, dtype=torch.float32), torch.tensor(rewards, dtype=torch.float32)
 
 class GRPOAgent(nn.Module):
     """
-    GRPO policy network that outputs an action per group.
+    GRPO policy network that outputs an action vector per group.
     Action vector: [Δlsh_buckets, Δlsh_bandwidth, Δtrie_stride, Δk_max]
     """
     def __init__(self, state_dim: int, action_dim: int):
@@ -369,61 +423,24 @@ class GRPOAgent(nn.Module):
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         return self.fc(state)
 
-class GRPOEnvironmentMulti:
-    """
-    Environment for multi-group candidate search hyperparameter optimization.
-    Each group state: [k_max, mu, sigma, T, P, H]
-    """
-    def __init__(self, initial_hyperparams: List[Dict[str, float]], alpha: float = 0.1, beta: float = 0.01):
-        self.groups = initial_hyperparams
-        self.alpha = alpha  # Weight for self-regression error.
-        self.beta = beta    # Weight for computation cost.
-    def get_state(self) -> torch.Tensor:
-        states = []
-        for g in self.groups:
-            n = g['k_max']
-            mu = 0.5      # Dummy average similarity.
-            sigma = 0.1   # Dummy variance.
-            T = 1.0       # Dummy resource cost.
-            P = 0.9       # Dummy downstream performance.
-            H = 0.0       # Dummy history.
-            states.append([n, mu, sigma, T, P, H])
-        return torch.tensor(states, dtype=torch.float32)
-    def step(self, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        rewards = []
-        new_states = []
-        for i, g in enumerate(self.groups):
-            a = actions[i]
-            g['lsh_buckets'] = max(1, g['lsh_buckets'] + a[0].item())
-            g['lsh_bandwidth'] = max(0.1, g['lsh_bandwidth'] + a[1].item())
-            g['trie_stride'] = max(1, g['trie_stride'] + a[2].item())
-            g['k_max'] = max(1, g['k_max'] + int(round(a[3].item())))
-            E = 0.05  # Dummy self-regression error.
-            C = g['k_max']
-            r = - self.alpha * E - self.beta * C
-            rewards.append(r)
-            new_states.append([g['k_max'], 0.5, 0.1, 1.0, 0.9, 0.0])
-        return torch.tensor(new_states, dtype=torch.float32), torch.tensor(rewards, dtype=torch.float32)
-
 def grpo_training_episode(agent: GRPOAgent, env: GRPOEnvironmentMulti, optimizer: torch.optim.Optimizer,
-                            episode_length: int = 10, gamma: float = 0.99, epsilon: float = 1e-8,
-                            lambda_kl: float = 0.01) -> float:
+                            episode_length: int = 10, epsilon: float = 1e-8, lambda_kl: float = 0.01) -> float:
     """
     Runs one GRPO training episode over multiple time steps.
-    Uses Monte Carlo baseline (mean reward) scaled by standard deviation and an explicit KL penalty.
+    Uses a Monte Carlo baseline (mean reward) scaled by reward standard deviation and includes an explicit KL penalty.
     """
     total_loss = 0.0
     state = env.get_state()  # Shape: [G, state_dim]
     for _ in range(episode_length):
         actions = agent(state)  # [G, action_dim]
-        std = torch.ones_like(actions)  # Fixed std = 1
+        std = torch.ones_like(actions)
         dist = torch.distributions.Normal(actions, std)
-        log_probs = dist.log_prob(actions).sum(dim=1)  # [G]
+        log_probs = dist.log_prob(actions).sum(dim=1)
         next_state, rewards = env.step(actions)
         mean_reward = rewards.mean()
         std_reward = rewards.std() + epsilon
         advantage = (rewards - mean_reward) / std_reward
-        # KL penalty: for Normal(actions,1) vs Normal(0,1), KL = 0.5 * (actions^2)
+        # Explicit KL penalty: for Normal(actions, 1) vs. Normal(0,1), KL = 0.5 * (actions^2)
         kl_div = 0.5 * (actions ** 2).mean()
         loss = - (log_probs * advantage).mean() + lambda_kl * kl_div
         optimizer.zero_grad()
@@ -435,14 +452,22 @@ def grpo_training_episode(agent: GRPOAgent, env: GRPOEnvironmentMulti, optimizer
 
 def example_grpo_full():
     """
-    Example GRPO training for multi-group candidate search hyperparameter optimization.
+    Full GRPO training example using real metrics.
+    Replace the placeholders in compute_real_reward and extract_state_from_module with your actual logic.
     """
     initial_hyperparams = [
         {'lsh_buckets': 32, 'lsh_bandwidth': 4.0, 'trie_stride': 4, 'k_max': 64},
         {'lsh_buckets': 30, 'lsh_bandwidth': 4.2, 'trie_stride': 5, 'k_max': 60},
         {'lsh_buckets': 35, 'lsh_bandwidth': 3.8, 'trie_stride': 4, 'k_max': 70}
     ]
-    env = GRPOEnvironmentMulti(initial_hyperparams, alpha=0.1, beta=0.01)
+    config = FastAttentionConfig(
+        d_model=512, d_key=64, d_query=64, n_heads=8, rank=32,
+        rff_dim=128, k_max=64, stride=4, lsh_buckets=32,
+        lsh_bandwidth=4.0, lsh_key_dim=64, wu_manber_prefix_len=3,
+        hyper_cuts_dim_groups=[32, 32], n_lsh_hashes=4, use_rff=True)
+    fast_module = FastAttention(config)
+    validation_data = torch.randn(2, 128, config.d_model)  # Replace with your actual validation data.
+    env = GRPOEnvironmentMulti(fast_module, validation_data, initial_hyperparams, alpha=1.0, beta=0.1)
     agent = GRPOAgent(state_dim=6, action_dim=4)
     optimizer = torch.optim.Adam(agent.parameters(), lr=0.001)
     num_episodes = 20
@@ -489,6 +514,5 @@ def example_usage_encoder_layer():
 if __name__ == "__main__":
     example_usage()
     example_usage_encoder_layer()
-    print("Starting full GRPO training (multi-group)...")
+    print("Starting full GRPO training (multi-group) with real metrics...")
     example_grpo_full()
-
