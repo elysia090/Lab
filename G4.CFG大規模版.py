@@ -4,21 +4,24 @@ import pycuda.autoinit
 import pycuda.driver as cuda
 from pycuda.compiler import SourceModule
 from collections import defaultdict
-from typing import List, Tuple, Dict
+from typing import List, Dict
 import time
+import graphviz  # CFG 視覚化用
 
 # 定数
 BITS_PER_MASK = 64
 MAX_MASK_COUNT = 10
 
-# CFG構築クラス (変更なし)
+# --------------------------------------------------
+# CFG構築モジュール
+# --------------------------------------------------
 class CFGBuilder(ast.NodeVisitor):
     def __init__(self):
         self.cfg: Dict[int, List[int]] = defaultdict(list)
         self.predecessors: Dict[int, List[int]] = defaultdict(list)
         self.current_node: int = 0
         self.node_count: int = 0
-        self.labels: Dict[int, ast.AST] = {}
+        self.labels: Dict[int, ast.AST] = {}  # ラベルを AST ノードオブジェクト自体にする
 
     def add_edge(self, from_node: int, to_node: int) -> None:
         self.cfg[from_node].append(to_node)
@@ -70,7 +73,7 @@ class CFGBuilder(ast.NodeVisitor):
 
     def generic_visit(self, node: ast.AST) -> None:
         if isinstance(node, ast.FunctionDef):
-           for stmt in node.body:
+            for stmt in node.body:
                 self.visit(stmt)
         elif isinstance(node, list):
             for item in node:
@@ -78,7 +81,7 @@ class CFGBuilder(ast.NodeVisitor):
                     self.visit(item)
         else:
             current_node = self.new_node()
-            self.labels[current_node] = node
+            self.labels[current_node] = type(node).__name__
             self.add_edge(self.current_node, current_node)
             self.current_node = current_node
             for field, value in ast.iter_fields(node):
@@ -89,11 +92,10 @@ class CFGBuilder(ast.NodeVisitor):
                 elif isinstance(value, ast.AST):
                     self.visit(value)
 
-# その他の関数 (変更なし)
 def prepare_predecessor_data(cfg, predecessors, num_nodes):
     pred_list: List[int] = []
     pred_offsets: List[int] = [0]
-    offset: int = 0
+    offset = 0
     for node in range(num_nodes):
         preds = predecessors[node]
         pred_list.extend(preds)
@@ -103,9 +105,7 @@ def prepare_predecessor_data(cfg, predecessors, num_nodes):
 
 def build_dominator_tree(dom, num_nodes, mask_count):
     from collections import defaultdict
-    tree: dict[int, list[int]] = defaultdict(list)
-    BITS_PER_MASK = 64
-
+    tree: Dict[int, List[int]] = defaultdict(list)
     for node in range(1, num_nodes):
         idom = None
         for i in range(num_nodes):
@@ -121,7 +121,21 @@ def build_dominator_tree(dom, num_nodes, mask_count):
             tree[idom].append(node)
     return tree
 
-# CUDAカーネル (変更なし)
+def visualize_cfg(cfg: Dict[int, List[int]], labels: Dict[int, any], filename: str = 'cfg'):
+    """Graphviz を使って CFG を視覚化する"""
+    dot = graphviz.Digraph(comment='Control Flow Graph')
+    for node_id in sorted(labels.keys()):
+        label = str(type(labels[node_id]).__name__) if isinstance(labels[node_id], ast.AST) else str(labels[node_id])
+        dot.node(str(node_id), label)
+    for from_node, to_nodes in cfg.items():
+        for to_node in to_nodes:
+            dot.edge(str(from_node), str(to_node))
+    dot.render(filename, format='png', view=False)
+    print(f"CFG を {filename}.png に保存しました。")
+
+# --------------------------------------------------
+# GPUドミネーター計算モジュール
+# --------------------------------------------------
 cuda_code = f"""
 #define BITS_PER_MASK {BITS_PER_MASK}
 #define MAX_MASK_COUNT {MAX_MASK_COUNT}
@@ -132,11 +146,11 @@ __global__ void compute_dominator(
     int *pred_offsets,
     int num_nodes,
     int num_preds,
-    int mask_count)
+    int mask_count,
+    int *d_changed)
 {{
     int node = blockIdx.x * blockDim.x + threadIdx.x;
     if (node >= num_nodes) return;
-
     if (mask_count > MAX_MASK_COUNT) return;
 
     if (node == 0) {{
@@ -164,22 +178,44 @@ __global__ void compute_dominator(
     if (mask_index < mask_count) {{
         intersection[mask_index] |= (1ULL << bit_index);
     }}
+
+    bool changed = false;
     for (int i = 0; i < mask_count; i++) {{
-        dom[node * mask_count + i] = intersection[i];
+        if (dom[node * mask_count + i] != intersection[i]) {{
+            changed = true;
+            break;
+        }}
+    }}
+    if (changed) {{
+        for (int i = 0; i < mask_count; i++) {{
+            dom[node * mask_count + i] = intersection[i];
+        }}
+        atomicExch(&d_changed[0], 1);
     }}
 }}
 """
 
-# メイン関数 (計測部分を修正)
+def run_gpu_dominator_kernel(dom_gpu, predecessors_gpu, pred_offsets_gpu,
+                               num_nodes, num_preds, mask_count,
+                               d_changed, block_size, grid_size, stream, compute_dominator):
+    """GPU カーネルを1回実行し、非同期ストリームで同期する"""
+    compute_dominator(
+        dom_gpu, predecessors_gpu, pred_offsets_gpu,
+        np.int32(num_nodes), np.int32(num_preds), np.int32(mask_count),
+        d_changed,
+        block=(block_size, 1, 1), grid=(grid_size, 1), stream=stream
+    )
+    stream.synchronize()
+
 def compute_dominators_on_gpu(source_code: str):
-    """GPUを使用してドミネーターを計算し、ドミネーターツリーを返す"""
-    # 1. CFGの構築
+    """GPU を用いてドミネーター計算を行い、ドミネーターツリーを返す"""
+    # 1. CFG の構築
     tree = ast.parse(source_code)
     builder = CFGBuilder()
     builder.visit(tree)
     num_nodes = builder.node_count
 
-    # 2. 先行ノードリストの準備
+    # 2. 先行ノードデータの準備
     predecessors, pred_offsets = prepare_predecessor_data(builder.cfg, builder.predecessors, num_nodes)
     num_preds = len(predecessors)
 
@@ -190,36 +226,41 @@ def compute_dominators_on_gpu(source_code: str):
     dom = np.zeros((num_nodes, mask_count), dtype=np.uint64)
     dom[0, 0] = 1
 
-    # 4. GPUメモリ転送 + カーネル実行 + 結果取得 (計測)
+    # 4. GPU メモリ転送とストリームの設定
     start_time = time.time()
     predecessors_gpu = cuda.to_device(predecessors)
     pred_offsets_gpu = cuda.to_device(pred_offsets)
     dom_gpu = cuda.to_device(dom)
-
+    # 変更フラグ（ホスト側は1要素の配列）
+    d_changed = cuda.mem_alloc(np.zeros(1, dtype=np.int32).nbytes)
     module = SourceModule(cuda_code)
     compute_dominator = module.get_function("compute_dominator")
     block_size = 256
     grid_size = (num_nodes + block_size - 1) // block_size
+    stream = cuda.Stream()
 
-    for _ in range(num_nodes):
-        old_dom = dom.copy()
-        compute_dominator(
-            dom_gpu, predecessors_gpu, pred_offsets_gpu,
-            np.int32(num_nodes), np.int32(num_preds), np.int32(mask_count),
-            block=(block_size, 1, 1), grid=(grid_size, 1)
-        )
-        cuda.memcpy_dtoh(dom, dom_gpu)
-        if np.array_equal(old_dom, dom):
+    # 5. 収束判定ループ：各反復で d_changed のみをチェックし、
+    #    反復内での全体 dom 配列のホストコピーを削減
+    while True:
+        changed_host = np.zeros(1, dtype=np.int32)  # 書き込み可能なバッファ
+        cuda.memcpy_htod_async(d_changed, changed_host, stream)
+        run_gpu_dominator_kernel(dom_gpu, predecessors_gpu, pred_offsets_gpu,
+                                 num_nodes, num_preds, mask_count,
+                                 d_changed, block_size, grid_size, stream, compute_dominator)
+        cuda.memcpy_dtoh(changed_host, d_changed)
+        if changed_host[0] == 0:
             break
+    # 収束後、最終的な dom 配列をホストにコピー
+    cuda.memcpy_dtoh(dom, dom_gpu)
     end_time = time.time()
 
-    # 5. ドミネーターツリー構築 (計測対象外)
+    # 6. ドミネーターツリー構築
     dom_tree = build_dominator_tree(dom, num_nodes, mask_count)
+    return dom, dom_tree, (end_time - start_time) * 1000  # ms
 
-    return dom, dom_tree, (end_time - start_time) * 1000  # 計算時間 (ms) を返す
-
-
-# テスト & 計測
+# --------------------------------------------------
+# テスト & 計測部
+# --------------------------------------------------
 if __name__ == "__main__":
     source_code_nested = """
 def nested_example(a, b, c):
@@ -233,28 +274,30 @@ def nested_example(a, b, c):
             y = b + c
         else:
             if c > 10:
-               y = 100
+                y = 100
             else:
-               y = -100
+                y = -100
     return x + y
 """
 
     num_runs = 100
     total_time = 0
-
     for _ in range(num_runs):
         _, _, elapsed_time = compute_dominators_on_gpu(source_code_nested)
         total_time += elapsed_time
-
     average_time = total_time / num_runs
     print(f"{num_runs}回の実行の平均時間: {average_time:.3f} ms")
 
-
-    # 最初の実行結果を表示
-    dominators_nested, dom_tree_nested, _ = compute_dominators_on_gpu(source_code_nested) #時間情報は破棄
+    dominators_nested, dom_tree_nested, _ = compute_dominators_on_gpu(source_code_nested)
     print("ドミネーター結果（ビットマスク）:")
-    for i, dom in enumerate(dominators_nested):
-        print(f"Node {i}: {dom.tolist()}")
+    for i, dom_val in enumerate(dominators_nested):
+        print(f"Node {i}: {dom_val.tolist()}")
     print("ドミネーターツリー:")
     for parent, children in dom_tree_nested.items():
         print(f"Node {parent} -> {children}")
+
+    # CFG を視覚化
+    tree = ast.parse(source_code_nested)
+    builder = CFGBuilder()
+    builder.visit(tree)
+    visualize_cfg(builder.cfg, builder.labels, filename='nested_example_cfg')
