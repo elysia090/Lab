@@ -10,6 +10,7 @@ from torch.utils.tensorboard import SummaryWriter
 import logging
 import time
 from collections import OrderedDict
+from torch.utils.checkpoint import checkpoint
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -253,29 +254,46 @@ class Trie(nn.Module):
         self.max_depth = 0
         self.node_count = 0
 
+class LRUCache:
+    """LRU Cache implementation."""
+    def __init__(self, capacity):
+        self.cache = OrderedDict()
+        self.capacity = capacity
+
+    def get(self, key):
+        if key not in self.cache:
+            return None
+        # アクセスされたアイテムを最新に移動
+        self.cache.move_to_end(key)
+        return self.cache[key]
+
+    def put(self, key, value):
+        if key in self.cache:
+            # 既存のアイテムを更新し、最新に移動
+            self.cache.move_to_end(key)
+        elif len(self.cache) >= self.capacity:
+            # 最も古いアイテムを削除
+            self.cache.popitem(last=False)
+        self.cache[key] = value
+
+
 class TrieCache(nn.Module):
     """Cache of Tries for efficient reuse."""
     def __init__(self, stride: int, max_cache_size: int = 16):
         super().__init__()
         self.stride = stride
         self.max_cache_size = max_cache_size
-        self.cache = OrderedDict()  # Use OrderedDict for FIFO behavior
+        self.cache = LRUCache(max_cache_size)
 
     def get_trie(self, data_hash: int) -> Tuple[Trie, bool]:
         """Get a Trie for the given data hash, creating if needed."""
-        if data_hash in self.cache:
-            trie = self.cache.pop(data_hash) # Pop and re-insert to move to end (FIFO-like for eviction)
-            self.cache[data_hash] = trie
-            return trie, True
+        cached_trie = self.cache.get(data_hash)
+        if cached_trie is not None:
+            return cached_trie, True
 
         # Create new Trie if not found
         trie = Trie(self.stride)
-
-        # Manage cache size - FIFO eviction using OrderedDict
-        if len(self.cache) >= self.max_cache_size:
-            self.cache.popitem(last=False) # Remove oldest item (FIFO)
-
-        self.cache[data_hash] = trie
+        self.cache.put(data_hash, trie)
         return trie, False
 
 class CandidateFinder(nn.Module):
@@ -305,7 +323,7 @@ class CandidateFinder(nn.Module):
         self.trie_cache = TrieCache(config.stride)
 
         # Cache for Wu-Manber hash tables
-        self.wu_manber_cache = OrderedDict() # Use OrderedDict for FIFO cache
+        self.wu_manber_cache = LRUCache(capacity=1000) # LRU Cache
         self.wu_manber_cache_hits = 0
         self.wu_manber_cache_misses = 0
 
@@ -332,11 +350,10 @@ class CandidateFinder(nn.Module):
         key_hash = hash(tuple(key_bin[:, :self.config.wu_manber_prefix_len].flatten().tolist()))
 
         # Check cache first
-        if key_hash in self.wu_manber_cache:
+        cached_table = self.wu_manber_cache.get(key_hash) # LRU cache
+        if cached_table is not None:
             self.wu_manber_cache_hits += 1
-            table = self.wu_manber_cache.pop(key_hash) # Pop and re-insert for FIFO-like eviction
-            self.wu_manber_cache[key_hash] = table
-            return table
+            return cached_table
 
         # Build new hash table more efficiently
         self.wu_manber_cache_misses += 1
@@ -348,13 +365,8 @@ class CandidateFinder(nn.Module):
         for i, prefix in enumerate(prefixes):
             table.setdefault(prefix, []).append(i)
 
-        # Use LRU cache with ordered dict instead of arbitrary removal
-        self.wu_manber_cache[key_hash] = table
-
-        # More efficient cache management with max size
-        if len(self.wu_manber_cache) > 1000:
-            # Use FIFO approach for more predictable cache behavior
-            self.wu_manber_cache.popitem(last=False) # Remove oldest item (FIFO)
+        # Use LRU cache
+        self.wu_manber_cache.put(key_hash, table)
 
         return table
 
@@ -489,7 +501,7 @@ class CandidateFinder(nn.Module):
         return {
             "wu_manber_hits": self.wu_manber_cache_hits,
             "wu_manber_misses": self.wu_manber_cache_misses,
-            "trie_cache_size": len(self.trie_cache.cache)
+            "trie_cache_size": len(self.trie_cache.cache.cache) # Access inner cache of LRUCache
         }
 
 class AbsorptionProjection(nn.Module):
@@ -617,26 +629,23 @@ class FastAttention(nn.Module):
             if self.config.use_rff:
                 rff_encoder = self.rff_encoders[head_idx]
 
-                # Combine reshape operations
-                q_and_keys = torch.cat([
-                    q_exp.reshape(-1, self.config.d_key),
-                    candidate_keys.reshape(-1, self.config.d_key)
-                ], dim=0)
+                # RFFをクエリに一度だけ適用（reshapeの操作を最小限に）
+                q_rff = rff_encoder(Q_proj.view(-1, self.config.d_key))
+                q_exp = q_rff.view(B, L, self.config.rff_dim).unsqueeze(2)
 
-                # Single RFF encoding
-                all_encoded = rff_encoder(q_and_keys)
+                # 候補キーを集める前にK_projにRFFを適用（より効率的な場合がある）
+                K_rff = rff_encoder(K_proj.reshape(-1, self.config.d_key)).reshape(B, L, self.config.rff_dim)
 
-                # Split back
-                q_size = q_exp.numel() // self.config.d_key
-                q_exp = all_encoded[:q_size].reshape(B, L, 1, self.config.rff_dim)
-                candidate_keys = all_encoded[q_size:].reshape(B, L, num_candidates, self.config.rff_dim)
-
-                scale = optimized_sqrt(self.config.rff_dim)
+                # 安全な候補のみを集める
+                candidate_keys = K_rff[b_idx, safe_candidates]
+                scale = 1.0 / optimized_sqrt(self.config.rff_dim)  # 数値的安定性のために逆数を事前計算
             else:
-                scale = optimized_sqrt(self.config.d_key)
+                q_exp = Q_proj.unsqueeze(2)
+                candidate_keys = K_proj[b_idx, safe_candidates]
+                scale = 1.0 / optimized_sqrt(self.config.d_key)  # 数値的安定性のために逆数を事前計算
 
-            # Compute attention scores
-            sim = torch.matmul(q_exp, candidate_keys.transpose(-2, -1)).squeeze(2) / scale
+            # スケールを乗算することで、除算よりも速い乗算を使用
+            sim = torch.matmul(q_exp, candidate_keys.transpose(-2, -1)).squeeze(2) * scale
 
             # Mask invalid candidates
             sim = sim.masked_fill(~cand_mask, float('-inf'))
@@ -707,7 +716,7 @@ class FeedForwardNetwork(nn.Module):
         return x
 
 class FastAttentionEncoderLayer(nn.Module):
-    """Improved FastAttentionEncoderLayer with Pre-Norm and residual connections."""
+    """Improved FastAttentionEncoderLayer with Pre-Norm, residual connections, and gradient checkpointing."""
     def __init__(self, config: FastAttentionConfig):
         super().__init__()
         self.self_attn = FastAttention(config)
@@ -717,7 +726,15 @@ class FastAttentionEncoderLayer(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, src: torch.Tensor, src_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Forward pass with Pre-Norm and residual connections."""
+        """Forward pass with Pre-Norm, residual connections and gradient checkpointing."""
+        # メモリ効率化のための勾配チェックポイント
+        if self.training and src.requires_grad:
+            return checkpoint(self._forward_impl, src, src_mask)
+        else:
+            return self._forward_impl(src, src_mask)
+
+    def _forward_impl(self, src: torch.Tensor, src_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Implementation of forward pass."""
         # Pre-Norm configuration
         x = self.norm1(src)
         x = src + self.dropout(self.self_attn(x, x, x, mask=src_mask))  # Residual connection
@@ -798,11 +815,12 @@ class SPGPOEnvironment:
     """Environment for SPGPO training, orchestrating response generation, preference, and advantage computation."""
     def __init__(self, policy_network: FastAttentionEncoderLayer, prompt_distribution: Callable,
                  reward_model: Callable, k_responses: int = 4, tokenizer: Callable = None,
-                 clip_ratio: float = 0.2):
+                 clip_ratio: float = 0.2, logging: bool = False):
         """Initializes the SPGPO environment with modular components."""
         self.prompt_distribution = prompt_distribution
         self.tokenizer = tokenizer
         self.clip_ratio = clip_ratio
+        self.logging = logging
 
         # Modular components
         self.response_generator = ResponseGenerator(policy_network, k_responses)
@@ -817,6 +835,7 @@ class SPGPOEnvironment:
 
     def step(self, prompts: torch.Tensor, old_log_probs_batch: torch.Tensor, baselines: torch.Tensor) -> torch.Tensor:
         """Performs a batched step in the SPGPO environment using modular components."""
+        start_time = time.time()
         B, _, _ = prompts.shape
         all_responses = []
         all_advantages = []
@@ -857,6 +876,12 @@ class SPGPOEnvironment:
         surr1 = ratios * all_advantages
         surr2 = torch.clamp(ratios, 1 - self.clip_ratio, 1 + self.clip_ratio) * all_advantages
         loss = -torch.min(surr1, surr2).mean()
+
+        # パフォーマンスのモニタリング追加
+        step_time = time.time() - start_time
+        if self.logging and B > 1:  # バッチ処理の場合のみログを記録
+            logger.debug(f"SPGPO step for batch size {B}: {step_time:.4f}s "
+                         f"({step_time/B:.4f}s per prompt)")
         return loss
 
 
@@ -934,7 +959,7 @@ def train_spgpo(config: FastAttentionConfig, prompt_distribution: Callable, rewa
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 0.95 ** epoch)
     writer = SummaryWriter()
 
-    env = SPGPOEnvironment(agent.policy_network, prompt_distribution, reward_model, k_responses, tokenizer, clip_ratio=0.2) # Pass policy_network
+    env = SPGPOEnvironment(agent.policy_network, prompt_distribution, reward_model, k_responses, tokenizer, clip_ratio=0.2, logging=True) # Pass policy_network and enable logging
 
     print("Starting SPGPO Training...")
     for episode in range(num_episodes):
