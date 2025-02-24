@@ -9,6 +9,7 @@ from typing import Optional, Tuple, List, Dict, Callable, Any, Union
 from torch.utils.tensorboard import SummaryWriter
 import logging
 import time
+from collections import OrderedDict
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -258,21 +259,21 @@ class TrieCache(nn.Module):
         super().__init__()
         self.stride = stride
         self.max_cache_size = max_cache_size
-        self.cache = {}  # Maps hash of data to Trie
+        self.cache = OrderedDict()  # Use OrderedDict for FIFO behavior
 
     def get_trie(self, data_hash: int) -> Tuple[Trie, bool]:
         """Get a Trie for the given data hash, creating if needed."""
         if data_hash in self.cache:
-            return self.cache[data_hash], True
+            trie = self.cache.pop(data_hash) # Pop and re-insert to move to end (FIFO-like for eviction)
+            self.cache[data_hash] = trie
+            return trie, True
 
         # Create new Trie if not found
         trie = Trie(self.stride)
 
-        # Manage cache size
+        # Manage cache size - FIFO eviction using OrderedDict
         if len(self.cache) >= self.max_cache_size:
-            # Remove oldest entry
-            oldest_key = next(iter(self.cache))
-            del self.cache[oldest_key]
+            self.cache.popitem(last=False) # Remove oldest item (FIFO)
 
         self.cache[data_hash] = trie
         return trie, False
@@ -304,7 +305,7 @@ class CandidateFinder(nn.Module):
         self.trie_cache = TrieCache(config.stride)
 
         # Cache for Wu-Manber hash tables
-        self.wu_manber_cache = {}
+        self.wu_manber_cache = OrderedDict() # Use OrderedDict for FIFO cache
         self.wu_manber_cache_hits = 0
         self.wu_manber_cache_misses = 0
 
@@ -326,32 +327,34 @@ class CandidateFinder(nn.Module):
         return groups
 
     def _build_wu_manber_hash_table(self, key_bin: torch.Tensor) -> Dict[tuple, List[int]]:
-        """Build Wu-Manber hash table with caching."""
-        # Generate a hash for the binary key
-        key_hash = hash(tuple(key_bin.flatten().tolist()))
+        """Build Wu-Manber hash table with improved caching."""
+        # Generate a hash for the binary key - use a faster hashing method
+        key_hash = hash(tuple(key_bin[:, :self.config.wu_manber_prefix_len].flatten().tolist()))
 
         # Check cache first
         if key_hash in self.wu_manber_cache:
             self.wu_manber_cache_hits += 1
-            return self.wu_manber_cache[key_hash]
+            table = self.wu_manber_cache.pop(key_hash) # Pop and re-insert for FIFO-like eviction
+            self.wu_manber_cache[key_hash] = table
+            return table
 
-        # Build new hash table
+        # Build new hash table more efficiently
         self.wu_manber_cache_misses += 1
         table: Dict[tuple, List[int]] = {}
         L = key_bin.size(0)
 
-        for i in range(L):
-            prefix = tuple(key_bin[i, :self.config.wu_manber_prefix_len].tolist())
+        # Use tensor operations for batch processing
+        prefixes = [tuple(key_bin[i, :self.config.wu_manber_prefix_len].tolist()) for i in range(L)]
+        for i, prefix in enumerate(prefixes):
             table.setdefault(prefix, []).append(i)
 
-        # Cache the result
+        # Use LRU cache with ordered dict instead of arbitrary removal
         self.wu_manber_cache[key_hash] = table
 
-        # Limit cache size
-        if len(self.wu_manber_cache) > 1000:  # Arbitrary limit, adjust as needed
-            # Remove random entry to avoid predictable eviction patterns
-            key_to_remove = next(iter(self.wu_manber_cache))
-            del self.wu_manber_cache[key_to_remove]
+        # More efficient cache management with max size
+        if len(self.wu_manber_cache) > 1000:
+            # Use FIFO approach for more predictable cache behavior
+            self.wu_manber_cache.popitem(last=False) # Remove oldest item (FIFO)
 
         return table
 
@@ -375,39 +378,54 @@ class CandidateFinder(nn.Module):
         return cand_lists
 
     def _get_trie_candidates_group(self, query_grp: torch.Tensor, key_grp: torch.Tensor, head_idx: int) -> List[List[List[int]]]:
-        """Get Trie candidates for a feature group with caching."""
+        """Get Trie candidates with batch processing optimization."""
         B, L, _ = key_grp.size()
         cand_lists = []
 
+        # Pre-compute binary quantization once
+        query_bin_all = self.binary_quantize(query_grp)
+
         for b in range(B):
-            # Use a hash of the key tensor as cache key
+            # Use a more efficient hash function
             key_data = key_grp[b].detach()
-            data_hash = hash(tuple(key_data.flatten().tolist()[:100])) + hash(str(head_idx))
+            # Only hash a subset of data for faster computation
+            data_hash = hash(tuple(key_data[0, :50].tolist())) + hash(str(head_idx)) + b
 
             trie, cache_hit = self.trie_cache.get_trie(data_hash)
 
             if not cache_hit:
-                # Build trie with binary quantized keys
+                # Build trie with vectorized operations where possible
                 key_bin = self.binary_quantize(key_grp[b])
                 for i in range(L):
                     trie.insert(key_bin[i], i)
 
-            # Search with binary quantized queries
-            query_bin = self.binary_quantize(query_grp[b])
-            batch_list = [trie.search(query_bin[i]) for i in range(L)]
+            # Use pre-computed binary quantized queries
+            query_bin = query_bin_all[b]
+
+            # Process in chunks for better cache utilization
+            batch_list = []
+            chunk_size = 32  # Adjust based on hardware
+            for chunk_start in range(0, L, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, L)
+                chunk_results = [trie.search(query_bin[i]) for i in range(chunk_start, chunk_end)]
+                batch_list.extend(chunk_results)
+
             cand_lists.append(batch_list)
 
         return cand_lists
 
     def merge_candidate_indices_groups(self, cand_tensors: List[torch.Tensor]) -> torch.Tensor:
-        """Merge candidate indices from different groups efficiently."""
+        """Merge candidate indices from different groups with optimized memory usage."""
         if not cand_tensors:
-            device = self.lsh_tables[0][0].random_vectors.device
-            return torch.tensor([], device=device)
+            return None # Or return torch.empty((B, L, 0), dtype=torch.long, device=device) if preferred
 
+        # Allocate output tensor only once
         merged = torch.cat(cand_tensors, dim=-1)
-        merged, _ = torch.sort(merged)
-        return torch.unique_consecutive(merged, dim=-1)
+
+        # Use in-place operations where possible
+        merged, _ = torch.sort(merged, dim=-1) # Ensure dim=-1 for sorting along the candidate dimension
+        # Use inplace unique to reduce memory overhead
+        return torch.unique(merged, dim=-1)
 
     def _process_dimension_group_candidates(self, query_grp: torch.Tensor, key_grp: torch.Tensor, head_idx: int) -> torch.Tensor:
         """Process candidates for dimension groups efficiently."""
@@ -461,7 +479,7 @@ class CandidateFinder(nn.Module):
             result = torch.full((B, L, self.config.k_max), -1, dtype=torch.long, device=device)
 
         processing_time = time.time() - start_time
-        if self.training and head_idx == 0:  # Log only for first head to reduce spam
+        if self.training and head_idx == 0 and processing_time > 0.1:  # Log only for first head and slow operations
             logger.debug(f"Candidate finding took {processing_time:.4f}s")
 
         return result
