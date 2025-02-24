@@ -139,4 +139,3 @@ patterns = ["123", "456"]
 solver.build_trie(patterns)
 result = solver.solve(5)
 print("Result:", result)
-​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
