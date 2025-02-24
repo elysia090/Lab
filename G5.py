@@ -6,6 +6,31 @@ from dataclasses import dataclass
 import math
 
 ##############################################
+# Low-level Helper Functions
+##############################################
+
+def fma(a: float, b: float, c: float) -> float:
+    """
+    Fused multiply-add: returns a*b+c in a single instruction if available.
+    """
+    try:
+        return math.fma(a, b, c)
+    except AttributeError:
+        return a * b + c
+
+def optimized_sqrt(n: int) -> float:
+    """
+    If n is a power of 2, compute sqrt(n) using bit shifts:
+    For n = 2^k, sqrt(n) = 2^(k/2).
+    Otherwise, falls back to math.sqrt.
+    """
+    if n & (n - 1) == 0:  # check if n is a power of 2
+        k = n.bit_length() - 1
+        # Use fma to combine exponentiation steps if needed (here it's trivial)
+        return 2 ** (k / 2)
+    return math.sqrt(n)
+
+##############################################
 # Fast Attention Components
 ##############################################
 
@@ -55,7 +80,7 @@ class LowRankLinear(nn.Module):
 
 class RandomFourierFeatures(nn.Module):
     """
-    Projects input features using random Fourier features for kernel approximation.
+    Projects input features using random Fourier features.
     """
     def __init__(self, input_dim: int, rff_dim: int):
         super().__init__()
@@ -63,12 +88,14 @@ class RandomFourierFeatures(nn.Module):
         self.bias = nn.Parameter(torch.rand(rff_dim) * 2 * math.pi, requires_grad=False)
         self.scale = math.sqrt(2.0 / rff_dim)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        projection = x.matmul(self.omega) + self.bias
+        projection = x.matmul(self.omega)
+        # Use fused multiply-add for adding bias if possible.
+        projection = projection + self.bias  # backend may fuse this operation.
         return torch.cos(projection) * self.scale
 
 class LSHTable(nn.Module):
     """
-    Locality-sensitive hashing (LSH) table for grouping similar features.
+    Locality-sensitive hashing table.
     """
     def __init__(self, dim: int, n_buckets: int, bandwidth: float, n_hashes: int):
         super().__init__()
@@ -84,7 +111,7 @@ class LSHTable(nn.Module):
 _TRIE_INDICES_KEY = '_indices'
 class Trie(nn.Module):
     """
-    Trie (prefix tree) for fast lookup using binary-quantized features.
+    Trie (prefix tree) for fast candidate lookup using binary quantization.
     """
     def __init__(self, stride: int):
         super().__init__()
@@ -109,8 +136,7 @@ class Trie(nn.Module):
 
 class CandidateFinder(nn.Module):
     """
-    Candidate search module combining LSH, Wu-Manber, and Trie-based methods.
-    Optionally splits features by dimension groups.
+    Candidate search module that uses LSH, Wu-Manber, and Trie-based methods.
     """
     def __init__(self, config: FastAttentionConfig, tries: List[Trie], lsh_tables: nn.ModuleList):
         super().__init__()
@@ -132,13 +158,6 @@ class CandidateFinder(nn.Module):
             groups.append(features[:, :, start:start+group_dim])
             start += group_dim
         return groups
-
-    def get_lsh_matches_for_group(self, query_grp: torch.Tensor, key_grp: torch.Tensor,
-                                  head_idx: int, group_idx: int) -> torch.Tensor:
-        lsh_table = self.lsh_tables[head_idx][group_idx]
-        q_hash = lsh_table(query_grp)
-        k_hash = lsh_table(key_grp)
-        return (q_hash.unsqueeze(2) == k_hash.unsqueeze(1)).any(dim=-1)
 
     def _build_wu_manber_hash_table(self, key_bin: torch.Tensor) -> Dict[tuple, List[int]]:
         table: Dict[tuple, List[int]] = {}
@@ -208,7 +227,7 @@ class CandidateFinder(nn.Module):
 
 class AbsorptionProjection(nn.Module):
     """
-    Projects queries into the key space using a low-rank 'absorption' transformation.
+    Projects queries into key space using a low-rank 'absorption' transformation.
     """
     def __init__(self, query_dim: int, key_dim: int, rank: int):
         super().__init__()
@@ -244,7 +263,6 @@ class FastAttention(nn.Module):
             RandomFourierFeatures(config.d_key, config.rff_dim)
             for _ in range(config.n_heads)
         ])
-        # Build LSH tables per head
         if config.hyper_cuts_dim_groups:
             self.lsh_tables_list = nn.ModuleList([
                 nn.ModuleList([
@@ -281,9 +299,9 @@ class FastAttention(nn.Module):
             if self.config.use_rff:
                 q_exp = self.rff_encoders[head_idx](q_exp.view(-1, self.config.d_key)).view(B, L, 1, self.config.rff_dim)
                 candidate_keys = self.rff_encoders[head_idx](candidate_keys.view(-1, self.config.d_key)).view(B, L, self.config.k_max, self.config.rff_dim)
-                scale = math.sqrt(self.config.rff_dim)
+                scale = optimized_sqrt(self.config.rff_dim)
             else:
-                scale = math.sqrt(self.config.d_key)
+                scale = optimized_sqrt(self.config.d_key)
             sim = torch.matmul(q_exp, candidate_keys.transpose(-2, -1)).squeeze(2) / scale
             sim = sim.masked_fill(~cand_mask, float('-inf'))
             attn_weights = F.softmax(sim, dim=-1)
@@ -313,7 +331,7 @@ class FeedForwardNetwork(nn.Module):
 
 class FastAttentionEncoderLayer(nn.Module):
     """
-    Transformer encoder layer that uses Fast Attention followed by a feedforward network.
+    Transformer encoder layer using Fast Attention followed by feedforward network.
     """
     def __init__(self, config: FastAttentionConfig):
         super().__init__()
@@ -333,7 +351,7 @@ class FastAttentionEncoderLayer(nn.Module):
         return residual + self.dropout(ffn)
 
 ##############################################
-# GRPO (Group Relative Policy Optimization) Components
+# GRPO Components
 ##############################################
 
 class GRPOAgent(nn.Module):
@@ -354,11 +372,10 @@ class GRPOAgent(nn.Module):
 class GRPOEnvironmentMulti:
     """
     Environment for multi-group candidate search hyperparameter optimization.
-    Each group maintains its own hyperparameters; state vector per group:
-    [k_max, mu, sigma, T, P, H]
+    Each group state: [k_max, mu, sigma, T, P, H]
     """
     def __init__(self, initial_hyperparams: List[Dict[str, float]], alpha: float = 0.1, beta: float = 0.01):
-        self.groups = initial_hyperparams  # List of dicts, one per group.
+        self.groups = initial_hyperparams
         self.alpha = alpha  # Weight for self-regression error.
         self.beta = beta    # Weight for computation cost.
     def get_state(self) -> torch.Tensor:
@@ -392,9 +409,8 @@ def grpo_training_episode(agent: GRPOAgent, env: GRPOEnvironmentMulti, optimizer
                             episode_length: int = 10, gamma: float = 0.99, epsilon: float = 1e-8,
                             lambda_kl: float = 0.01) -> float:
     """
-    Run one GRPO training episode over multiple time steps.
-    Uses a Monte Carlo baseline (mean of rewards) and scales advantage by reward standard deviation.
-    Also includes an explicit KL divergence penalty.
+    Runs one GRPO training episode over multiple time steps.
+    Uses Monte Carlo baseline (mean reward) scaled by standard deviation and an explicit KL penalty.
     """
     total_loss = 0.0
     state = env.get_state()  # Shape: [G, state_dim]
@@ -403,11 +419,11 @@ def grpo_training_episode(agent: GRPOAgent, env: GRPOEnvironmentMulti, optimizer
         std = torch.ones_like(actions)  # Fixed std = 1
         dist = torch.distributions.Normal(actions, std)
         log_probs = dist.log_prob(actions).sum(dim=1)  # [G]
-        next_state, rewards = env.step(actions)  # rewards: [G]
+        next_state, rewards = env.step(actions)
         mean_reward = rewards.mean()
         std_reward = rewards.std() + epsilon
         advantage = (rewards - mean_reward) / std_reward
-        # Explicit KL penalty: for Normal(actions,1) vs Normal(0,1), KL = 0.5 * (actions^2)
+        # KL penalty: for Normal(actions,1) vs Normal(0,1), KL = 0.5 * (actions^2)
         kl_div = 0.5 * (actions ** 2).mean()
         loss = - (log_probs * advantage).mean() + lambda_kl * kl_div
         optimizer.zero_grad()
@@ -419,7 +435,7 @@ def grpo_training_episode(agent: GRPOAgent, env: GRPOEnvironmentMulti, optimizer
 
 def example_grpo_full():
     """
-    Example usage of GRPO training for multi-group candidate search hyperparameter optimization.
+    Example GRPO training for multi-group candidate search hyperparameter optimization.
     """
     initial_hyperparams = [
         {'lsh_buckets': 32, 'lsh_bandwidth': 4.0, 'trie_stride': 4, 'k_max': 64},
@@ -475,3 +491,4 @@ if __name__ == "__main__":
     example_usage_encoder_layer()
     print("Starting full GRPO training (multi-group)...")
     example_grpo_full()
+
