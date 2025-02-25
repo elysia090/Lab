@@ -85,7 +85,12 @@ def check_for_nan(tensor: torch.Tensor, tensor_name: str):
     if torch.isnan(tensor).any():
         raise ValueError(f"NaN detected in {tensor_name}!")
 
-
+def check_for_inf(tensor: torch.Tensor, tensor_name: str):
+    """
+    Checks if a tensor contains inf values and raises a ValueError if it does.
+    """
+    if torch.isinf(tensor).any():
+        raise ValueError(f"inf detected in {tensor_name}!")
 ##############################################
 # Fast Attention Components - Improved
 ##############################################
@@ -96,7 +101,7 @@ class FastAttentionConfig:
     Configuration for FastAttention with validation.
 
     Attributes:
-        # ... (既存の属性)
+        # ... (existing attributes)
         dtype: torch.dtype = torch.float32
     """
     d_model: int
@@ -116,7 +121,7 @@ class FastAttentionConfig:
     dropout: float = 0.1
     intermediate_dim: int = 2048
     use_rff: bool = True
-    dtype: torch.dtype = torch.float32  # dtype フィールドを dataclass 属性として定義
+    dtype: torch.dtype = torch.float32  # dtype field as a dataclass attribute
 
     def __post_init__(self):
         """Validate configuration parameters."""
@@ -177,6 +182,7 @@ class RandomFourierFeatures(nn.Module):
         projection = torch.addmm(self.bias, x, self.omega)
         result = torch.cos(projection) * self.scale
         check_for_nan(result, "RFF output")
+        check_for_inf(result, "RFF output")
         if len(orig_shape) > 2:
             new_shape = list(orig_shape[:-1]) + [self.omega.size(1)]
             result = result.view(*new_shape)
@@ -215,6 +221,7 @@ class LSHTable(nn.Module):
         proj = x.matmul(self.random_vectors)
         hashed = torch.floor(proj / self.bandwidth) % self.n_buckets
         check_for_nan(hashed, "LSH hashed output")
+        check_for_inf(hashed, "LSH hashed output")
 
         if self.training:
             unique_hashes = torch.unique(hashed.reshape(-1, self.n_hashes), dim=0).shape[0]
@@ -426,6 +433,7 @@ class CandidateFinder(nn.Module):
         else:
             result = torch.full((B, L, self.config.k_max), -1, dtype=torch.long, device=device)
         check_for_nan(result, "CandidateFinder output")
+        check_for_inf(result, "CandidateFinder output")
         processing_time = time.time() - start_time
         if self.training and head_idx == 0:
             logger.debug(f"Candidate finding took {processing_time:.4f}s")
@@ -458,12 +466,15 @@ class AbsorptionProjection(nn.Module):
         self.W_absorb = torch.matmul(W_UK.transpose(0, 1), W_UQ)
         self.needs_composition = False
         check_for_nan(self.W_absorb, "Absorption Matrix W_absorb")
+        check_for_inf(self.W_absorb, "Absorption Matrix W_absorb")
+
 
     def forward(self, query: torch.Tensor, key: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.needs_composition or self.W_absorb is None:
             self._compute_absorption_matrix()
         Q_proj = torch.matmul(query, self.W_absorb.transpose(0, 1))
         check_for_nan(Q_proj, "Absorption Projection Q_proj")
+        check_for_inf(Q_proj, "Absorption Projection Q_proj")
         return Q_proj, key
 
     def train(self, mode: bool = True):
@@ -515,6 +526,9 @@ class FastAttention(nn.Module):
         key_down = self.key_value_down_proj(key)
         check_for_nan(query_down, "Query Down Projection")
         check_for_nan(key_down, "Key Down Projection")
+        check_for_inf(query_down, "Query Down Projection")
+        check_for_inf(key_down, "Key Down Projection")
+
 
         concat = torch.zeros(B, L, self.config.d_model * self.config.n_heads, device=device, dtype=query.dtype)
 
@@ -522,9 +536,13 @@ class FastAttention(nn.Module):
             Q_proj, K_proj = self.absorption_projs[head_idx](query_down, key_down)
             check_for_nan(Q_proj, f"Head {head_idx} Absorption Projection Q_proj")
             check_for_nan(K_proj, f"Head {head_idx} Absorption Projection K_proj")
+            check_for_inf(Q_proj, f"Head {head_idx} Absorption Projection Q_proj")
+            check_for_inf(K_proj, f"Head {head_idx} Absorption Projection K_proj")
+
 
             candidates = self.candidate_finder(Q_proj, K_proj, head_idx)
             check_for_nan(candidates, f"Head {head_idx} CandidateFinder output")
+            check_for_inf(candidates, f"Head {head_idx} CandidateFinder output")
 
             cand_mask = candidates != -1
             safe_candidates = candidates.clone()
@@ -533,6 +551,7 @@ class FastAttention(nn.Module):
             b_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, L, num_candidates)
             candidate_keys = K_proj[b_idx, safe_candidates]
             check_for_nan(candidate_keys, f"Head {head_idx} Candidate Keys")
+            check_for_inf(candidate_keys, f"Head {head_idx} Candidate Keys")
 
             q_exp = Q_proj.unsqueeze(2)
             if self.config.use_rff:
@@ -544,9 +563,13 @@ class FastAttention(nn.Module):
                 scale = optimized_sqrt(self.config.d_key)
             check_for_nan(q_exp, f"Head {head_idx} Q_exp after RFF")
             check_for_nan(candidate_keys, f"Head {head_idx} Candidate Keys after RFF")
+            check_for_inf(q_exp, f"Head {head_idx} Q_exp after RFF")
+            check_for_inf(candidate_keys, f"Head {head_idx} Candidate Keys after RFF")
 
             sim = torch.matmul(q_exp, candidate_keys.transpose(-2, -1)).squeeze(2) / scale
             check_for_nan(sim, f"Head {head_idx} Similarity Scores (sim)")
+            check_for_inf(sim, f"Head {head_idx} Similarity Scores (sim)")
+
 
             sim.masked_fill_(~cand_mask, -1e9)
             if mask is not None:
@@ -557,24 +580,32 @@ class FastAttention(nn.Module):
             attn_weights = self.dropout(attn_weights)
             check_for_nan(sim, f"Head {head_idx} Sim before Softmax")
             check_for_nan(attn_weights, f"Head {head_idx} Attention Weights")
+            check_for_inf(sim, f"Head {head_idx} Sim before Softmax")
+            check_for_inf(attn_weights, f"Head {head_idx} Attention Weights")
 
             candidate_values = key_down[b_idx, safe_candidates]
             check_for_nan(candidate_values, f"Head {head_idx} Candidate Values")
+            check_for_inf(candidate_values, f"Head {head_idx} Candidate Values")
 
             candidate_values = self.value_up_projs[head_idx](
                 candidate_values.reshape(-1, self.config.d_key)
             ).reshape(B, L, num_candidates, self.config.d_model)
             check_for_nan(candidate_values, f"Head {head_idx} Candidate Values Up-Projected")
+            check_for_inf(candidate_values, f"Head {head_idx} Candidate Values Up-Projected")
+
 
             head_out = torch.sum(attn_weights.unsqueeze(-1) * candidate_values, dim=2)
             check_for_nan(head_out, f"Head {head_idx} Output (head_out)")
+            check_for_inf(head_out, f"Head {head_idx} Output (head_out)")
             concat_slice = slice(head_idx * self.config.d_model, (head_idx + 1) * self.config.d_model)
             concat[:, :, concat_slice] = head_out
 
         check_for_nan(concat, "Concat output before output_proj")
+        check_for_inf(concat, "Concat output before output_proj")
         output = self.output_proj(concat)
         output = self.dropout(output)
         check_for_nan(output, "FastAttention final output")
+        check_for_inf(output, "FastAttention final output")
 
         forward_time = time.time() - start_time
         self.forward_times.append(forward_time)
@@ -597,18 +628,21 @@ class FeedForwardNetwork(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         self.use_layer_norm = True
         if self.use_layer_norm:
-            self.norm = nn.LayerNorm(config.intermediate_dim) # dtype 不要 (weight, bias はパラメータで、上で指定)
+            self.norm = nn.LayerNorm(config.intermediate_dim) # dtype is not needed (weight and bias are parameters specified above)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.linear1(x)
         check_for_nan(x, "FFN linear1 output")
+        check_for_inf(x, "FFN linear1 output")
         x = F.gelu(x)
         if self.use_layer_norm:
             x = self.norm(x)
             check_for_nan(x, "FFN layer norm output")
+            check_for_inf(x, "FFN layer norm output")
         x = self.dropout(x)
         x = self.linear2(x)
         check_for_nan(x, "FFN linear2 output")
+        check_for_inf(x, "FFN linear2 output")
         x = self.dropout(x)
         return x
 
@@ -620,21 +654,28 @@ class FastAttentionEncoderLayer(nn.Module):
         super().__init__()
         self.self_attn = FastAttention(config)
         self.feed_forward = FeedForwardNetwork(config)
-        self.norm1 = nn.LayerNorm(config.d_model)  # dtype 不要 (weight, bias はパラメータ)
-        self.norm2 = nn.LayerNorm(config.d_model)  # dtype 不要
+        self.norm1 = nn.LayerNorm(config.d_model)  # dtype is not needed (weight and bias are parameters)
+        self.norm2 = nn.LayerNorm(config.d_model)  # dtype is not needed
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, src: torch.Tensor, src_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Ensure src has the correct dtype
+        src = src.to(self.norm1.weight.dtype)  # Match LayerNorm's parameters
+
         # Pre-Norm configuration
-        x = self.norm1(src)  #  இங்கே src.float() 는 필요 없음
+        x = self.norm1(src)
         check_for_nan(x, "Encoder Layer norm1 output")
+        check_for_inf(x, "Encoder Layer norm1 output")
         attn_output = self.self_attn(x, x, x, mask=src_mask)
         check_for_nan(attn_output, "Encoder Self Attention output")
+        check_for_inf(attn_output, "Encoder Self Attention output")
         x = src + self.dropout(attn_output)
-        x = self.norm2(x)  # src.float() 不要
+        x = self.norm2(x)
         check_for_nan(x, "Encoder Layer norm2 output")
+        check_for_inf(x, "Encoder Layer norm2 output")
         ff_output = self.feed_forward(x)
         check_for_nan(ff_output, "Encoder FeedForward output")
+        check_for_inf(ff_output, "Encoder FeedForward output")
         x = x + self.dropout(ff_output)
         return x
 
@@ -650,17 +691,37 @@ class ResponseGenerator(nn.Module):
         self.temperature = temperature
 
     def generate_responses(self, prompt: torch.Tensor) -> torch.Tensor:
-        B, L, d_model = prompt.size()  # d_model を取得
+        B, L, d_model = prompt.size()  # Get d_model
         prompt_expanded = prompt.repeat_interleave(self.k_responses, dim=0) # (B*k_responses, L, d_model)
         check_for_nan(prompt_expanded, "ResponseGenerator prompt_expanded")
+        check_for_inf(prompt_expanded, "ResponseGenerator prompt_expanded")
+
+        # Ensure correct dtype for policy network input.
+        prompt_expanded = prompt_expanded.to(self.policy_network.norm1.weight.dtype)
+
         logits = self.policy_network(prompt_expanded) / self.temperature  # (B*k_responses, L, vocab_size)
         check_for_nan(logits, "ResponseGenerator logits")
+        check_for_inf(logits, "ResponseGenerator logits")
 
         probs = F.softmax(logits, dim=-1)
         check_for_nan(probs, "ResponseGenerator probs before Categorical")
+        check_for_inf(probs, "ResponseGenerator probs before Categorical")
         dist = Categorical(probs)
         response_tokens = dist.sample()  # (B*k_responses, L)
         return response_tokens.view(B, self.k_responses, L)  # (B, k_responses, L)
+
+
+def preference_oracle(response, response_group, prompt, reward_model):
+    """
+    Simplified preference oracle using the reward model.  Handles batches correctly.
+    """
+    B, K, L = response_group.shape
+    rewards_responses = reward_model(prompt, response.squeeze(1))  # (B,)
+    rewards_group = reward_model(prompt.repeat_interleave(K, dim=0), response_group.view(-1, L)).view(B, K) # (B, K)
+
+    # Create preference matrix based on pairwise comparisons
+    preferences = (rewards_responses.unsqueeze(1) > rewards_group).float()  # (B, K)
+    return preferences
 
 
 class PreferenceComputer:
@@ -673,10 +734,8 @@ class PreferenceComputer:
     def compute_group_preference(self, response: torch.Tensor, response_group: torch.Tensor, prompt: torch.Tensor) -> torch.Tensor:
 
         B, K, L = response_group.shape
-        response_expanded = response.unsqueeze(1)  # (B, 1, L)
-        response_group_expanded = response_group.unsqueeze(0)  # (1, B, K, L) -> (1, K, L)
-        prompt_expanded = prompt.unsqueeze(1)
-        preferences = preference_oracle(response_expanded, response_group_expanded, prompt_expanded, self.reward_model)
+         # (B, 1, L)
+        preferences = preference_oracle(response, response_group, prompt, self.reward_model) # (B, K) Call the oracle
         return preferences
 
 class AdvantageComputer:
@@ -689,12 +748,12 @@ class AdvantageComputer:
 
     def compute_spgpo_advantage(self, response: torch.Tensor, response_group: torch.Tensor, prompt: torch.Tensor, baseline: torch.Tensor) -> torch.Tensor:
         B, K, L = response_group.shape
-        preferences = self.preference_computer.compute_group_preference(response, response_group, prompt)
+        preferences = self.preference_computer.compute_group_preference(response, response_group, prompt)  #(B,K)
         mask = torch.ones((B, K), device=response.device)
         response_expanded = response.unsqueeze(1)
         equals = (response_expanded == response_group).all(dim=2)
         mask.masked_fill_(equals, 0)
-        denom = torch.clamp(self.k_responses - equals.sum(dim=1, keepdim=True), min=1.0)
+        denom = torch.clamp(self.k_responses - equals.sum(dim=1, keepdim=True), min=1.0) # Avoid division by zero
         response_pref = (preferences * mask).sum(dim=1) / denom
         avg_group_pref = preferences.mean(dim=1)
         advantage = response_pref - avg_group_pref - baseline
@@ -714,27 +773,34 @@ class SPGPOEnvironment:
         self.preference_computer = PreferenceComputer(reward_model)
         self.advantage_computer = AdvantageComputer(self.preference_computer, k_responses)
         self.policy_network = policy_network
+        # Dummy tokenizer if none provided
         if self.tokenizer is None:
             self.tokenizer = lambda x: torch.randint(0, 100, (1, x))
 
+
     def step(self, prompts: torch.Tensor, old_log_probs_batch: torch.Tensor, baselines: torch.Tensor) -> torch.Tensor:
-        B, L, d_model = prompts.shape # d_model を取得
+        B, L, d_model = prompts.shape # Get d_model
         all_responses = []
         all_advantages = []
         all_current_log_probs = []
 
         for i in range(B):
             prompt = prompts[i].unsqueeze(0) # (1, L, d_model)
-            response_group = self.response_generator.generate_responses(prompt)  # (1, k_responses, L) -> (k_responses, L)
+            response_group = self.response_generator.generate_responses(prompt)  # (1, k_responses, L)
             response_group = response_group.squeeze(0) # (k_responses, L)
-            # (k_responses, L) -> (k_responses, L, d_model)
-            response_group_expanded = response_group.unsqueeze(-1).repeat(1, 1, d_model)
+            response_group_expanded = response_group.unsqueeze(-1).repeat(1, 1, d_model)  # (k_responses, L) -> (k_responses, L, d_model)
+            # Ensure correct dtype before passing to the policy network
+            response_group_expanded = response_group_expanded.to(self.policy_network.norm1.weight.dtype)
+
 
 
             logits = self.policy_network(response_group_expanded)  # (k_responses, L, vocab_size)
             check_for_nan(logits, "Env Policy Network logits")
+            check_for_inf(logits, "Env Policy Network logits")
+
             current_log_probs = F.log_softmax(logits, dim=-1) # (k_responses, L, vocab_size)
             check_for_nan(current_log_probs, "Env Log Probs")
+            check_for_inf(current_log_probs, "Env Log Probs")
 
             for k in range(self.response_generator.k_responses):
                 response = response_group[k]  # (L,)
@@ -755,7 +821,7 @@ class SPGPOEnvironment:
         all_current_log_probs = torch.stack(all_current_log_probs)  # (B*k_responses,)
 
         log_diff = all_current_log_probs - old_log_probs_batch
-        log_diff = torch.clamp(log_diff, -20, 20)
+        log_diff = torch.clamp(log_diff, -20, 20)  # Clip for stability
         ratios = torch.exp(log_diff)
         surr1 = ratios * all_advantages
         surr2 = torch.clamp(ratios, 1 - self.clip_ratio, 1 + self.clip_ratio) * all_advantages
@@ -772,6 +838,8 @@ class SPGPOAgent(nn.Module):
         self.policy_network = FastAttentionEncoderLayer(config)
 
     def forward(self, prompt: torch.Tensor) -> torch.Tensor:
+        # Ensure prompt has the correct dtype
+        prompt = prompt.to(self.policy_network.norm1.weight.dtype)
         return self.policy_network(prompt)
 
 def compute_baselines(prompts: torch.Tensor, env: SPGPOEnvironment) -> torch.Tensor:
@@ -782,7 +850,7 @@ def compute_baselines(prompts: torch.Tensor, env: SPGPOEnvironment) -> torch.Ten
         response_group = env.response_generator.generate_responses(prompt)
         response_group = response_group.squeeze(0) # (k_responses, L)
         preferences_batch = env.preference_computer.compute_group_preference(response_group, response_group.unsqueeze(0), prompt)
-        avg_group_pref = preferences_batch.mean()
+        avg_group_pref = preferences_batch.mean()  # Average preference for the group
         baselines.append(avg_group_pref)
     return torch.stack(baselines)
 
@@ -792,39 +860,44 @@ def spgpo_training_episode(agent: SPGPOAgent, env: SPGPOEnvironment, optimizer: 
 
     total_loss = 0.0
     prompts = env.prompt_distribution(batch_size)
-    B, L, d_model = prompts.shape # d_model を取得
+    B, L, d_model = prompts.shape # Get d_model
 
+    # Compute baselines (using the current policy)
     baselines = compute_baselines(prompts, env).detach()
 
+    # Calculate old log probabilities for the batch (outside the loop)
     old_log_probs_batch = []
-    with torch.no_grad():
+    with torch.no_grad():  # No gradients needed for old log probs
         for i in range(batch_size):
             prompt = prompts[i].unsqueeze(0)
             response_group = env.response_generator.generate_responses(prompt)
             response_group = response_group.squeeze(0) # (k_responses, L)
-            # (k_responses, L) -> (k_responses, L, d_model)
-            response_group_expanded = response_group.unsqueeze(-1).repeat(1, 1, d_model)
+            response_group_expanded = response_group.unsqueeze(-1).repeat(1, 1, d_model)  # (k_responses, L) -> (k_responses, L, d_model)
+            # Ensure correct dtype before passing to the agent
+            response_group_expanded = response_group_expanded.to(agent.policy_network.norm1.weight.dtype)
 
             logits = agent(response_group_expanded)  # (k_responses, L, vocab_size)
             log_probs = F.log_softmax(logits, dim=-1)
 
             for k in range(env.response_generator.k_responses):
                 response = response_group[k]
-                response_tokens = response.long()
+                response_tokens = response.long()  # Ensure token indices are long
                 log_prob_response = log_probs[k]
                 gathered_log_probs = torch.gather(log_prob_response, 1, response_tokens.unsqueeze(1)).squeeze(1)
-                summed_log_prob = gathered_log_probs.sum()
+                summed_log_prob = gathered_log_probs.sum() # Sum log probabilities over the sequence
                 old_log_probs_batch.append(summed_log_prob)
 
-    old_log_probs_batch = torch.stack(old_log_probs_batch).detach()
+    old_log_probs_batch = torch.stack(old_log_probs_batch).detach() # Detach from the computation graph
 
+    # Perform the policy update step
     loss = env.step(prompts, old_log_probs_batch, baselines)
 
+    # Optimization step
     optimizer.zero_grad()
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=1.0)
+    torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=1.0)  # Gradient clipping
     optimizer.step()
-    scheduler.step()
+    scheduler.step()  # Update learning rate
     total_loss += loss.item()
 
     writer.add_scalar("Loss/Episode", loss.item(), episode)
@@ -871,18 +944,21 @@ def main():
         dropout=0.1,
         intermediate_dim=512,
         use_rff=True,
-        dtype=torch.float32
+        dtype=torch.float32  # Explicitly set dtype
     )
 
     def simple_prompt_distribution(batch_size):
         seq_len = 64
         prompt_dim = config.d_model
+        # Ensure the prompt tensor has the correct dtype.  THIS IS CRITICAL.
         return torch.randn(batch_size, seq_len, prompt_dim, dtype=config.dtype)
 
     def simple_reward_model(prompt, response):
-      return torch.randn(prompt.size(0), dtype=config.dtype) # (B,)
+        # Ensure consistent dtype for reward calculation
+        return torch.randn(prompt.size(0), dtype=config.dtype)  # (B,)
 
     def simple_tokenizer(seq_len):
+        # Consistent dtype
         return torch.randint(0, 100, (1, seq_len))
 
     trained_agent = train_spgpo(
@@ -890,7 +966,7 @@ def main():
         prompt_distribution=simple_prompt_distribution,
         reward_model=simple_reward_model,
         tokenizer=simple_tokenizer,
-        num_episodes=50,
+        num_episodes=50,  # Reduced for testing
         batch_size=16,
         k_responses=4
     )
