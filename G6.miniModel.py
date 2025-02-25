@@ -93,6 +93,8 @@ class FastAttentionConfig:
 
         if self.k_max <= 0:
             raise ValueError("k_max must be positive")
+        if self.dropout < 0 or self.dropout >= 1:
+            raise ValueError("Dropout must be in [0, 1)")
 
 ##############################################
 # Low-Rank Projection Components
@@ -833,7 +835,6 @@ class FastAttentionEncoderLayer(nn.Module):
         residual = src
         src = self.norm2(src)
         ffn = self.feed_forward(src)
-        return residual + self.dropout(ffn)
         return residual + self.dropout(ffn)
 
 ##############################################
