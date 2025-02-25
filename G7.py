@@ -1,4 +1,3 @@
---- START OF FILE G7 (1).py ---
 import math
 import torch
 import torch.nn as nn
