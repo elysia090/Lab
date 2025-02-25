@@ -3,974 +3,1114 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.distributions import Normal, Categorical
+from torch.distributions import Normal
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, List, Dict, Callable, Any, Union
-from torch.utils.tensorboard import SummaryWriter
-import logging
-import time
-from collections import OrderedDict
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+from typing import Optional, Tuple, List, Dict, Any
 
 ##############################################
-# Low-level Helpers - Improved
+# Low-level Helpers
 ##############################################
 
 def optimized_sqrt(n: int) -> float:
     """
-    Optimized square root for powers of 2.
-
+    Optimized square root calculation for powers of 2.
+    
+    For powers of 2, uses bit manipulation for faster computation.
+    For other values, falls back to standard math.sqrt.
+    
     Args:
-        n (int): Input integer.
-
+        n: Integer to compute square root of
+    
     Returns:
-        float: Square root of n, optimized for powers of 2.
-
-    Raises:
-        ValueError: If input is not positive.
+        Square root of n as float
     """
-    if n <= 0:
-        raise ValueError("Input must be positive")
-    if n & (n - 1) == 0:
+    if n & (n - 1) == 0:  # Check if n is a power of 2
         k = n.bit_length() - 1
         return 2 ** (k / 2)
     return math.sqrt(n)
 
 def fma(a: float, b: float, c: float) -> float:
     """
-    Fused multiply-add with fallback to standard operations.
-
+    Fused multiply-add operation: a*b + c.
+    
+    Uses hardware FMA if available, otherwise falls back to standard operations.
+    
     Args:
-        a (float): First factor.
-        b (float): Second factor.
-        c (float): Addend.
-
+        a: First multiplicand
+        b: Second multiplicand
+        c: Addend
+    
     Returns:
-        float: Result of fused multiply-add operation (a*b + c).
+        Result of a*b + c
     """
     try:
-        return math.fma(a, b, c)
+        return math.fma(a, b, c)  # Use hardware FMA if available
     except AttributeError:
-        return a * b + c
+        return a * b + c  # Fallback implementation
 
-def validate_tensor_dimensions(tensor: torch.Tensor, name: str, expected_dims: int):
-    """
-    Validates tensor dimensions to provide clear error messages.
-
-    Args:
-        tensor (torch.Tensor): Input tensor to validate.
-        name (str): Name of the tensor for error messages.
-        expected_dims (int): Expected number of dimensions.
-
-    Raises:
-        ValueError: If tensor dimensions do not match expected dimensions.
-    """
-    if tensor.dim() != expected_dims:
-        raise ValueError(f"Expected {name} to have {expected_dims} dimensions, got {tensor.dim()}")
-
-def check_for_nan(tensor: torch.Tensor, tensor_name: str):
-    """
-    Checks if a tensor contains NaN values and raises a ValueError if it does.
-
-    Args:
-        tensor (torch.Tensor): Input tensor to check.
-        tensor_name (str): Name of the tensor for error messages.
-
-    Raises:
-        ValueError: If tensor contains NaN values.
-    """
-    if torch.isnan(tensor).any():
-        raise ValueError(f"NaN detected in {tensor_name}!")
-
-def check_for_inf(tensor: torch.Tensor, tensor_name: str):
-    """
-    Checks if a tensor contains inf values and raises a ValueError if it does.
-    """
-    if torch.isinf(tensor).any():
-        raise ValueError(f"inf detected in {tensor_name}!")
 ##############################################
-# Fast Attention Components - Improved
+# Fast Attention Configuration
 ##############################################
 
 @dataclass
 class FastAttentionConfig:
-    """
-    Configuration for FastAttention with validation.
+    """Configuration for Fast Attention components."""
 
-    Attributes:
-        # ... (existing attributes)
-        dtype: torch.dtype = torch.float32
-    """
-    d_model: int
-    d_key: int
-    d_query: int
-    n_heads: int
-    rank: int
-    rff_dim: int
-    k_max: int
-    stride: int
-    lsh_buckets: int
-    lsh_bandwidth: float
-    lsh_key_dim: int
-    wu_manber_prefix_len: int
-    hyper_cuts_dim_groups: Optional[List[int]] = None
-    n_lsh_hashes: int = 4
-    dropout: float = 0.1
-    intermediate_dim: int = 2048
-    use_rff: bool = True
-    dtype: torch.dtype = torch.float32  # dtype field as a dataclass attribute
+    # Model dimensions
+    d_model: int          # Overall model dimension
+    d_key: int            # Key dimension
+    d_query: int          # Query dimension
+    n_heads: int          # Number of attention heads
+
+    # Approximation parameters
+    rank: int             # Rank for low-rank approximations
+    rff_dim: int          # Output dimension for random Fourier features
+
+    # Candidate search parameters
+    k_max: int            # Maximum candidate keys per query
+    stride: int           # Stride length for Trie
+    lsh_buckets: int      # Number of LSH buckets
+    lsh_bandwidth: float  # Bandwidth parameter for LSH
+    lsh_key_dim: int      # LSH input dimension
+    wu_manber_prefix_len: int  # Prefix length for Wu-Manber search
+
+    # Optional parameters
+    hyper_cuts_dim_groups: Optional[List[int]] = None  # Dimension groups for HyperCuts-inspired partitioning
+    n_lsh_hashes: int = 4  # Number of hash functions for LSH
+    dropout: float = 0.1  # Dropout probability
+    intermediate_dim: int = 2048  # Dimension of intermediate FFN layer
+    use_rff: bool = True  # Whether to use Random Fourier Features
 
     def __post_init__(self):
         """Validate configuration parameters."""
-        if self.d_model <= 0 or self.d_key <= 0 or self.d_query <= 0:
-            raise ValueError("Dimensions must be positive")
-        if self.n_heads <= 0:
-            raise ValueError("Number of heads must be positive")
-        if self.rank <= 0:
-            raise ValueError("Rank must be positive")
         if self.hyper_cuts_dim_groups is not None:
-            if sum(self.hyper_cuts_dim_groups) != self.lsh_key_dim:
-                raise ValueError(f"Sum of hyper_cuts_dim_groups ({sum(self.hyper_cuts_dim_groups)}) "
-                                f"must equal lsh_key_dim ({self.lsh_key_dim})")
+            total_dims = sum(self.hyper_cuts_dim_groups)
+            if total_dims != self.d_key:
+                raise ValueError(f"Sum of hyper_cuts_dim_groups ({total_dims}) must equal d_key ({self.d_key})")
+
+        if self.d_query <= 0 or self.d_key <= 0 or self.d_model <= 0:
+            raise ValueError("Dimensions must be positive")
+
+        if self.k_max <= 0:
+            raise ValueError("k_max must be positive")
+        if self.dropout < 0 or self.dropout >= 1:
+            raise ValueError("Dropout must be in [0, 1)")
+
+##############################################
+# Low-Rank Projection Components
+##############################################
 
 class LowRankLinear(nn.Module):
     """
-    Improved LowRankLinear with better initialization and caching.
+    Low-rank approximation of a linear transformation.
+    
+    Represents a matrix W of shape (in_features, out_features) as a product
+    of two smaller matrices: W = U * V where U is (in_features, rank) and
+    V is (rank, out_features).
+    
+    This reduces parameter count from O(in_features * out_features) to
+    O((in_features + out_features) * rank).
     """
-    def __init__(self, in_features: int, out_features: int, rank: int, dtype=torch.float32):
+
+    def __init__(self, in_features: int, out_features: int, rank: int):
+        """
+        Initialize a low-rank linear transformation.
+        
+        Args:
+            in_features: Input dimension
+            out_features: Output dimension
+            rank: Rank of the approximation
+        """
         super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.rank = rank
-        std = 1.0 / math.sqrt(rank)
-        self.u_weight = nn.Parameter(torch.randn(in_features, rank, dtype=dtype) * std)
-        self.v_weight = nn.Parameter(torch.randn(rank, out_features, dtype=dtype) * std)
-        self.register_buffer('composed_weight', None)
-        self.needs_composition = True
+
+        # Initialize with scaled random values for better gradient flow
+        self.u_weight = nn.Parameter(torch.randn(in_features, rank) / math.sqrt(rank))
+        self.v_weight = nn.Parameter(torch.randn(rank, out_features) / math.sqrt(rank))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.rank <= min(self.in_features, self.out_features) // 4:
-            if self.needs_composition or self.composed_weight is None:
-                self.composed_weight = torch.matmul(self.u_weight, self.v_weight)
-                self.needs_composition = False
-            return torch.matmul(x, self.composed_weight)
+        """
+        Apply the low-rank linear transformation.
+        
+        Args:
+            x: Input tensor of shape (..., in_features)
+        
+        Returns:
+            Output tensor of shape (..., out_features)
+        """
         return torch.matmul(torch.matmul(x, self.u_weight), self.v_weight)
 
-    def train(self, mode: bool = True):
-        if mode and not self.training:
-            self.needs_composition = True
-        return super().train(mode)
+##############################################
+# Random Fourier Features
+##############################################
 
 class RandomFourierFeatures(nn.Module):
     """
-    Improved RandomFourierFeatures with normalized projections and JIT compatibility.
+    Random Fourier Features for kernel approximation.
+    
+    Approximates a Gaussian kernel by projecting inputs into a randomized
+    feature space where dot products approximate kernel evaluations.
     """
-    def __init__(self, input_dim: int, rff_dim: int, dtype=torch.float32):
+
+    def __init__(self, input_dim: int, rff_dim: int):
+        """
+        Initialize the Random Fourier Features module.
+        
+        Args:
+            input_dim: Dimension of input features
+            rff_dim: Dimension of output features
+        """
         super().__init__()
-        self.omega = nn.Parameter(torch.randn(input_dim, rff_dim, dtype=dtype) / math.sqrt(input_dim),
-                                 requires_grad=False)
-        self.bias = nn.Parameter(torch.rand(rff_dim, dtype=dtype) * 2 * math.pi, requires_grad=False)
+
+        # Random projection matrix (fixed during training)
+        self.omega = nn.Parameter(torch.randn(input_dim, rff_dim), requires_grad=False)
+
+        # Random bias terms (fixed during training)
+        self.bias = nn.Parameter(torch.rand(rff_dim) * 2 * math.pi, requires_grad=False)
+
+        # Scale factor to normalize variance
         self.scale = math.sqrt(2.0 / rff_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        orig_shape = x.shape
-        if x.dim() > 2:
-            x = x.reshape(-1, orig_shape[-1])
-        projection = torch.addmm(self.bias, x, self.omega)
-        result = torch.cos(projection) * self.scale
-        check_for_nan(result, "RFF output")
-        check_for_inf(result, "RFF output")
-        if len(orig_shape) > 2:
-            new_shape = list(orig_shape[:-1]) + [self.omega.size(1)]
-            result = result.view(*new_shape)
-        return result
+        """
+        Transform input using Random Fourier Features.
+        
+        Args:
+            x: Input tensor of shape (..., input_dim)
+        
+        Returns:
+            Transformed tensor of shape (..., rff_dim)
+        """
+        # Project and add bias
+        projection = x.matmul(self.omega) + self.bias
+
+        # Apply cosine and scale
+        return torch.cos(projection) * self.scale
+
+##############################################
+# Locality-Sensitive Hashing
+##############################################
 
 class LSHTable(nn.Module):
     """
-    Improved LSHTable with better hashing and optional seed control.
+    Locality-Sensitive Hashing table for approximate nearest neighbor search.
+    
+    Projects vectors into discrete hash buckets such that similar vectors are
+    likely to hash to the same bucket.
     """
-    def __init__(self, dim: int, n_buckets: int, bandwidth: float, n_hashes: int, seed: Optional[int] = None, dtype=torch.float32):
+
+    def __init__(self, dim: int, n_buckets: int, bandwidth: float, n_hashes: int):
+        """
+        Initialize the LSH table.
+        
+        Args:
+            dim: Dimension of input vectors
+            n_buckets: Number of hash buckets
+            bandwidth: Bandwidth parameter (controls sensitivity)
+            n_hashes: Number of hash functions to use
+        """
         super().__init__()
         self.dim = dim
         self.n_buckets = n_buckets
         self.bandwidth = bandwidth
         self.n_hashes = n_hashes
 
-        if seed is not None:
-            torch.manual_seed(seed)
-
-        random_vectors = self._init_quasi_orthogonal_vectors(dim, n_hashes, dtype=dtype)
-        self.register_buffer("random_vectors", random_vectors)
-        self.register_buffer("collision_count", torch.zeros(1))
-
-    def _init_quasi_orthogonal_vectors(self, dim: int, n_hashes: int, dtype=torch.float32) -> torch.Tensor:
-        vectors = torch.randn(dim, n_hashes, dtype=dtype)
-
-        if n_hashes <= dim and n_hashes <= 10:
-            for i in range(1, n_hashes):
-                for j in range(i):
-                    proj = torch.sum(vectors[:, i] * vectors[:, j]) / torch.sum(vectors[:, j] ** 2)
-                    vectors[:, i] = vectors[:, i] - proj * vectors[:, j]
-        return vectors / torch.norm(vectors, dim=0, keepdim=True)
+        # Random projection vectors for hashing
+        self.random_vectors = nn.Parameter(
+            torch.randn(dim, n_hashes),
+            requires_grad=False
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        validate_tensor_dimensions(x, "input", x.dim())
+        """
+        Hash input vectors.
+        
+        Args:
+            x: Input tensor of shape (..., dim)
+        
+        Returns:
+            Hash buckets of shape (..., n_hashes), each value in range [0, n_buckets-1]
+        """
+        # Project input onto random vectors
         proj = x.matmul(self.random_vectors)
-        hashed = torch.floor(proj / self.bandwidth) % self.n_buckets
-        check_for_nan(hashed, "LSH hashed output")
-        check_for_inf(hashed, "LSH hashed output")
 
-        if self.training:
-            unique_hashes = torch.unique(hashed.reshape(-1, self.n_hashes), dim=0).shape[0]
-            total_hashes = hashed.reshape(-1, self.n_hashes).shape[0]
-            expected_unique = min(total_hashes, self.n_buckets ** self.n_hashes)
-            if expected_unique > 0 and total_hashes > 0:
-                self.collision_count[0] = 1.0 - (unique_hashes / expected_unique)
-        return hashed
+        # Quantize and take modulo to get bucket indices
+        return torch.floor(proj / self.bandwidth) % self.n_buckets
+
+##############################################
+# Trie-based Prefix Search
+##############################################
 
 _TRIE_INDICES_KEY = '_indices'
 
 class Trie(nn.Module):
     """
-    Improved Trie with memory-efficient storage and faster lookups.
+    Trie data structure for efficient prefix matching.
+    
+    Stores binary vector prefixes for fast candidate retrieval.
     """
+
     def __init__(self, stride: int):
+        """
+        Initialize the Trie.
+        
+        Args:
+            stride: Stride length for prefix chunks
+        """
         super().__init__()
-        self.root_node: Dict = {}
+        self.root_node: Dict[Any, Any] = {}
         self.stride_len = stride
-        self.max_depth = 0
-        self.node_count = 0
 
     def insert(self, binary_vector: torch.Tensor, index: int) -> None:
-        if binary_vector.dim() != 1:
-            raise ValueError(f"Expected 1D binary_vector, got {binary_vector.dim()}D")
+        """
+        Insert a binary vector into the Trie.
+        
+        Args:
+            binary_vector: Binary vector to insert
+            index: Index associated with this vector
+        """
         current_node = self.root_node
-        depth = 0
+
+        # Process vector in chunks of size stride_len
         for i in range(0, len(binary_vector), self.stride_len):
-            depth += 1
-            end_idx = min(i + self.stride_len, len(binary_vector))
-            prefix = tuple(binary_vector[i:end_idx].tolist())
+            prefix = tuple(binary_vector[i:i+self.stride_len].tolist())
+
+            # Create node if it doesn't exist
             if prefix not in current_node:
                 current_node[prefix] = {}
-                self.node_count += 1
+
             current_node = current_node[prefix]
-        if _TRIE_INDICES_KEY not in current_node:
-            current_node[_TRIE_INDICES_KEY] = []
-        current_node[_TRIE_INDICES_KEY].append(index)
-        self.max_depth = max(self.max_depth, depth)
+
+        # Store index at leaf node
+        current_node.setdefault(_TRIE_INDICES_KEY, []).append(index)
 
     def search(self, binary_vector: torch.Tensor) -> List[int]:
-        if binary_vector.dim() != 1:
-            raise ValueError(f"Expected 1D binary_vector, got {binary_vector.dim()}D")
+        """
+        Search for matching prefixes in the Trie.
+        
+        Args:
+            binary_vector: Binary vector to search for
+        
+        Returns:
+            List of indices for matching prefixes
+        """
         current_node = self.root_node
+
+        # Follow path through Trie
         for i in range(0, len(binary_vector), self.stride_len):
-            end_idx = min(i + self.stride_len, len(binary_vector))
-            prefix = tuple(binary_vector[i:end_idx].tolist())
+            prefix = tuple(binary_vector[i:i+self.stride_len].tolist())
+
             if prefix not in current_node:
-                return []
+                return []  # No match found
+
             current_node = current_node[prefix]
+
+        # Return stored indices
         return current_node.get(_TRIE_INDICES_KEY, [])
 
-    def clear(self) -> None:
-        self.root_node.clear()
-        self.max_depth = 0
-        self.node_count = 0
-
-class TrieCache(nn.Module):
-    """
-    Cache of Tries for efficient reuse.
-    """
-    def __init__(self, stride: int, max_cache_size: int = 16):
-        super().__init__()
-        self.stride = stride
-        self.max_cache_size = max_cache_size
-        self.cache = OrderedDict()
-
-    def get_trie(self, data_hash: int) -> Tuple[Trie, bool]:
-        if data_hash in self.cache:
-            trie = self.cache.pop(data_hash)
-            self.cache[data_hash] = trie
-            return trie, True
-        trie = Trie(self.stride)
-        if len(self.cache) >= self.max_cache_size:
-            self.cache.popitem(last=False)
-        self.cache[data_hash] = trie
-        return trie, False
+##############################################
+# Candidate Key Search
+##############################################
 
 class CandidateFinder(nn.Module):
     """
-    Improved CandidateFinder with caching and parallel processing.
+    Finds candidate keys for each query using multiple search strategies.
+    
+    Combines Wu-Manber algorithm, Trie prefix matching, and
+    HyperCuts-inspired dimension partitioning.
     """
-    def __init__(self, config: FastAttentionConfig):
+
+    def __init__(self, config: FastAttentionConfig, tries: List[Trie], lsh_tables: nn.ModuleList):
+        """
+        Initialize the CandidateFinder.
+        
+        Args:
+            config: Fast attention configuration
+            tries: List of Tries for each attention head
+            lsh_tables: List of LSH tables for each attention head
+        """
         super().__init__()
         self.config = config
+        self.tries = tries
+        self.lsh_tables = lsh_tables
         self.wu_manber_prefix_len = config.wu_manber_prefix_len
         self.hyper_cuts_dim_groups = config.hyper_cuts_dim_groups
-        self.lsh_tables = nn.ModuleList()
-        for _ in range(config.n_heads):
-            if config.hyper_cuts_dim_groups:
-                head_tables = nn.ModuleList()
-                for dim in config.hyper_cuts_dim_groups:
-                    head_tables.append(
-                        LSHTable(dim, config.lsh_buckets, config.lsh_bandwidth, config.n_lsh_hashes, dtype=config.dtype)
-                    )
-                self.lsh_tables.append(head_tables)
-            else:
-                self.lsh_tables.append(nn.ModuleList([
-                    LSHTable(config.lsh_key_dim, config.lsh_buckets, config.lsh_bandwidth, config.n_lsh_hashes, dtype=config.dtype)
-                ]))
-        self.trie_cache = TrieCache(config.stride)
-        self.wu_manber_cache = OrderedDict()
-        self.wu_manber_cache_hits = 0
-        self.wu_manber_cache_misses = 0
 
     def binary_quantize(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Convert features to binary representation.
+        
+        Args:
+            x: Input tensor
+        
+        Returns:
+            Binary tensor (0.0 or 1.0 values)
+        """
         return (x > 0).float()
 
     def split_features_by_dim_groups(self, features: torch.Tensor) -> List[torch.Tensor]:
+        """
+        Split features along dimension groups for HyperCuts-inspired search.
+        
+        Args:
+            features: Input features of shape (batch, length, dim)
+        
+        Returns:
+            List of tensors, each containing a subset of dimensions
+        """
         if self.hyper_cuts_dim_groups is None:
             return [features]
+
         groups = []
         start = 0
+
         for group_dim in self.hyper_cuts_dim_groups:
             groups.append(features[:, :, start:start+group_dim])
             start += group_dim
+
         return groups
 
     def _build_wu_manber_hash_table(self, key_bin: torch.Tensor) -> Dict[tuple, List[int]]:
-        key_hash = hash(tuple(key_bin[:, :self.config.wu_manber_prefix_len].flatten().tolist()))
-        if key_hash in self.wu_manber_cache:
-            self.wu_manber_cache_hits += 1
-            table = self.wu_manber_cache.pop(key_hash)
-            self.wu_manber_cache[key_hash] = table
-            return table
-        self.wu_manber_cache_misses += 1
+        """
+        Build Wu-Manber hash table from binary keys.
+        
+        Args:
+            key_bin: Binary key tensor of shape (length, dim)
+        
+        Returns:
+            Dictionary mapping prefixes to lists of indices
+        """
         table: Dict[tuple, List[int]] = {}
         L = key_bin.size(0)
-        prefixes = [tuple(key_bin[i, :self.config.wu_manber_prefix_len].tolist()) for i in range(L)]
-        for i, prefix in enumerate(prefixes):
+
+        for i in range(L):
+            prefix = tuple(key_bin[i, :self.config.wu_manber_prefix_len].tolist())
             table.setdefault(prefix, []).append(i)
-        self.wu_manber_cache[key_hash] = table
-        if len(self.wu_manber_cache) > 1000:
-            self.wu_manber_cache.popitem(last=False)
+
         return table
 
     def _wu_manber_search(self, query_bin: torch.Tensor, table: Dict[tuple, List[int]]) -> List[int]:
+        """
+        Search Wu-Manber hash table for matching prefixes.
+        
+        Args:
+            query_bin: Binary query tensor
+            table: Wu-Manber hash table
+        
+        Returns:
+            List of matching indices
+        """
         prefix = tuple(query_bin[:self.config.wu_manber_prefix_len].tolist())
         return table.get(prefix, [])
 
     def _get_wu_manber_candidates_group(self, query_grp: torch.Tensor, key_grp: torch.Tensor) -> List[List[List[int]]]:
+        """
+        Get Wu-Manber candidates for a dimension group.
+        
+        Args:
+            query_grp: Query features for this dimension group
+            key_grp: Key features for this dimension group
+        
+        Returns:
+            List of candidate lists for each batch and position
+        """
         B, L, _ = key_grp.size()
         key_bin = self.binary_quantize(key_grp)
         query_bin = self.binary_quantize(query_grp)
         cand_lists = []
+
         for b in range(B):
             table = self._build_wu_manber_hash_table(key_bin[b])
             batch_list = [self._wu_manber_search(query_bin[b, i], table) for i in range(L)]
             cand_lists.append(batch_list)
+
         return cand_lists
 
     def _get_trie_candidates_group(self, query_grp: torch.Tensor, key_grp: torch.Tensor, head_idx: int) -> List[List[List[int]]]:
+        """
+        Get Trie-based candidates for a dimension group.
+        
+        Args:
+            query_grp: Query features for this dimension group
+            key_grp: Key features for this dimension group
+            head_idx: Attention head index
+        
+        Returns:
+            List of candidate lists for each batch and position
+        """
         B, L, _ = key_grp.size()
         cand_lists = []
-        query_bin_all = self.binary_quantize(query_grp)
+
         for b in range(B):
-            key_data = key_grp[b].detach()
-            data_hash = hash(tuple(key_data[0, :50].tolist())) + hash(str(head_idx)) + b
-            trie, cache_hit = self.trie_cache.get_trie(data_hash)
-            if not cache_hit:
-                key_bin = self.binary_quantize(key_grp[b])
-                for i in range(L):
-                    trie.insert(key_bin[i], i)
-            query_bin = query_bin_all[b]
-            batch_list = []
-            chunk_size = 32
-            for chunk_start in range(0, L, chunk_size):
-                chunk_end = min(chunk_start + chunk_size, L)
-                chunk_results = [trie.search(query_bin[i]) for i in range(chunk_start, chunk_end)]
-                batch_list.extend(chunk_results)
+            trie = Trie(self.config.stride)
+            key_bin = self.binary_quantize(key_grp[b])
+
+            for i in range(L):
+                trie.insert(key_bin[i], i)
+
+            batch_list = [trie.search(self.binary_quantize(query_grp[b][i])) for i in range(L)]
             cand_lists.append(batch_list)
+
         return cand_lists
 
     def merge_candidate_indices_groups(self, cand_tensors: List[torch.Tensor]) -> torch.Tensor:
-        if not cand_tensors:
-            return None
+        """
+        Merge candidate indices from multiple dimension groups.
+        
+        Args:
+            cand_tensors: List of candidate tensors
+        
+        Returns:
+            Merged and deduplicated tensor of candidates
+        """
         merged = torch.cat(cand_tensors, dim=-1)
-        merged, _ = torch.sort(merged, dim=-1)
-        return torch.unique(merged, dim=-1)
+        merged, _ = torch.sort(merged)
+        return torch.unique_consecutive(merged, dim=-1)
 
     def _process_dimension_group_candidates(self, query_grp: torch.Tensor, key_grp: torch.Tensor, head_idx: int) -> torch.Tensor:
+        """
+        Process candidates for a dimension group.
+        
+        Args:
+            query_grp: Query features for this dimension group
+            key_grp: Key features for this dimension group
+            head_idx: Attention head index
+        
+        Returns:
+            Tensor of candidate indices
+        """
         B, L, _ = query_grp.size()
-        device = query_grp.device
+
+        # Get candidates from both search methods
         wu_cands = self._get_wu_manber_candidates_group(query_grp, key_grp)
         trie_cands = self._get_trie_candidates_group(query_grp, key_grp, head_idx)
-        candidates = torch.full((B, L, self.config.k_max), -1, dtype=torch.long, device=device)
+
+        # Initialize output tensor
+        candidates = torch.full((B, L, self.config.k_max), -1, dtype=torch.long, device=query_grp.device)
+
+        # Take intersection of candidates and limit to k_max
         for b in range(B):
             for i in range(L):
                 common = list(set(wu_cands[b][i]) & set(trie_cands[b][i]))
+
                 if common:
-                    common_tensor = torch.tensor(common, dtype=torch.long, device=device)
-                    size = min(common_tensor.numel(), self.config.k_max)
-                    candidates[b, i, :size] = common_tensor[:size]
+                    common_tensor = torch.tensor(common, dtype=torch.long, device=query_grp.device)
+
+                    if common_tensor.numel() > self.config.k_max:
+                        common_tensor = common_tensor[:self.config.k_max]
+
+                    candidates[b, i, :common_tensor.numel()] = common_tensor
+
         return candidates
 
     def forward(self, query_up: torch.Tensor, key_up: torch.Tensor, head_idx: int) -> torch.Tensor:
+        """
+        Find candidate keys for each query.
+        
+        Args:
+            query_up: Query features
+            key_up: Key features
+            head_idx: Attention head index
+        
+        Returns:
+            Tensor of candidate indices
+        """
         B, L, _ = query_up.size()
-        device = query_up.device
-        start_time = time.time()
+
+        # Split by dimension groups
         query_groups = self.split_features_by_dim_groups(query_up)
         key_groups = self.split_features_by_dim_groups(key_up)
-        cand_list = []
-        for q_grp, k_grp in zip(query_groups, key_groups):
-            cand_list.append(self._process_dimension_group_candidates(q_grp, k_grp, head_idx))
-        if cand_list:
-            merged = torch.cat(cand_list, dim=-1)
-            merged, _ = torch.sort(merged, dim=-1)
-            result = torch.unique_consecutive(merged, dim=-1)[:, :, :self.config.k_max]
-        else:
-            result = torch.full((B, L, self.config.k_max), -1, dtype=torch.long, device=device)
-        check_for_nan(result, "CandidateFinder output")
-        check_for_inf(result, "CandidateFinder output")
-        processing_time = time.time() - start_time
-        if self.training and head_idx == 0:
-            logger.debug(f"Candidate finding took {processing_time:.4f}s")
-        return result
 
-    def get_cache_stats(self):
-        return {
-            "wu_manber_hits": self.wu_manber_cache_hits,
-            "wu_manber_misses": self.wu_manber_cache_misses,
-            "trie_cache_size": len(self.trie_cache.cache)
-        }
+        # Process each dimension group
+        cand_list = [
+            self._process_dimension_group_candidates(q_grp, k_grp, head_idx)
+            for q_grp, k_grp in zip(query_groups, key_groups)
+        ]
+
+        # Merge candidates from all groups
+        if cand_list:
+            merged = self.merge_candidate_indices_groups(cand_list)
+            return merged[:, :, :self.config.k_max]
+
+        # Fallback if no candidates found
+        return torch.full((B, L, self.config.k_max), -1, dtype=torch.long, device=query_up.device)
+
+##############################################
+# Absorption Projection for Attention
+##############################################
 
 class AbsorptionProjection(nn.Module):
     """
-    Improved AbsorptionProjection with optimized matrix operations.
+    Absorption Projection for efficient attention computation.
+    
+    Projects queries and keys into a compatible space using low-rank
+    approximations of weight matrices.
     """
-    def __init__(self, query_dim: int, key_dim: int, rank: int, dtype=torch.float32):
+
+    def __init__(self, query_dim: int, key_dim: int, rank: int):
+        """
+        Initialize the Absorption Projection.
+        
+        Args:
+            query_dim: Query dimension
+            key_dim: Key dimension
+            rank: Rank for low-rank approximations
+        """
         super().__init__()
-        std = 1.0 / math.sqrt(rank)
-        self.u_q = nn.Parameter(torch.randn(query_dim, rank, dtype=dtype) * std)
-        self.v_q = nn.Parameter(torch.randn(rank, key_dim, dtype=dtype) * std)
-        self.u_k = nn.Parameter(torch.randn(key_dim, rank, dtype=dtype) * std)
-        self.v_k = nn.Parameter(torch.randn(rank, key_dim, dtype=dtype) * std)
-        self.register_buffer('W_absorb', None)
-        self.needs_composition = True
 
-    def _compute_absorption_matrix(self):
-        W_UQ = torch.matmul(self.u_q, self.v_q)
-        W_UK = torch.matmul(self.u_k, self.v_k)
-        self.W_absorb = torch.matmul(W_UK.transpose(0, 1), W_UQ)
-        self.needs_composition = False
-        check_for_nan(self.W_absorb, "Absorption Matrix W_absorb")
-        check_for_inf(self.W_absorb, "Absorption Matrix W_absorb")
+        # Low-rank factors for query projection
+        self.u_q = nn.Parameter(torch.randn(query_dim, rank) / math.sqrt(rank))
+        self.v_q = nn.Parameter(torch.randn(rank, key_dim) / math.sqrt(rank))
 
+        # Low-rank factors for key projection
+        self.u_k = nn.Parameter(torch.randn(key_dim, rank) / math.sqrt(rank))
+        self.v_k = nn.Parameter(torch.randn(rank, key_dim) / math.sqrt(rank))
 
     def forward(self, query: torch.Tensor, key: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.needs_composition or self.W_absorb is None:
-            self._compute_absorption_matrix()
-        Q_proj = torch.matmul(query, self.W_absorb.transpose(0, 1))
-        check_for_nan(Q_proj, "Absorption Projection Q_proj")
-        check_for_inf(Q_proj, "Absorption Projection Q_proj")
+        """
+        Apply absorption projection to query and key.
+        
+        Args:
+            query: Query tensor
+            key: Key tensor
+        
+        Returns:
+            Tuple of (projected_query, key)
+        """
+        # Reconstruct weight matrices from low-rank factors
+        W_UQ = torch.matmul(self.u_q, self.v_q)
+        W_UK = torch.matmul(self.u_k, self.v_k)
+
+        # Compute absorption matrix
+        W_absorb = torch.matmul(W_UK.transpose(0, 1), W_UQ)
+
+        # Project query through absorption matrix
+        Q_proj = torch.matmul(query, W_absorb.transpose(0, 1))
+
         return Q_proj, key
 
-    def train(self, mode: bool = True):
-        if mode and not self.training:
-            self.needs_composition = True
-        return super().train(mode)
+##############################################
+# Fast Attention Implementation
+##############################################
 
 class FastAttention(nn.Module):
     """
-    Improved FastAttention with optimized computations and better parallelism.
+    Fast Attention implementation combining multiple efficiency techniques.
+    
+    Uses candidate search, low-rank projections, and optional random Fourier features
+    to approximate full attention with reduced computational complexity.
     """
+
     def __init__(self, config: FastAttentionConfig):
+        """
+        Initialize the Fast Attention module.
+        
+        Args:
+            config: Fast attention configuration
+        """
         super().__init__()
         self.config = config
-        dtype = config.dtype
 
-        self.query_down_proj = nn.Linear(config.d_model, config.d_query, dtype=dtype)
-        self.key_value_down_proj = nn.Linear(config.d_model, config.d_key, dtype=dtype)
+        # Input projections
+        self.query_down_proj = nn.Linear(config.d_model, config.d_query)
+        self.key_value_down_proj = nn.Linear(config.d_model, config.d_key)
 
+        # Absorption projections for each head
         self.absorption_projs = nn.ModuleList([
-            AbsorptionProjection(config.d_query, config.d_key, config.rank, dtype=dtype)
+            AbsorptionProjection(config.d_query, config.d_key, config.rank)
             for _ in range(config.n_heads)
         ])
-        self.value_up_projs = nn.ModuleList([
-            LowRankLinear(config.d_key, config.d_model, config.rank, dtype=dtype)
-            for _ in range(config.n_heads)
-            ])
 
-        if config.use_rff:
-            self.rff_encoders = nn.ModuleList([
-                RandomFourierFeatures(config.d_key, config.rff_dim, dtype=dtype)
+        # Value projections for each head
+        self.value_up_projs = nn.ModuleList([
+            LowRankLinear(config.d_key, config.d_model, config.rank)
+            for _ in range(config.n_heads)
+        ])
+
+        # Random Fourier Feature encoders for each head
+        self.rff_encoders = nn.ModuleList([
+            RandomFourierFeatures(config.d_key, config.rff_dim)
+            for _ in range(config.n_heads)
+        ])
+
+        # LSH tables for each head and dimension group
+        if config.hyper_cuts_dim_groups:
+            self.lsh_tables_list = nn.ModuleList([
+                nn.ModuleList([
+                    LSHTable(dim, config.lsh_buckets, config.lsh_bandwidth, config.n_lsh_hashes)
+                    for dim in config.hyper_cuts_dim_groups
+                ])
                 for _ in range(config.n_heads)
             ])
-        self.candidate_finder = CandidateFinder(config)
-        self.output_proj = nn.Linear(config.d_model * config.n_heads, config.d_model, dtype=dtype)
+        else:
+            self.lsh_tables_list = nn.ModuleList([
+                nn.ModuleList([
+                    LSHTable(config.lsh_key_dim, config.lsh_buckets, config.lsh_bandwidth, config.n_lsh_hashes)
+                ])
+                for _ in range(config.n_heads)
+            ])
+
+        # Tries for each head
+        self.tries_list = nn.ModuleList([
+            Trie(config.stride) for _ in range(config.n_heads)
+        ])
+
+        # Candidate finder
+        self.candidate_finder = CandidateFinder(
+            config,
+            list(self.tries_list),
+            self.lsh_tables_list
+        )
+
+        # Output projection
+        self.output_proj = nn.Linear(config.d_model * config.n_heads, config.d_model)
+
+        # Dropout for regularization
         self.dropout = nn.Dropout(config.dropout)
-        self.forward_times = []
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                 mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        start_time = time.time()
-        validate_tensor_dimensions(query, "query", query.dim())
-        validate_tensor_dimensions(key, "key", key.dim())
-        validate_tensor_dimensions(value, "value", value.dim())
-
+        """
+        Apply fast attention.
+        
+        Args:
+            query: Query tensor of shape (batch, length, d_model)
+            key: Key tensor of shape (batch, length, d_model)
+            value: Value tensor of shape (batch, length, d_model)
+            mask: Optional attention mask
+        
+        Returns:
+            Output tensor of shape (batch, length, d_model)
+        """
         B, L, _ = query.size()
-        device = query.device
+
+        # Project inputs to lower dimensions
         query_down = self.query_down_proj(query)
         key_down = self.key_value_down_proj(key)
-        check_for_nan(query_down, "Query Down Projection")
-        check_for_nan(key_down, "Key Down Projection")
-        check_for_inf(query_down, "Query Down Projection")
-        check_for_inf(key_down, "Key Down Projection")
 
+        head_outputs = []
 
-        concat = torch.zeros(B, L, self.config.d_model * self.config.n_heads, device=device, dtype=query.dtype)
-
+        # Process each attention head
         for head_idx in range(self.config.n_heads):
+            # Apply absorption projection
             Q_proj, K_proj = self.absorption_projs[head_idx](query_down, key_down)
-            check_for_nan(Q_proj, f"Head {head_idx} Absorption Projection Q_proj")
-            check_for_nan(K_proj, f"Head {head_idx} Absorption Projection K_proj")
-            check_for_inf(Q_proj, f"Head {head_idx} Absorption Projection Q_proj")
-            check_for_inf(K_proj, f"Head {head_idx} Absorption Projection K_proj")
 
-
+            # Find candidate keys for each query
             candidates = self.candidate_finder(Q_proj, K_proj, head_idx)
-            check_for_nan(candidates, f"Head {head_idx} CandidateFinder output")
-            check_for_inf(candidates, f"Head {head_idx} CandidateFinder output")
-
             cand_mask = candidates != -1
-            safe_candidates = candidates.masked_fill(~cand_mask, 0) # OUT-OF-PLACE
-            num_candidates = candidates.size(-1)
-            b_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, L, num_candidates)
-            candidate_keys = K_proj[b_idx, safe_candidates]
-            check_for_nan(candidate_keys, f"Head {head_idx} Candidate Keys")
-            check_for_inf(candidate_keys, f"Head {head_idx} Candidate Keys")
 
+            # Replace invalid indices with 0 to avoid indexing errors
+            safe_candidates = candidates.clone()
+            safe_candidates[safe_candidates == -1] = 0
+
+            num_candidates = candidates.size(-1)
+
+            # Create batch indices for gathering
+            b_idx = torch.arange(B, device=K_proj.device).view(B, 1, 1).expand(B, L, num_candidates)
+
+            # Gather candidate keys
+            candidate_keys = K_proj[b_idx, safe_candidates]
+
+            # Prepare query for similarity computation
             q_exp = Q_proj.unsqueeze(2)
+
+            # Apply Random Fourier Features if enabled
             if self.config.use_rff:
-                rff_encoder = self.rff_encoders[head_idx]
-                q_exp = rff_encoder(q_exp)
-                candidate_keys = rff_encoder(candidate_keys)
-                scale = optimized_sqrt(q_exp.size(-1))
+                q_exp = self.rff_encoders[head_idx](q_exp.reshape(-1, self.config.d_key)).reshape(B, L, 1, self.config.rff_dim)
+                candidate_keys = self.rff_encoders[head_idx](candidate_keys.reshape(-1, self.config.d_key)).reshape(B, L, num_candidates, self.config.rff_dim)
+                scale = optimized_sqrt(self.config.rff_dim)
             else:
                 scale = optimized_sqrt(self.config.d_key)
-            check_for_nan(q_exp, f"Head {head_idx} Q_exp after RFF")
-            check_for_nan(candidate_keys, f"Head {head_idx} Candidate Keys after RFF")
-            check_for_inf(q_exp, f"Head {head_idx} Q_exp after RFF")
-            check_for_inf(candidate_keys, f"Head {head_idx} Candidate Keys after RFF")
 
+            # Compute similarity scores
             sim = torch.matmul(q_exp, candidate_keys.transpose(-2, -1)).squeeze(2) / scale
-            check_for_nan(sim, f"Head {head_idx} Similarity Scores (sim)")
-            check_for_inf(sim, f"Head {head_idx} Similarity Scores (sim)")
 
+            # Mask invalid candidates
+            sim = sim.masked_fill(~cand_mask, float('-inf'))
 
-            sim = sim.masked_fill(~cand_mask, -1e9) # OUT-OF-PLACE
-            if mask is not None:
-                expanded_mask = mask.unsqueeze(1).expand_as(sim)
-                sim = sim.masked_fill(~expanded_mask, -1e9) # OUT-OF-PLACE
-
+            # Compute attention weights
             attn_weights = F.softmax(sim, dim=-1)
             attn_weights = self.dropout(attn_weights)
-            check_for_nan(sim, f"Head {head_idx} Sim before Softmax")
-            check_for_nan(attn_weights, f"Head {head_idx} Attention Weights")
-            check_for_inf(sim, f"Head {head_idx} Sim before Softmax")
-            check_for_inf(attn_weights, f"Head {head_idx} Attention Weights")
 
+            # Gather candidate values
             candidate_values = key_down[b_idx, safe_candidates]
-            check_for_nan(candidate_values, f"Head {head_idx} Candidate Values")
-            check_for_inf(candidate_values, f"Head {head_idx} Candidate Values")
 
-            candidate_values = self.value_up_projs[head_idx](
-                candidate_values.reshape(-1, self.config.d_key)
-            ).reshape(B, L, num_candidates, self.config.d_model)
-            check_for_nan(candidate_values, f"Head {head_idx} Candidate Values Up-Projected")
-            check_for_inf(candidate_values, f"Head {head_idx} Candidate Values Up-Projected")
+            # Project values to output dimension
+            candidate_values = self.value_up_projs[head_idx](candidate_values.reshape(-1, self.config.d_key)).reshape(B, L, num_candidates, self.config.d_model)
 
-
+            # Apply attention weights to values
             head_out = torch.sum(attn_weights.unsqueeze(-1) * candidate_values, dim=2)
-            check_for_nan(head_out, f"Head {head_idx} Output (head_out)")
-            check_for_inf(head_out, f"Head {head_idx} Output (head_out)")
-            concat_slice = slice(head_idx * self.config.d_model, (head_idx + 1) * self.config.d_model)
-            concat[:, :, concat_slice] = head_out
 
-        check_for_nan(concat, "Concat output before output_proj")
-        check_for_inf(concat, "Concat output before output_proj")
+            head_outputs.append(head_out)
+
+        # Concatenate outputs from all heads
+        concat = torch.cat(head_outputs, dim=-1)
+
+        # Final output projection
         output = self.output_proj(concat)
-        output = self.dropout(output)
-        check_for_nan(output, "FastAttention final output")
-        check_for_inf(output, "FastAttention final output")
 
-        forward_time = time.time() - start_time
-        self.forward_times.append(forward_time)
-        if len(self.forward_times) > 100:
-            self.forward_times = self.forward_times[-100:]
-        if self.training and torch.rand(1).item() < 0.01:
-            avg_time = sum(self.forward_times) / len(self.forward_times)
-            logger.debug(f"FastAttention forward: {avg_time:.4f}s, batch={B}, seq_len={L}")
-        return output
+        return self.dropout(output)
+
+##############################################
+# Feed-Forward Network
+##############################################
 
 class FeedForwardNetwork(nn.Module):
     """
-    Improved FeedForwardNetwork with GeLU and potential layer normalization.
+    Feed-Forward Network for Transformer-like architectures.
+    
+    Standard two-layer FFN with ReLU activation.
     """
+
     def __init__(self, config: FastAttentionConfig):
+        """
+        Initialize the Feed-Forward Network.
+        
+        Args:
+            config: Fast attention configuration
+        """
         super().__init__()
-        dtype = config.dtype
-        self.linear1 = nn.Linear(config.d_model, config.intermediate_dim, dtype=dtype)
-        self.linear2 = nn.Linear(config.intermediate_dim, config.d_model, dtype=dtype)
+        self.linear1 = nn.Linear(config.d_model, config.intermediate_dim)
+        self.linear2 = nn.Linear(config.intermediate_dim, config.d_model)
         self.dropout = nn.Dropout(config.dropout)
-        self.use_layer_norm = True
-        if self.use_layer_norm:
-            self.norm = nn.LayerNorm(config.intermediate_dim) # dtype is not needed (weight and bias are parameters specified above)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.linear1(x)
-        check_for_nan(x, "FFN linear1 output")
-        check_for_inf(x, "FFN linear1 output")
-        x = F.gelu(x)
-        if self.use_layer_norm:
-            x = self.norm(x)
-            check_for_nan(x, "FFN layer norm output")
-            check_for_inf(x, "FFN layer norm output")
+        """
+        Apply the Feed-Forward Network.
+        
+        Args:
+            x: Input tensor
+        
+        Returns:
+            Transformed tensor
+        """
+        x = F.relu(self.linear1(x))
         x = self.dropout(x)
         x = self.linear2(x)
-        check_for_nan(x, "FFN linear2 output")
-        check_for_inf(x, "FFN linear2 output")
-        x = self.dropout(x)
-        return x
+        return self.dropout(x)
+
+##############################################
+# Encoder Layer
+##############################################
 
 class FastAttentionEncoderLayer(nn.Module):
     """
-    Improved FastAttentionEncoderLayer with Pre-Norm and residual connections.
+    Encoder layer using Fast Attention.
+    
+    Follows the standard Transformer encoder architecture with
+    pre-layer normalization and residual connections.
     """
+
     def __init__(self, config: FastAttentionConfig):
+        """
+        Initialize the Fast Attention Encoder Layer.
+        
+        Args:
+            config: Fast attention configuration
+        """
         super().__init__()
         self.self_attn = FastAttention(config)
         self.feed_forward = FeedForwardNetwork(config)
-        self.norm1 = nn.LayerNorm(config.d_model)  # dtype is not needed (weight and bias are parameters)
-        self.norm2 = nn.LayerNorm(config.d_model)  # dtype is not needed
+        self.norm1 = nn.LayerNorm(config.d_model)
+        self.norm2 = nn.LayerNorm(config.d_model)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, src: torch.Tensor, src_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # Ensure src has the correct dtype
-        src = src.to(self.norm1.weight.dtype)  # Match LayerNorm's parameters
+        """
+        Apply the encoder layer.
+        
+        Args:
+            src: Input tensor
+            src_mask: Optional attention mask
+        
+        Returns:
+            Transformed tensor
+        """
+        # First sub-layer: Self-attention with residual connection
+        residual = src
+        src = self.norm1(src)
+        attn = self.self_attn(src, src, src, mask=src_mask)
+        src = residual + self.dropout(attn)
 
-        # Pre-Norm configuration
-        x = self.norm1(src)
-        check_for_nan(x, "Encoder Layer norm1 output")
-        check_for_inf(x, "Encoder Layer norm1 output")
-        attn_output = self.self_attn(x, x, x, mask=src_mask)
-        check_for_nan(attn_output, "Encoder Self Attention output")
-        check_for_inf(attn_output, "Encoder Self Attention output")
-        x = src + self.dropout(attn_output)
-        x = self.norm2(x)
-        check_for_nan(x, "Encoder Layer norm2 output")
-        check_for_inf(x, "Encoder Layer norm2 output")
-        ff_output = self.feed_forward(x)
-        check_for_nan(ff_output, "Encoder FeedForward output")
-        check_for_inf(ff_output, "Encoder FeedForward output")
-        x = x + self.dropout(ff_output)
-        return x
+        # Second sub-layer: Feed-forward network with residual connection
+        residual = src
+        src = self.norm2(src)
+        ffn = self.feed_forward(src)
+        return residual + self.dropout(ffn)
 
 ##############################################
-# SPGPO Components - Refactored and Modularized
+# Policy Network with Fast Attention Integration
 ##############################################
 
-class ResponseGenerator(nn.Module):
-    def __init__(self, policy_network: FastAttentionEncoderLayer, k_responses: int, temperature: float = 1.0):
+class PolicyNetworkWithAttention(nn.Module):
+    """
+    FastAttention を利用した状態処理を統合するポリシーネットワーク。
+    
+    入力状態が [batch, seq_len, state_dim] で与えられる場合、
+    FastAttention を利用して抽出された特徴 [batch, seq_len, d_model] を
+    集約して [batch, d_model] にし、MLP により行動分布の平均と対数標準偏差を出力する。
+    """
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256,
+                 attention_config: Optional[FastAttentionConfig] = None,
+                 seq_len: int = 1):
         super().__init__()
-        self.policy_network = policy_network
-        self.k_responses = k_responses
-        self.temperature = temperature
+        self.seq_len = seq_len
+        self.attention = FastAttentionEncoderLayer(attention_config) if attention_config is not None else None
+        self.effective_state_dim = attention_config.d_model if self.attention is not None else state_dim
 
-    def generate_responses(self, prompt: torch.Tensor) -> torch.Tensor:
-        B, L, d_model = prompt.size()  # Get d_model
-        prompt_expanded = prompt.repeat_interleave(self.k_responses, dim=0) # (B*k_responses, L, d_model)
-        check_for_nan(prompt_expanded, "ResponseGenerator prompt_expanded")
-        check_for_inf(prompt_expanded, "ResponseGenerator prompt_expanded")
+        self.net = nn.Sequential(
+            nn.Linear(self.effective_state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 2 * action_dim)  # 出力: [mean, log_std]
+        )
 
-        # Ensure correct dtype for policy network input.
-        prompt_expanded = prompt_expanded.to(self.policy_network.norm1.weight.dtype)
+    def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.attention is not None:
+            # 状態を [batch, seq_len, state_dim] として処理
+            batch_size = state.size(0) // self.seq_len
+            state = state.view(batch_size, self.seq_len, -1)
+            state = self.attention(state)
+            state = state.mean(dim=1)  # [batch, d_model]
+        else:
+            state = state.squeeze(1)  # [batch, state_dim]
 
-        logits = self.policy_network(prompt_expanded) / self.temperature  # (B*k_responses, L, vocab_size)
-        check_for_nan(logits, "ResponseGenerator logits")
-        check_for_inf(logits, "ResponseGenerator logits")
+        out = self.net(state)
+        mean, log_std = torch.chunk(out, 2, dim=-1)
+        std = log_std.exp()
+        return mean, std
 
-        probs = F.softmax(logits, dim=-1)
-        check_for_nan(probs, "ResponseGenerator probs before Categorical")
-        check_for_inf(probs, "ResponseGenerator probs before Categorical")
-        dist = Categorical(probs)
-        response_tokens = dist.sample()  # (B*k_responses, L)
-        return response_tokens.view(B, self.k_responses, L)  # (B, k_responses, L)
+##############################################
+# SPPO Agent with Fast Attention Integration
+##############################################
 
-
-def preference_oracle(response, response_group, prompt, reward_model):
+class SPPO:
     """
-    Simplified preference oracle using the reward model.  Handles batches correctly.
+    SPPO エージェント: FastAttention を利用した状態処理、
+    グループ相対報酬の計算、Adam による更新、
+    オンラインハイパーパラメータ調整を統合する。
+    
+    主な処理フロー:
+      1. 状態の正規化と FastAttention による特徴抽出
+      2. ポリシーネットワークからアクションのサンプリング (再パラメータ化)
+      3. 報酬モデルを用いて各候補の報酬を計算し、グループ内で正規化
+      4. PPO 損失の計算：クリップされた代理目的関数、価値関数損失、エントロピーボーナス
+      5. Adam によるパラメータ更新
+      6. エピソード終了後にベースライン更新とハイパーパラメータのオンライン調整
     """
-    B, K, L = response_group.shape
-    rewards_responses = reward_model(prompt, response.squeeze(1))  # (B,)
-    rewards_group = reward_model(prompt.repeat_interleave(K, dim=0), response_group.view(-1, L)).view(B, K) # (B, K)
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        policy_lr: float = 1e-3,
+        eta: float = 0.01,
+        alpha: float = 0.1,
+        num_samples: int = 8,
+        correction: float = None,
+        use_adam_optimizer: bool = True,
+        attention_config: Optional[FastAttentionConfig] = None,
+        seq_len: int = 1
+    ):
+        # ポリシーネットワークの初期化 (FastAttention 統合版)
+        self.policy = PolicyNetworkWithAttention(state_dim, action_dim, attention_config=attention_config, seq_len=seq_len)
+        # ベースラインポリシーは定期的に更新するため、初期状態は同一にする
+        self.baseline_policy = PolicyNetworkWithAttention(state_dim, action_dim, attention_config=attention_config, seq_len=seq_len)
+        self.baseline_policy.load_state_dict(self.policy.state_dict())
 
-    # Create preference matrix based on pairwise comparisons
-    preferences = (rewards_responses.unsqueeze(1) > rewards_group).float()  # (B, K)
-    return preferences
+        self.eta = eta
+        self.alpha = alpha
+        self.num_samples = num_samples
+        self.correction = correction or eta / 2
+        self.use_adam_optimizer = use_adam_optimizer
 
+        if use_adam_optimizer:
+            self.optimizer = optim.Adam(self.policy.parameters(), lr=policy_lr)
+        else:
+            self.optimizer = None  # Mirror Descent 更新を用いる
 
-class PreferenceComputer:
-    """
-    Computes group preferences.
-    """
-    def __init__(self, reward_model: Callable):
-        self.reward_model = reward_model
+    def normalize_state(self, x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        """
+        状態テンソルを各サンプルごとにゼロ平均・単位分散に正規化する。
+        """
+        mean = x.mean(dim=-1, keepdim=True)
+        std = x.std(dim=-1, keepdim=True)
+        return (x - mean) / (std + eps)
 
-    def compute_group_preference(self, response: torch.Tensor, response_group: torch.Tensor, prompt: torch.Tensor) -> torch.Tensor:
+    def sample_actions(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        ポリシーネットワークからアクションをサンプリングする。
+        再パラメータ化トリックを使用して、ランダムなサンプルを生成する。
 
-        B, K, L = response_group.shape
-         # (B, 1, L)
-        preferences = preference_oracle(response, response_group, prompt, self.reward_model) # (B, K) Call the oracle
-        return preferences
+        Returns:
+            actions: サンプリングされたアクション [batch, action_dim]
+            mean: 平均 [batch, action_dim]
+            std:  標準偏差 [batch, action_dim]
+        """
+        mean, std = self.policy(state)
+        epsilon = torch.randn_like(mean)
+        actions = mean + std * epsilon
+        return actions, mean, std
 
-class AdvantageComputer:
-    """
-    Computes SPGPO advantage.
-    """
-    def __init__(self, preference_computer: PreferenceComputer, k_responses: int):
-        self.preference_computer = preference_computer
-        self.k_responses = k_responses
+    def compute_log_prob(self, actions: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+        """
+        正規分布におけるアクションの対数確率を計算する。
 
-    def compute_spgpo_advantage(self, response: torch.Tensor, response_group: torch.Tensor, prompt: torch.Tensor, baseline: torch.Tensor) -> torch.Tensor:
-        B, K, L = response_group.shape
-        preferences = self.preference_computer.compute_group_preference(response, response_group, prompt)  #(B,K)
-        mask = torch.ones((B, K), device=response.device)
-        response_expanded = response.unsqueeze(1)
-        equals = (response_expanded == response_group).all(dim=2)
-        mask = mask.masked_fill(equals, 0) # OUT-OF-PLACE
-        denom = torch.clamp(self.k_responses - equals.sum(dim=1, keepdim=True), min=1.0) # Avoid division by zero
-        response_pref = (preferences * mask).sum(dim=1) / denom
-        avg_group_pref = preferences.mean(dim=1)
-        advantage = response_pref - avg_group_pref - baseline
-        return advantage
+        Returns:
+            対数確率 [batch]
+        """
+        return (-0.5 * ((actions - mean) / std).pow(2) - std.log() - 0.5 * np.log(2 * np.pi)).sum(-1)
 
-class SPGPOEnvironment:
-    """
-    Environment for SPGPO training.
-    """
-    def __init__(self, policy_network: FastAttentionEncoderLayer, prompt_distribution: Callable,
-                 reward_model: Callable, k_responses: int = 4, tokenizer: Callable = None,
-                 clip_ratio: float = 0.2):
-        self.prompt_distribution = prompt_distribution
-        self.tokenizer = tokenizer
-        self.clip_ratio = clip_ratio
-        self.response_generator = ResponseGenerator(policy_network, k_responses)
-        self.preference_computer = PreferenceComputer(reward_model)
-        self.advantage_computer = AdvantageComputer(self.preference_computer, k_responses)
-        self.policy_network = policy_network
-        # Dummy tokenizer if none provided
-        if self.tokenizer is None:
-            self.tokenizer = lambda x: torch.randint(0, 100, (1, x))
+    def compute_group_rewards(self, state: torch.Tensor, actions: torch.Tensor, reward_model: Callable) -> torch.Tensor:
+        """
+        グループ内報酬の計算:
+          - 各サンプルごとに報酬を計算し、ミニバッチ内で正規化する。
+        
+        Args:
+            state: [group_size, state_dim]
+            actions: [group_size, action_dim]
+            reward_model: 報酬計算関数 (例: realistic_reward_model)
+        
+        Returns:
+            グループ内相対報酬 [group_size, 1]
+        """
+        raw_rewards = reward_model(state, actions)  # [group_size]
+        mean_reward = raw_rewards.mean()
+        std_reward = raw_rewards.std() + 1e-8
+        normalized_rewards = (raw_rewards - mean_reward) / std_reward
+        return normalized_rewards.unsqueeze(1)
 
+    def update_baseline(self):
+        """
+        エピソード終了時に、現在のポリシーネットワークのパラメータを
+        ベースラインポリシーとして更新する。
+        """
+        self.baseline_policy.load_state_dict(self.policy.state_dict())
 
-    def step(self, prompts: torch.Tensor, old_log_probs_batch: torch.Tensor, baselines: torch.Tensor) -> torch.Tensor:
-        B, L, d_model = prompts.shape # Get d_model
-        all_responses = []
-        all_advantages = []
-        all_current_log_probs = []
+    def compute_ppo_loss(self, state: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor, advantages: torch.Tensor) -> torch.Tensor:
+        """
+        PPO 損失の計算:
+        loss = -min(ratio * advantage, clip(ratio, 1 - eps, 1 + eps) * advantage) + value_loss + entropy_bonus
+        """
+        # Compute current policy log prob
+        current_mean, current_std = self.policy(state)
+        current_log_prob = self.compute_log_prob(actions, current_mean, current_std)
 
-        for i in range(B):
-            prompt = prompts[i].unsqueeze(0) # (1, L, d_model)
-            response_group = self.response_generator.generate_responses(prompt)  # (1, k_responses, L)
-            response_group = response_group.squeeze(0) # (k_responses, L)
-            response_group_expanded = response_group.unsqueeze(-1).repeat(1, 1, d_model)  # (k_responses, L) -> (k_responses, L, d_model)
-            # Ensure correct dtype before passing to the policy network
-            response_group_expanded = response_group_expanded.to(self.policy_network.norm1.weight.dtype)
+        # Compute baseline policy log prob
+        with torch.no_grad():
+            baseline_mean, baseline_std = self.baseline_policy(state)
+            baseline_log_prob = self.compute_log_prob(actions, baseline_mean, baseline_std)
 
+        # Compute ratio
+        ratio = torch.exp(current_log_prob - baseline_log_prob)
 
+        # Compute clipped ratio
+        clip_eps = 0.2
+        clipped_ratio = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
 
-            logits = self.policy_network(response_group_expanded)  # (k_responses, L, vocab_size)
-            check_for_nan(logits, "Env Policy Network logits")
-            check_for_inf(logits, "Env Policy Network logits")
+        # Compute policy loss
+        policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
 
-            current_log_probs = F.log_softmax(logits, dim=-1) # (k_responses, L, vocab_size)
-            check_for_nan(current_log_probs, "Env Log Probs")
-            check_for_inf(current_log_probs, "Env Log Probs")
+        # Compute value loss (assuming rewards are advantages for simplicity)
+        value_loss = (rewards - current_mean).pow(2).mean()
 
-            for k in range(self.response_generator.k_responses):
-                response = response_group[k]  # (L,)
-                all_responses.append(response)
-                advantage = self.advantage_computer.compute_spgpo_advantage(
-                    response.unsqueeze(0), response_group.unsqueeze(0), prompt, baselines[i].unsqueeze(0)
-                )
-                all_advantages.append(advantage.squeeze(0))
+        # Compute entropy bonus
+        entropy_bonus = - (current_log_prob * torch.exp(current_log_prob)).mean()
 
-                response_tokens = response.long()
-                current_log_prob_response = current_log_probs[k]
-                gathered_log_probs = torch.gather(current_log_prob_response, 1, response_tokens.unsqueeze(1)).squeeze(1)
-                summed_log_prob = gathered_log_probs.sum()
-                all_current_log_probs.append(summed_log_prob)
+        # Total loss
+        loss = policy_loss + 0.5 * value_loss + 0.01 * entropy_bonus
 
-        all_responses = torch.stack(all_responses) # (B*k_responses, L)
-        all_advantages = torch.stack(all_advantages) # (B*k_responses,)
-        all_current_log_probs = torch.stack(all_current_log_probs)  # (B*k_responses,)
-
-        log_diff = all_current_log_probs - old_log_probs_batch
-        log_diff = torch.clamp(log_diff, -20, 20)  # Clip for stability
-        ratios = torch.exp(log_diff)
-        surr1 = ratios * all_advantages
-        surr2 = torch.clamp(ratios, 1 - self.clip_ratio, 1 + self.clip_ratio) * all_advantages
-        loss = -torch.min(surr1, surr2).mean()
         return loss
 
+    def update_policy(self, loss: torch.Tensor):
+        """
+        ポリシーの更新を実施する。
+        use_adam_optimizer が True の場合は Adam を用い、
+        それ以外は Mirror Descent 更新を行う。
+        """
+        if self.use_adam_optimizer:
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+        else:
+            raise NotImplementedError("Mirror Descent update is not implemented.")
 
-class SPGPOAgent(nn.Module):
-    """
-    Agent class encapsulating the policy network.
-    """
-    def __init__(self, config: FastAttentionConfig):
-        super().__init__()
-        self.policy_network = FastAttentionEncoderLayer(config)
+    def adjust_hyperparameters(self, current_loss: float, previous_loss: float):
+        """
+        シンプルなルールに基づくオンラインハイパーパラメータ調整。
+        将来的にはハイパーグラデント法等による自動調整への拡張も検討する。
+        """
+        if current_loss < previous_loss:
+            self.eta *= 1.05
+            self.alpha *= 1.05
+        else:
+            self.eta *= 0.9
+            self.alpha *= 0.9
 
-    def forward(self, prompt: torch.Tensor) -> torch.Tensor:
-        # Ensure prompt has the correct dtype
-        prompt = prompt.to(self.policy_network.norm1.weight.dtype)
-        return self.policy_network(prompt)
+##############################################
+# Training Loop Example
+##############################################
 
-def compute_baselines(prompts: torch.Tensor, env: SPGPOEnvironment) -> torch.Tensor:
-    B, _, _ = prompts.shape
-    baselines = []
-    for i in range(B):
-        prompt = prompts[i].unsqueeze(0)
-        response_group = env.response_generator.generate_responses(prompt)
-        response_group = response_group.squeeze(0) # (k_responses, L)
-        preferences_batch = env.preference_computer.compute_group_preference(response_group, response_group.unsqueeze(0), prompt)
-        avg_group_pref = preferences_batch.mean()  # Average preference for the group
-        baselines.append(avg_group_pref)
-    return torch.stack(baselines)
+if __name__ == '__main__':
+    # 設定例
+    state_dim = 128       # 入力状態次元
+    action_dim = 2        # アクション空間次元
+    num_samples_per_state = 8  # 1状態あたりの候補数
 
-def spgpo_training_episode(agent: SPGPOAgent, env: SPGPOEnvironment, optimizer: optim.Optimizer,
-                            scheduler: optim.lr_scheduler.LambdaLR, writer: SummaryWriter, episode: int,
-                            batch_size: int = 32) -> float:
-
-    total_loss = 0.0
-    prompts = env.prompt_distribution(batch_size)
-    B, L, d_model = prompts.shape # Get d_model
-
-    # Compute baselines (using the current policy)
-    baselines = compute_baselines(prompts, env).detach()
-
-    # Calculate old log probabilities for the batch (outside the loop)
-    old_log_probs_batch = []
-    with torch.no_grad():  # No gradients needed for old log probs
-        for i in range(batch_size):
-            prompt = prompts[i].unsqueeze(0)
-            response_group = env.response_generator.generate_responses(prompt)
-            response_group = response_group.squeeze(0) # (k_responses, L)
-            response_group_expanded = response_group.unsqueeze(-1).repeat(1, 1, d_model)  # (k_responses, L) -> (k_responses, L, d_model)
-            # Ensure correct dtype before passing to the agent
-            response_group_expanded = response_group_expanded.to(agent.policy_network.norm1.weight.dtype)
-
-            logits = agent(response_group_expanded)  # (k_responses, L, vocab_size)
-            log_probs = F.log_softmax(logits, dim=-1)
-
-            for k in range(env.response_generator.k_responses):
-                response = response_group[k]
-                response_tokens = response.long()  # Ensure token indices are long
-                log_prob_response = log_probs[k]
-                gathered_log_probs = torch.gather(log_prob_response, 1, response_tokens.unsqueeze(1)).squeeze(1)
-                summed_log_prob = gathered_log_probs.sum() # Sum log probabilities over the sequence
-                old_log_probs_batch.append(summed_log_prob)
-
-    old_log_probs_batch = torch.stack(old_log_probs_batch).detach() # Detach from the computation graph
-
-    # Perform the policy update step
-    loss = env.step(prompts, old_log_probs_batch, baselines)
-
-    # Optimization step
-    optimizer.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=1.0)  # Gradient clipping
-    optimizer.step()
-    scheduler.step()  # Update learning rate
-    total_loss += loss.item()
-
-    writer.add_scalar("Loss/Episode", loss.item(), episode)
-    return total_loss
-
-
-def train_spgpo(config: FastAttentionConfig, prompt_distribution: Callable, reward_model: Callable,
-                 tokenizer: Callable, num_episodes: int = 100, batch_size: int = 32, k_responses: int = 4):
-
-    dtype = config.dtype
-    agent = SPGPOAgent(config)
-    optimizer = optim.AdamW(agent.parameters(), lr=3e-4, weight_decay=0.01)
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 0.95 ** epoch)
-    writer = SummaryWriter()
-
-    env = SPGPOEnvironment(agent.policy_network, prompt_distribution, reward_model, k_responses, tokenizer, clip_ratio=0.2)
-
-    print("Starting SPGPO Training...")
-    for episode in range(num_episodes):
-        episode_loss = spgpo_training_episode(agent, env, optimizer, scheduler, writer, episode, batch_size)
-        print(f"Episode {episode+1}/{num_episodes}, Loss: {episode_loss:.4f}")
-
-    writer.close()
-    print("SPGPO Training Finished!")
-    return agent
-
-def main():
-    # Example usage and training setup
-    config = FastAttentionConfig(
-        d_model=128,
+    # FastAttention の設定
+    attention_config = FastAttentionConfig(
+        d_model=128,     # FastAttention 出力次元
         d_key=32,
         d_query=32,
         n_heads=4,
         rank=16,
         rff_dim=64,
         k_max=32,
-        stride=8,
+        stride=4,
         lsh_buckets=64,
         lsh_bandwidth=2.0,
         lsh_key_dim=32,
         wu_manber_prefix_len=4,
-        hyper_cuts_dim_groups=[16, 16],
-        n_lsh_hashes=4,
         dropout=0.1,
-        intermediate_dim=512,
-        use_rff=True,
-        dtype=torch.float32  # Explicitly set dtype
+        intermediate_dim=256,
+        use_rff=True
     )
 
-    def simple_prompt_distribution(batch_size):
-        seq_len = 64
-        prompt_dim = config.d_model
-        # Ensure the prompt tensor has the correct dtype.  THIS IS CRITICAL.
-        return torch.randn(batch_size, seq_len, prompt_dim, dtype=config.dtype)
-
-    def simple_reward_model(prompt, response):
-        # Ensure consistent dtype for reward calculation
-        return torch.randn(prompt.size(0), dtype=config.dtype)  # (B,)
-
-    def simple_tokenizer(seq_len):
-        # Consistent dtype
-        return torch.randint(0, 100, (1, seq_len))
-
-    trained_agent = train_spgpo(
-        config=config,
-        prompt_distribution=simple_prompt_distribution,
-        reward_model=simple_reward_model,
-        tokenizer=simple_tokenizer,
-        num_episodes=50,  # Reduced for testing
-        batch_size=16,
-        k_responses=4
+    # SPPO エージェント初期化 (FastAttention 利用)
+    sppo_agent = SPPO(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        num_samples=num_samples_per_state,
+        attention_config=attention_config,
+        use_adam_optimizer=True
     )
 
-    print("Trained Agent:", trained_agent)
+    previous_loss = float('inf')
+    num_episodes = 10
+    num_steps_per_episode = 20
 
-if __name__ == "__main__":
-    main()
+    # トレーニングループ
+    for episode in range(num_episodes):
+        for step in range(num_steps_per_episode):
+            # ダミー状態生成 & 正規化
+            dummy_states = torch.randn(num_samples_per_state, state_dim)
+            normalized_states = sppo_agent.normalize_state(dummy_states)
+            
+            # アクションのサンプリング (再パラメータ化)
+            actions, _, _ = sppo_agent.sample_actions(normalized_states)
+            
+            # 現実的報酬モデルを用いたグループ相対報酬計算
+            group_rewards = sppo_agent.compute_group_rewards(normalized_states, actions, realistic_reward_model)
+            
+            # PPO 損失の計算とポリシー更新
+            loss = sppo_agent.compute_ppo_loss(normalized_states, actions, group_rewards)
+            sppo_agent.update_policy(loss)
+            
+            if step % 5 == 0:
+                print(f"Episode: {episode}, Step: {step}, Loss: {loss.item():.4f}")
+        
+        # エピソード終了後にベースライン更新とハイパーパラメータ調整
+        sppo_agent.update_baseline()
+        current_loss = loss.item()
+        sppo_agent.adjust_hyperparameters(current_loss, previous_loss)
+        previous_loss = current_loss
+        print(f"Episode {episode} completed, Adjusted eta: {sppo_agent.eta:.4f}, alpha: {sppo_agent.alpha:.4f}")
