@@ -1,579 +1,523 @@
 """
-GPU-Accelerated Dominator Analysis for Control Flow Graphs
+Control Flow Graph Analysis with GPU-Accelerated Dominator Computation
 
-This module implements control flow graph (CFG) construction and 
-dominator computation using CUDA GPU acceleration.
+This module provides tools to:
+1. Build a Control Flow Graph (CFG) from Python source code
+2. Compute dominators on GPU using CUDA
+3. Visualize the CFG and dominator tree
 """
 
 import ast
 import time
-from typing import Dict, List, Tuple, Any, Optional, Set, Union
 from collections import defaultdict
+from typing import Dict, List, Tuple, Union, Optional, Set
 
 import numpy as np
 import pycuda.autoinit
 import pycuda.driver as cuda
 from pycuda.compiler import SourceModule
-import graphviz  # For CFG visualization
+import graphviz
 
-# Configuration constants
-class Config:
-    """Configuration settings for dominator computation."""
-    BITS_PER_MASK: int = 64
-    MAX_MASK_COUNT: int = 10
-    DEFAULT_BLOCK_SIZE: int = 256
-    MAX_ITERATIONS: int = 1000  # Safety limit for convergence
+# =========================================================
+# Constants
+# =========================================================
+BITS_PER_MASK = 64
+MAX_MASK_COUNT = 10
+DEFAULT_BLOCK_SIZE = 256
+MAX_ITERATIONS = 100
 
-
-# --------------------------------------------------
-# CFG Construction Module
-# --------------------------------------------------
-class CFGBuilder(ast.NodeVisitor):
-    """
-    Control Flow Graph Builder that traverses Python AST.
+# =========================================================
+# Data Structures
+# =========================================================
+class ControlFlowGraph:
+    """Represents a Control Flow Graph with nodes and edges."""
     
-    Builds a control flow graph by visiting AST nodes and tracking edges
-    between basic blocks.
-    """
-    
-    def __init__(self) -> None:
-        """Initialize a new CFG builder."""
-        self.cfg: Dict[int, List[int]] = defaultdict(list)
+    def __init__(self):
+        self.successors: Dict[int, List[int]] = defaultdict(list)
         self.predecessors: Dict[int, List[int]] = defaultdict(list)
-        self.current_node: int = 0
+        self.node_labels: Dict[int, Union[ast.AST, str]] = {}
         self.node_count: int = 0
-        self.labels: Dict[int, Any] = {}  # Maps node IDs to AST nodes or labels
-        
-    def add_edge(self, from_node: int, to_node: int) -> None:
-        """
-        Add a directed edge from one node to another in the CFG.
-        
-        Args:
-            from_node: Source node ID
-            to_node: Destination node ID
-        """
-        self.cfg[from_node].append(to_node)
-        self.predecessors[to_node].append(from_node)
-        
-    def new_node(self) -> int:
-        """
-        Create a new node in the CFG.
-        
-        Returns:
-            The ID of the newly created node
-        """
+    
+    def add_node(self, label: Union[ast.AST, str]) -> int:
+        """Add a node to the CFG and return its ID."""
+        node_id = self.node_count
         self.node_count += 1
-        return self.node_count - 1
+        self.node_labels[node_id] = label
+        return node_id
+    
+    def add_edge(self, from_node: int, to_node: int) -> None:
+        """Add a directed edge between nodes in the CFG."""
+        if to_node not in self.successors[from_node]:
+            self.successors[from_node].append(to_node)
+        if from_node not in self.predecessors[to_node]:
+            self.predecessors[to_node].append(from_node)
+    
+    def visualize(self, filename: str = 'cfg') -> None:
+        """Generate a visual representation of the CFG using Graphviz."""
+        dot = graphviz.Digraph(comment='Control Flow Graph')
         
+        # Add nodes with labels
+        for node_id, label in self.node_labels.items():
+            if isinstance(label, ast.AST):
+                node_label = f"{node_id}: {type(label).__name__}"
+                # Add line number if available
+                if hasattr(label, 'lineno'):
+                    node_label += f" (line {label.lineno})"
+            else:
+                node_label = f"{node_id}: {label}"
+            
+            dot.node(str(node_id), node_label)
+        
+        # Add edges
+        for from_node, to_nodes in self.successors.items():
+            for to_node in to_nodes:
+                dot.edge(str(from_node), str(to_node))
+        
+        # Render the graph
+        dot.render(filename, format='png', view=False)
+        print(f"CFG visualization saved to {filename}.png")
+    
+    def to_gpu_format(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Convert graph to format suitable for GPU processing."""
+        pred_list = []
+        pred_offsets = [0]
+        offset = 0
+        
+        for node in range(self.node_count):
+            preds = self.predecessors[node]
+            pred_list.extend(preds)
+            offset += len(preds)
+            pred_offsets.append(offset)
+            
+        return (
+            np.array(pred_list, dtype=np.int32),
+            np.array(pred_offsets, dtype=np.int32)
+        )
+
+# =========================================================
+# CFG Construction
+# =========================================================
+class CFGBuilder(ast.NodeVisitor):
+    """Constructs a Control Flow Graph from Python AST."""
+    
+    def __init__(self):
+        self.cfg = ControlFlowGraph()
+        self.current_node: int = -1
+    
+    def build(self, source_code: str) -> ControlFlowGraph:
+        """Build a CFG from source code."""
+        tree = ast.parse(source_code)
+        self.cfg = ControlFlowGraph()
+        self.current_node = self.cfg.add_node("Entry")
+        self.visit(tree)
+        return self.cfg
+    
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        """
-        Visit a function definition node and create entry point in CFG.
+        """Process a function definition."""
+        # Mark the current node as the function entry
+        self.cfg.node_labels[self.current_node] = node
         
-        Args:
-            node: The FunctionDef AST node
-        """
-        self.current_node = 0
-        self.node_count = 1
-        self.labels[0] = node
-        self.generic_visit(node)
-        
+        # Visit function body
+        for stmt in node.body:
+            self.visit(stmt)
+    
     def visit_If(self, node: ast.If) -> None:
-        """
-        Visit an if statement node and create appropriate CFG branches.
+        """Process an if statement with then/else branches."""
+        condition_node = self.cfg.add_node(node)
+        self.cfg.add_edge(self.current_node, condition_node)
+        prev_node = self.current_node
+        self.current_node = condition_node
         
-        Args:
-            node: The If AST node
-        """
-        current_node = self.current_node
-        
-        # Create then branch
-        then_node = self.new_node()
-        self.labels[then_node] = node
-        self.add_edge(current_node, then_node)
+        # Then branch
+        then_node = self.cfg.add_node(f"then_branch_{node.lineno}")
+        self.cfg.add_edge(condition_node, then_node)
         self.current_node = then_node
         
         for stmt in node.body:
             self.visit(stmt)
-            
-        if_end_node = self.current_node
         
-        # Create else branch if it exists
+        then_exit = self.current_node
+        
+        # Else branch (if present)
         if node.orelse:
-            else_node = self.new_node()
-            self.labels[else_node] = node.orelse
-            self.add_edge(current_node, else_node)
+            else_node = self.cfg.add_node(f"else_branch_{node.lineno}")
+            self.cfg.add_edge(condition_node, else_node)
             self.current_node = else_node
             
             for stmt in node.orelse:
                 self.visit(stmt)
-                
-            # Create merge point after if-else
-            next_node = self.new_node()
-            self.labels[next_node] = f"next_{node.lineno}"
-            self.add_edge(if_end_node, next_node)
-            self.add_edge(self.current_node, next_node)
-            self.current_node = next_node
-        else:
-            # Create merge point after if (no else)
-            next_node = self.new_node()
-            self.labels[next_node] = f"next_{node.lineno}"
-            self.add_edge(current_node, next_node)
-            self.add_edge(if_end_node, next_node)
-            self.current_node = next_node
             
-    def visit_Return(self, node: ast.Return) -> None:
-        """
-        Visit a return statement node and create corresponding CFG node.
+            else_exit = self.current_node
+            
+            # Create merge point
+            merge_node = self.cfg.add_node(f"if_merge_{node.lineno}")
+            self.cfg.add_edge(then_exit, merge_node)
+            self.cfg.add_edge(else_exit, merge_node)
+            self.current_node = merge_node
+        else:
+            # No else branch - direct path from condition to merge
+            merge_node = self.cfg.add_node(f"if_merge_{node.lineno}")
+            self.cfg.add_edge(then_exit, merge_node)
+            self.cfg.add_edge(condition_node, merge_node)
+            self.current_node = merge_node
+    
+    def visit_While(self, node: ast.While) -> None:
+        """Process a while loop."""
+        # Create condition node
+        condition_node = self.cfg.add_node(node)
+        self.cfg.add_edge(self.current_node, condition_node)
+        self.current_node = condition_node
         
-        Args:
-            node: The Return AST node
-        """
-        return_node = self.new_node()
-        self.labels[return_node] = node
-        self.add_edge(self.current_node, return_node)
-        self.current_node = return_node
+        # Create body entry node
+        body_node = self.cfg.add_node(f"while_body_{node.lineno}")
+        self.cfg.add_edge(condition_node, body_node)
+        self.current_node = body_node
         
-    def generic_visit(self, node: ast.AST) -> None:
-        """
-        Visit nodes not handled by specific visit methods.
+        # Process body statements
+        for stmt in node.body:
+            self.visit(stmt)
         
-        Args:
-            node: Any AST node
-        """
-        if isinstance(node, ast.FunctionDef):
-            for stmt in node.body:
+        # Loop back to condition
+        self.cfg.add_edge(self.current_node, condition_node)
+        
+        # Create exit node
+        exit_node = self.cfg.add_node(f"while_exit_{node.lineno}")
+        self.cfg.add_edge(condition_node, exit_node)
+        self.current_node = exit_node
+        
+        # Process else clause if present
+        if node.orelse:
+            else_node = self.cfg.add_node(f"while_else_{node.lineno}")
+            self.cfg.add_edge(exit_node, else_node)
+            self.current_node = else_node
+            
+            for stmt in node.orelse:
                 self.visit(stmt)
-        elif isinstance(node, list):
-            for item in node:
-                if isinstance(item, ast.AST):
-                    self.visit(item)
+    
+    def visit_For(self, node: ast.For) -> None:
+        """Process a for loop."""
+        # Create initialization node
+        init_node = self.cfg.add_node(node)
+        self.cfg.add_edge(self.current_node, init_node)
+        self.current_node = init_node
+        
+        # Create body entry node
+        body_node = self.cfg.add_node(f"for_body_{node.lineno}")
+        self.cfg.add_edge(init_node, body_node)
+        self.current_node = body_node
+        
+        # Process body statements
+        for stmt in node.body:
+            self.visit(stmt)
+        
+        # Loop back to init for next iteration
+        self.cfg.add_edge(self.current_node, init_node)
+        
+        # Create exit node for when loop terminates
+        exit_node = self.cfg.add_node(f"for_exit_{node.lineno}")
+        self.cfg.add_edge(init_node, exit_node)
+        self.current_node = exit_node
+        
+        # Process else clause if present
+        if node.orelse:
+            else_node = self.cfg.add_node(f"for_else_{node.lineno}")
+            self.cfg.add_edge(exit_node, else_node)
+            self.current_node = else_node
+            
+            for stmt in node.orelse:
+                self.visit(stmt)
+    
+    def visit_Return(self, node: ast.Return) -> None:
+        """Process a return statement."""
+        return_node = self.cfg.add_node(node)
+        self.cfg.add_edge(self.current_node, return_node)
+        self.current_node = return_node
+    
+    def generic_visit(self, node: ast.AST) -> None:
+        """Process other AST node types."""
+        # For statement-like nodes that aren't specially handled
+        if isinstance(node, (ast.Assign, ast.AugAssign, ast.Expr, ast.Assert)):
+            stmt_node = self.cfg.add_node(node)
+            self.cfg.add_edge(self.current_node, stmt_node)
+            self.current_node = stmt_node
         else:
-            current_node = self.new_node()
-            self.labels[current_node] = type(node).__name__
-            self.add_edge(self.current_node, current_node)
-            self.current_node = current_node
-            
-            for field, value in ast.iter_fields(node):
-                if isinstance(value, list):
-                    for item in value:
-                        if isinstance(item, ast.AST):
-                            self.visit(item)
-                elif isinstance(value, ast.AST):
-                    self.visit(value)
+            # Default behavior
+            super().generic_visit(node)
 
-
-def build_cfg_from_source(source_code: str) -> CFGBuilder:
-    """
-    Build a control flow graph from Python source code.
-    
-    Args:
-        source_code: Python source code as a string
-        
-    Returns:
-        A CFGBuilder instance with the constructed graph
-        
-    Raises:
-        SyntaxError: If the source code contains syntax errors
-    """
-    try:
-        tree = ast.parse(source_code)
-        builder = CFGBuilder()
-        builder.visit(tree)
-        return builder
-    except SyntaxError as e:
-        raise SyntaxError(f"Failed to parse source code: {e}")
-
-
-# --------------------------------------------------
-# Data Preparation Functions
-# --------------------------------------------------
-def prepare_predecessor_data(cfg_builder: CFGBuilder) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Prepare predecessor data for GPU processing.
-    
-    Convert the graph representation to flat arrays suitable for GPU processing.
-    
-    Args:
-        cfg_builder: A CFG builder with graph data
-        
-    Returns:
-        A tuple of (predecessors array, offsets array)
-    """
-    predecessors = cfg_builder.predecessors
-    num_nodes = cfg_builder.node_count
-    
-    pred_list: List[int] = []
-    pred_offsets: List[int] = [0]
-    offset = 0
-    
-    for node in range(num_nodes):
-        preds = predecessors[node]
-        pred_list.extend(preds)
-        offset += len(preds)
-        pred_offsets.append(offset)
-        
-    return (
-        np.array(pred_list, dtype=np.int32),
-        np.array(pred_offsets, dtype=np.int32)
-    )
-
-
-def build_dominator_tree(dom: np.ndarray, num_nodes: int, mask_count: int) -> Dict[int, List[int]]:
-    """
-    Build a dominator tree from dominator bit masks.
-    
-    Args:
-        dom: Computed dominator bit masks
-        num_nodes: Number of nodes in the CFG
-        mask_count: Number of 64-bit masks per node
-        
-    Returns:
-        A dictionary representing the dominator tree (parent -> [children])
-    """
-    tree: Dict[int, List[int]] = defaultdict(list)
-    
-    for node in range(1, num_nodes):
-        idom: Optional[int] = None
-        
-        # Find immediate dominator (closest dominator)
-        for i in range(num_nodes):
-            mask_index = i // Config.BITS_PER_MASK
-            bit_index = i % Config.BITS_PER_MASK
-            
-            if mask_index < mask_count:
-                dom_value = np.uint64(dom[node][mask_index])
-                bit_value = np.uint64(1 << bit_index)
-                
-                # Check if i dominates node
-                if (dom_value & bit_value) != 0 and i != node:
-                    # Check if i is closer than current idom
-                    if idom is None or (np.uint64(dom[idom][mask_index]) & bit_value) == 0:
-                        idom = i
-                        
-        if idom is not None:
-            tree[idom].append(node)
-            
-    return tree
-
-
-# --------------------------------------------------
+# =========================================================
 # GPU Dominator Computation
-# --------------------------------------------------
-def create_cuda_module() -> SourceModule:
-    """
-    Create CUDA module with the dominator computation kernel.
+# =========================================================
+class DominatorAnalyzer:
+    """Computes dominator sets and trees using GPU acceleration."""
     
-    Returns:
-        Compiled CUDA module
-    """
-    cuda_code = f"""
-    #define BITS_PER_MASK {Config.BITS_PER_MASK}
-    #define MAX_MASK_COUNT {Config.MAX_MASK_COUNT}
+    def __init__(self):
+        self.cuda_code = self._generate_cuda_code()
+        self.module = SourceModule(self.cuda_code)
+        self.compute_dominator = self.module.get_function("compute_dominator")
+    
+    def _generate_cuda_code(self) -> str:
+        """Generate CUDA C code for dominator computation."""
+        return f"""
+        #define BITS_PER_MASK {BITS_PER_MASK}
+        #define MAX_MASK_COUNT {MAX_MASK_COUNT}
 
-    __global__ void compute_dominator(
-        unsigned long long *dom,
-        int *predecessors,
-        int *pred_offsets,
-        int num_nodes,
-        int num_preds,
-        int mask_count,
-        int *d_changed)
-    {{
-        int node = blockIdx.x * blockDim.x + threadIdx.x;
-        if (node >= num_nodes) return;
-        if (mask_count > MAX_MASK_COUNT) return;
+        __global__ void compute_dominator(
+            unsigned long long *dom,
+            int *predecessors,
+            int *pred_offsets,
+            int num_nodes,
+            int num_preds,
+            int mask_count,
+            int *d_changed)
+        {{
+            int node = blockIdx.x * blockDim.x + threadIdx.x;
+            if (node >= num_nodes) return;
+            if (mask_count > MAX_MASK_COUNT) return;
 
-        // Special case for entry node (0)
-        if (node == 0) {{
-            dom[node * mask_count] = 1ULL << (node % BITS_PER_MASK);
-            for (int i = 1; i < mask_count; i++) {{
-                dom[node * mask_count + i] = 0;
+            // Entry node (0) dominates only itself
+            if (node == 0) {{
+                dom[node * mask_count] = 1ULL << (node % BITS_PER_MASK);
+                for (int i = 1; i < mask_count; i++) {{
+                    dom[node * mask_count + i] = 0;
+                }}
+                return;
             }}
-            return;
-        }}
 
-        // Compute intersection of all predecessors
-        unsigned long long intersection[MAX_MASK_COUNT];
-        for (int i = 0; i < mask_count; i++) {{
-            intersection[i] = ~0ULL;  // Initialize to all 1s
-        }}
-        
-        // Get predecessor range for this node
-        int start = pred_offsets[node];
-        int end = (node + 1 < num_nodes) ? pred_offsets[node + 1] : num_preds;
-        
-        // Compute intersection of dominator sets of all predecessors
-        for (int i = start; i < end; i++) {{
-            int pred = predecessors[i];
-            for (int j = 0; j < mask_count; j++) {{
-                intersection[j] &= dom[pred * mask_count + j];
-            }}
-        }}
-        
-        // Add node itself to its dominator set
-        int mask_index = node / BITS_PER_MASK;
-        int bit_index = node % BITS_PER_MASK;
-        if (mask_index < mask_count) {{
-            intersection[mask_index] |= (1ULL << bit_index);
-        }}
-
-        // Check if anything changed
-        bool changed = false;
-        for (int i = 0; i < mask_count; i++) {{
-            if (dom[node * mask_count + i] != intersection[i]) {{
-                changed = true;
-                break;
-            }}
-        }}
-        
-        // Update dominator set if changed
-        if (changed) {{
+            // Initialize intersection to universal set (all bits set)
+            unsigned long long intersection[MAX_MASK_COUNT];
             for (int i = 0; i < mask_count; i++) {{
-                dom[node * mask_count + i] = intersection[i];
+                intersection[i] = ~0ULL;
             }}
-            atomicExch(&d_changed[0], 1);
+            
+            // Compute intersection of predecessors' dominator sets
+            int start = pred_offsets[node];
+            int end = (node + 1 < num_nodes) ? pred_offsets[node + 1] : num_preds;
+            
+            for (int i = start; i < end; i++) {{
+                int pred = predecessors[i];
+                for (int j = 0; j < mask_count; j++) {{
+                    intersection[j] &= dom[pred * mask_count + j];
+                }}
+            }}
+            
+            // Add node itself to its dominator set
+            int mask_index = node / BITS_PER_MASK;
+            int bit_index = node % BITS_PER_MASK;
+            if (mask_index < mask_count) {{
+                intersection[mask_index] |= (1ULL << bit_index);
+            }}
+
+            // Check if dominator set has changed
+            bool changed = false;
+            for (int i = 0; i < mask_count; i++) {{
+                if (dom[node * mask_count + i] != intersection[i]) {{
+                    changed = true;
+                    break;
+                }}
+            }}
+            
+            // Update dominator set if it changed
+            if (changed) {{
+                for (int i = 0; i < mask_count; i++) {{
+                    dom[node * mask_count + i] = intersection[i];
+                }}
+                atomicExch(&d_changed[0], 1);  // Signal that something changed
+            }}
         }}
-    }}
-    """
+        """
     
-    try:
-        return SourceModule(cuda_code)
-    except Exception as e:
-        raise RuntimeError(f"CUDA module compilation failed: {e}")
-
-
-def compute_dominators_gpu(cfg_builder: CFGBuilder, block_size: int = Config.DEFAULT_BLOCK_SIZE) -> Tuple[np.ndarray, Dict[int, List[int]], float]:
-    """
-    Compute dominators using GPU acceleration.
-    
-    Args:
-        cfg_builder: CFG builder with the graph
-        block_size: CUDA thread block size
+    def compute(self, cfg: ControlFlowGraph) -> Tuple[np.ndarray, Dict[int, List[int]], float]:
+        """
+        Compute dominators for a CFG using GPU.
         
-    Returns:
-        Tuple of (dominator bit masks, dominator tree, execution time in ms)
+        Returns:
+            Tuple of (dominator_sets, dominator_tree, execution_time_ms)
+        """
+        num_nodes = cfg.node_count
+        if num_nodes == 0:
+            raise ValueError("Empty CFG - no nodes found")
         
-    Raises:
-        ValueError: If mask count exceeds MAX_MASK_COUNT
-        RuntimeError: For CUDA-related errors
-    """
-    num_nodes = cfg_builder.node_count
-    
-    # Prepare data for GPU processing
-    predecessors, pred_offsets = prepare_predecessor_data(cfg_builder)
-    num_preds = len(predecessors)
-    
-    # Calculate mask count (number of 64-bit masks per node)
-    mask_count = (num_nodes + Config.BITS_PER_MASK - 1) // Config.BITS_PER_MASK
-    if mask_count > Config.MAX_MASK_COUNT:
-        raise ValueError(f"Node count ({num_nodes}) requires {mask_count} masks, exceeding MAX_MASK_COUNT ({Config.MAX_MASK_COUNT})")
-    
-    # Initialize dominator sets
-    dom = np.zeros((num_nodes, mask_count), dtype=np.uint64)
-    dom[0, 0] = 1  # Entry node dominates itself
-    
-    # Start timing
-    start_time = time.time()
-    
-    # Allocate GPU memory
-    try:
-        predecessors_gpu = cuda.to_device(predecessors)
-        pred_offsets_gpu = cuda.to_device(pred_offsets)
-        dom_gpu = cuda.to_device(dom)
+        # Prepare data for GPU
+        pred_list, pred_offsets = cfg.to_gpu_format()
+        num_preds = len(pred_list)
         
-        # Allocate change flag
-        d_changed = cuda.mem_alloc(np.zeros(1, dtype=np.int32).nbytes)
+        # Calculate number of bit masks needed
+        mask_count = (num_nodes + BITS_PER_MASK - 1) // BITS_PER_MASK
+        if mask_count > MAX_MASK_COUNT:
+            raise ValueError(f"Too many nodes: mask_count ({mask_count}) exceeds MAX_MASK_COUNT ({MAX_MASK_COUNT})")
         
-        # Compile and get kernel function
-        module = create_cuda_module()
-        compute_dominator = module.get_function("compute_dominator")
+        # Start timing
+        start_time = time.time()
         
-        # Calculate grid dimensions
-        grid_size = (num_nodes + block_size - 1) // block_size
+        # Initialize dominator sets
+        dom = np.zeros((num_nodes, mask_count), dtype=np.uint64)
+        dom[0, 0] = 1  # Entry node dominates itself
         
-        # Create CUDA stream for asynchronous operations
-        stream = cuda.Stream()
-        
-        # Convergence loop
-        iteration_count = 0
-        while iteration_count < Config.MAX_ITERATIONS:
-            iteration_count += 1
+        # Allocate GPU memory
+        try:
+            predecessors_gpu = cuda.to_device(pred_list)
+            pred_offsets_gpu = cuda.to_device(pred_offsets)
+            dom_gpu = cuda.to_device(dom)
+            d_changed = cuda.mem_alloc(np.zeros(1, dtype=np.int32).nbytes)
             
-            # Reset change flag
-            changed_host = np.zeros(1, dtype=np.int32)
-            cuda.memcpy_htod_async(d_changed, changed_host, stream)
+            # Configure kernel execution
+            block_size = DEFAULT_BLOCK_SIZE
+            grid_size = (num_nodes + block_size - 1) // block_size
+            stream = cuda.Stream()
             
-            # Launch kernel
-            compute_dominator(
-                dom_gpu, predecessors_gpu, pred_offsets_gpu,
-                np.int32(num_nodes), np.int32(num_preds), np.int32(mask_count),
-                d_changed,
-                block=(block_size, 1, 1), grid=(grid_size, 1), stream=stream
-            )
-            
-            # Synchronize and check for changes
-            stream.synchronize()
-            cuda.memcpy_dtoh(changed_host, d_changed)
-            
-            if changed_host[0] == 0:
-                break
+            # Fixed-point iteration
+            iteration_count = 0
+            while iteration_count < MAX_ITERATIONS:
+                iteration_count += 1
                 
-        # Copy final result back to host
-        cuda.memcpy_dtoh(dom, dom_gpu)
-        
-        # Free GPU memory
-        predecessors_gpu.free()
-        pred_offsets_gpu.free()
-        dom_gpu.free()
-        d_changed.free()
-        
-    except cuda.Error as e:
-        raise RuntimeError(f"CUDA error: {e}")
-    
-    # End timing
-    end_time = time.time()
-    execution_time_ms = (end_time - start_time) * 1000
-    
-    # Build dominator tree
-    dom_tree = build_dominator_tree(dom, num_nodes, mask_count)
-    
-    return dom, dom_tree, execution_time_ms
-
-
-# --------------------------------------------------
-# Visualization Functions
-# --------------------------------------------------
-def visualize_cfg(cfg_builder: CFGBuilder, filename: str = 'cfg') -> None:
-    """
-    Visualize the control flow graph using Graphviz.
-    
-    Args:
-        cfg_builder: CFG builder with the graph
-        filename: Base filename for the output image
-    """
-    dot = graphviz.Digraph(comment='Control Flow Graph')
-    
-    # Add nodes
-    for node_id in sorted(cfg_builder.labels.keys()):
-        label = cfg_builder.labels[node_id]
-        if isinstance(label, ast.AST):
-            # For AST nodes, use the class name
-            node_label = f"{node_id}: {type(label).__name__}"
-            if isinstance(label, ast.FunctionDef):
-                node_label += f"\n{label.name}"
-        else:
-            # For string labels
-            node_label = f"{node_id}: {label}"
+                # Reset changed flag
+                changed_host = np.zeros(1, dtype=np.int32)
+                cuda.memcpy_htod_async(d_changed, changed_host, stream)
+                
+                # Run kernel
+                self.compute_dominator(
+                    dom_gpu, predecessors_gpu, pred_offsets_gpu,
+                    np.int32(num_nodes), np.int32(num_preds), np.int32(mask_count),
+                    d_changed,
+                    block=(block_size, 1, 1), grid=(grid_size, 1), stream=stream
+                )
+                stream.synchronize()
+                
+                # Check if anything changed
+                cuda.memcpy_dtoh(changed_host, d_changed)
+                if changed_host[0] == 0:
+                    break
             
-        dot.node(str(node_id), node_label)
-    
-    # Add edges
-    for from_node, to_nodes in cfg_builder.cfg.items():
-        for to_node in to_nodes:
-            dot.edge(str(from_node), str(to_node))
-    
-    # Render the graph
-    try:
-        dot.render(filename, format='png', view=False)
-        print(f"CFG saved to {filename}.png")
-    except Exception as e:
-        print(f"Failed to visualize CFG: {e}")
-
-
-def visualize_dominator_tree(dom_tree: Dict[int, List[int]], filename: str = 'dominator_tree') -> None:
-    """
-    Visualize the dominator tree using Graphviz.
-    
-    Args:
-        dom_tree: Dominator tree as a dict (parent -> [children])
-        filename: Base filename for the output image
-    """
-    dot = graphviz.Digraph(comment='Dominator Tree')
-    
-    # Add all nodes that appear in the tree
-    nodes = set(dom_tree.keys())
-    for children in dom_tree.values():
-        nodes.update(children)
-    
-    for node in sorted(nodes):
-        dot.node(str(node), str(node))
-    
-    # Add edges
-    for parent, children in dom_tree.items():
-        for child in children:
-            dot.edge(str(parent), str(child))
-    
-    # Render the graph
-    try:
-        dot.render(filename, format='png', view=False)
-        print(f"Dominator tree saved to {filename}.png")
-    except Exception as e:
-        print(f"Failed to visualize dominator tree: {e}")
-
-
-# --------------------------------------------------
-# Utility Functions
-# --------------------------------------------------
-def format_dominator_results(dom: np.ndarray, num_nodes: int) -> List[Set[int]]:
-    """
-    Convert bit mask representation to sets of dominators for easier reading.
-    
-    Args:
-        dom: Dominator bit masks
-        num_nodes: Number of nodes in the CFG
-        
-    Returns:
-        List of sets, where each set contains the dominators of a node
-    """
-    mask_count = dom.shape[1]
-    result: List[Set[int]] = []
-    
-    for node in range(num_nodes):
-        dominators = set()
-        for i in range(num_nodes):
-            mask_index = i // Config.BITS_PER_MASK
-            bit_index = i % Config.BITS_PER_MASK
+            # Get final result
+            cuda.memcpy_dtoh(dom, dom_gpu)
             
-            if mask_index < mask_count:
+        finally:
+            # Clean up GPU resources
+            try:
+                predecessors_gpu.free()
+                pred_offsets_gpu.free()
+                dom_gpu.free()
+                d_changed.free()
+            except:
+                pass
+        
+        end_time = time.time()
+        elapsed_ms = (end_time - start_time) * 1000
+        
+        # Build dominator tree
+        dom_tree = self._build_dominator_tree(dom, num_nodes, mask_count)
+        
+        return dom, dom_tree, elapsed_ms
+    
+    def _build_dominator_tree(self, dom: np.ndarray, num_nodes: int, mask_count: int) -> Dict[int, List[int]]:
+        """Build a dominator tree from dominator sets."""
+        tree = defaultdict(list)
+        
+        # For each node (except entry), find its immediate dominator
+        for node in range(1, num_nodes):
+            idom = None
+            
+            for i in range(num_nodes):
+                mask_index = i // BITS_PER_MASK
+                bit_index = i % BITS_PER_MASK
+                
+                if mask_index >= mask_count:
+                    continue
+                
                 dom_value = np.uint64(dom[node][mask_index])
                 bit_value = np.uint64(1 << bit_index)
                 
-                if (dom_value & bit_value) != 0:
-                    dominators.add(i)
-                    
-        result.append(dominators)
+                # Check if i dominates node and could be immediate dominator
+                if (dom_value & bit_value) != 0 and i != node:
+                    # Check if i is more specific than current idom
+                    if idom is None:
+                        idom = i
+                    else:
+                        # Check if i is dominated by current idom
+                        idom_mask_index = idom // BITS_PER_MASK
+                        idom_bit_index = idom % BITS_PER_MASK
+                        
+                        if idom_mask_index < mask_count:
+                            if (np.uint64(dom[i][idom_mask_index]) & 
+                                np.uint64(1 << idom_bit_index)) != 0:
+                                # i is dominated by idom, so i is more specific
+                                idom = i
+            
+            if idom is not None:
+                tree[idom].append(node)
         
-    return result
+        return tree
 
-
-def benchmark_dominators(source_code: str, num_runs: int = 10) -> float:
-    """
-    Benchmark dominator computation on a given source code.
+# =========================================================
+# Main Analysis API
+# =========================================================
+class CFGAnalyzer:
+    """Main API for CFG analysis."""
     
-    Args:
-        source_code: Python source code to analyze
-        num_runs: Number of benchmark iterations
+    def __init__(self):
+        self.builder = CFGBuilder()
+        self.dominator_analyzer = DominatorAnalyzer()
+    
+    def analyze(self, source_code: str, visualize: bool = True) -> Dict[str, object]:
+        """
+        Analyze Python source code to compute CFG and dominators.
         
-    Returns:
-        Average execution time in milliseconds
-    """
-    cfg_builder = build_cfg_from_source(source_code)
+        Args:
+            source_code: Python source code to analyze
+            visualize: Whether to generate a visualization
+            
+        Returns:
+            Dictionary with analysis results
+        """
+        # Build CFG
+        cfg = self.builder.build(source_code)
+        
+        # Compute dominators
+        dom_sets, dom_tree, elapsed_time = self.dominator_analyzer.compute(cfg)
+        
+        # Visualize if requested
+        if visualize:
+            cfg.visualize(filename='cfg_analysis')
+        
+        # Return results
+        return {
+            'cfg': cfg,
+            'dominator_sets': dom_sets,
+            'dominator_tree': dom_tree,
+            'execution_time_ms': elapsed_time
+        }
     
+    def print_analysis_summary(self, results: Dict[str, object]) -> None:
+        """Print a summary of the analysis results."""
+        dom_tree = results['dominator_tree']
+        dom_sets = results['dominator_sets']
+        cfg = results['cfg']
+        
+        print(f"\nControl Flow Graph: {cfg.node_count} nodes")
+        
+        print("\nDominator Tree:")
+        for parent, children in sorted(dom_tree.items()):
+            print(f"Node {parent} immediately dominates: {sorted(children)}")
+        
+        print(f"\nAnalysis completed in {results['execution_time_ms']:.2f} ms")
+
+# =========================================================
+# Testing and Benchmarking
+# =========================================================
+def run_benchmark(analyzer: CFGAnalyzer, source_code: str, runs: int = 10) -> float:
+    """Run a benchmark on the given source code."""
     total_time = 0
-    for _ in range(num_runs):
-        _, _, time_ms = compute_dominators_gpu(cfg_builder)
-        total_time += time_ms
-        
-    return total_time / num_runs
+    
+    for i in range(runs):
+        results = analyzer.analyze(source_code, visualize=(i == 0))
+        total_time += results['execution_time_ms']
+    
+    return total_time / runs
 
-
-# --------------------------------------------------
-# Main Application
-# --------------------------------------------------
-def main() -> None:
-    """Main entry point for dominator analysis."""
-    # Test code example
-    source_code_nested = """
+def main():
+    """Main entry point for demonstration."""
+    # Test code samples
+    nested_conditionals = """
 def nested_example(a, b, c):
     if a > b:
         if b > c:
@@ -591,34 +535,43 @@ def nested_example(a, b, c):
     return x + y
 """
 
-    print("Building CFG...")
-    cfg_builder = build_cfg_from_source(source_code_nested)
-    
-    print("Computing dominators...")
-    dominators, dom_tree, execution_time = compute_dominators_gpu(cfg_builder)
-    
-    print(f"Dominator computation completed in {execution_time:.3f} ms")
-    
-    # Display results
-    print("\nDominator Results:")
-    dom_sets = format_dominator_results(dominators, cfg_builder.node_count)
-    for i, doms in enumerate(dom_sets):
-        print(f"Node {i} is dominated by: {sorted(doms)}")
-    
-    print("\nDominator Tree:")
-    for parent, children in sorted(dom_tree.items()):
-        print(f"Node {parent} immediately dominates: {sorted(children)}")
-    
-    # Visualize the graphs
-    visualize_cfg(cfg_builder, filename='cfg_nested_example')
-    visualize_dominator_tree(dom_tree, filename='dom_tree_nested_example')
-    
-    # Run benchmark
-    print("\nRunning benchmark...")
-    num_runs = 100
-    avg_time = benchmark_dominators(source_code_nested, num_runs)
-    print(f"Average execution time over {num_runs} runs: {avg_time:.3f} ms")
+    loops_example = """
+def loop_example(n, threshold):
+    result = 0
+    for i in range(n):
+        if i % 2 == 0:
+            result += i
+        else:
+            result -= i
+            
+    count = 0
+    while result > threshold:
+        result = result // 2
+        count += 1
+        
+    return result, count
+"""
 
+    # Create analyzer
+    analyzer = CFGAnalyzer()
+    
+    # Analyze nested conditionals
+    print("Analyzing code with nested conditionals...")
+    results_nested = analyzer.analyze(nested_conditionals, visualize=True)
+    analyzer.print_analysis_summary(results_nested)
+    
+    # Analyze loops
+    print("\nAnalyzing code with loops...")
+    results_loops = analyzer.analyze(loops_example, visualize=True)
+    analyzer.print_analysis_summary(results_loops)
+    
+    # Run benchmarks
+    print("\nRunning benchmarks...")
+    avg_time_nested = run_benchmark(analyzer, nested_conditionals, runs=10)
+    avg_time_loops = run_benchmark(analyzer, loops_example, runs=10)
+    
+    print(f"Average execution time (nested conditionals): {avg_time_nested:.3f} ms")
+    print(f"Average execution time (loops): {avg_time_loops:.3f} ms")
 
 if __name__ == "__main__":
     main()
