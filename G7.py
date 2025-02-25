@@ -1,3 +1,4 @@
+--- START OF FILE G7 (1).py ---
 import math
 import torch
 import torch.nn as nn
@@ -545,8 +546,7 @@ class FastAttention(nn.Module):
             check_for_inf(candidates, f"Head {head_idx} CandidateFinder output")
 
             cand_mask = candidates != -1
-            safe_candidates = candidates.clone()
-            safe_candidates.masked_fill_(~cand_mask, 0)
+            safe_candidates = candidates.masked_fill(~cand_mask, 0) # OUT-OF-PLACE
             num_candidates = candidates.size(-1)
             b_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, L, num_candidates)
             candidate_keys = K_proj[b_idx, safe_candidates]
@@ -571,10 +571,10 @@ class FastAttention(nn.Module):
             check_for_inf(sim, f"Head {head_idx} Similarity Scores (sim)")
 
 
-            sim.masked_fill_(~cand_mask, -1e9)
+            sim = sim.masked_fill(~cand_mask, -1e9) # OUT-OF-PLACE
             if mask is not None:
                 expanded_mask = mask.unsqueeze(1).expand_as(sim)
-                sim.masked_fill_(~expanded_mask, -1e9)
+                sim = sim.masked_fill(~expanded_mask, -1e9) # OUT-OF-PLACE
 
             attn_weights = F.softmax(sim, dim=-1)
             attn_weights = self.dropout(attn_weights)
@@ -752,7 +752,7 @@ class AdvantageComputer:
         mask = torch.ones((B, K), device=response.device)
         response_expanded = response.unsqueeze(1)
         equals = (response_expanded == response_group).all(dim=2)
-        mask.masked_fill_(equals, 0)
+        mask = mask.masked_fill(equals, 0) # OUT-OF-PLACE
         denom = torch.clamp(self.k_responses - equals.sum(dim=1, keepdim=True), min=1.0) # Avoid division by zero
         response_pref = (preferences * mask).sum(dim=1) / denom
         avg_group_pref = preferences.mean(dim=1)
