@@ -6,6 +6,10 @@ import torch.optim as optim
 from torch.distributions import Normal
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List, Dict, Any, Callable
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 ##############################################
 # Configuration
@@ -32,6 +36,32 @@ class FastAttentionConfig:
     hyper_cuts_dim_groups: Optional[List[int]] = None  # Dimension groups
     n_lsh_hashes: int = 4  # Number of LSH hash functions
 
+@dataclass
+class TrainingConfig:
+    """Configuration for training the RL agent."""
+    state_dim: int        # Dimension of state space
+    action_dim: int       # Dimension of action space
+    hidden_dim: int = 256 # Hidden dimension for policy network
+    policy_lr: float = 3e-4  # Learning rate for policy network
+    eta: float = 0.01     # Initial step size parameter
+    alpha: float = 0.1    # Initial trust region parameter
+    num_samples: int = 64 # Number of samples per batch
+    gamma: float = 0.99   # Discount factor
+    gae_lambda: float = 0.95  # GAE lambda parameter
+    clip_eps: float = 0.2  # PPO clipping parameter
+    entropy_coef: float = 0.01  # Entropy coefficient
+    value_coef: float = 0.5  # Value loss coefficient
+    max_grad_norm: float = 0.5  # Gradient clipping
+    use_attention: bool = True  # Whether to use attention
+    seq_len: int = 8      # Sequence length for attention
+    use_reward_normalization: bool = True  # Normalize rewards
+    n_updates: int = 10   # Number of updates per batch
+    total_timesteps: int = 1_000_000  # Total timesteps to train
+    eval_frequency: int = 10000  # Evaluation frequency
+    save_frequency: int = 50000  # Save frequency
+    log_frequency: int = 1000  # Logging frequency
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"  # Device to use
+
 ##############################################
 # Utility Functions
 ##############################################
@@ -43,8 +73,218 @@ def optimized_sqrt(n: int) -> float:
         return 2 ** (k / 2)
     return math.sqrt(n)
 
+def create_logger(log_dir: str):
+    """Create a simple logger."""
+    import logging
+    logger = logging.getLogger("RL_LOGGER")
+    logger.setLevel(logging.INFO)
+    
+    # Create formatter
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    
+    # Create file handler
+    fh = logging.FileHandler(f"{log_dir}/training.log")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(formatter)
+    
+    # Create console handler
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(formatter)
+    
+    # Add handlers to logger
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    
+    return logger
+
 ##############################################
-# Core Architecture Components
+# Reward Model
+##############################################
+
+def realistic_reward_model(states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    """
+    A realistic reward model for reinforcement learning environments that calculates
+    rewards based on both state information and action selections.
+    
+    The model incorporates multiple reward components:
+    1. Goal-oriented rewards: How close actions bring the agent to target states
+    2. Energy efficiency: Penalizes excessive action magnitudes
+    3. Smoothness: Rewards consistency and penalizes jittery behavior
+    4. Exploration bonus: Rewards exploring under-visited state regions
+    5. Task-specific rewards: Adjusts rewards based on domain-specific criteria
+    
+    Args:
+        states: Tensor of shape [batch_size, state_dim] representing states
+        actions: Tensor of shape [batch_size, action_dim] representing actions
+    
+    Returns:
+        rewards: Tensor of shape [batch_size] containing computed rewards
+    """
+    batch_size = states.size(0)
+    state_dim = states.size(1)
+    action_dim = actions.size(1)
+    device = states.device
+    
+    # Initialize reward components
+    rewards = torch.zeros(batch_size, device=device)
+    
+    # 1. Goal-oriented rewards
+    # Simulate target states - in a real environment, these would be defined externally
+    # Here we create synthetic targets based on a simple function of the states
+    target_direction = torch.ones(state_dim, device=device) / math.sqrt(state_dim)
+    state_projections = torch.matmul(states, target_direction)
+    
+    # Calculate how well the actions align with moving toward target direction
+    action_alignment = torch.zeros(batch_size, device=device)
+    if action_dim >= 2:
+        # For multi-dimensional actions, calculate alignment with target direction
+        # Extract a subset of the state to determine the desired action direction
+        state_subset = states[:, :min(state_dim, action_dim)]
+        desired_action_direction = torch.nn.functional.normalize(state_subset, dim=1)
+        normalized_actions = torch.nn.functional.normalize(actions, dim=1)
+        # Cosine similarity between action and desired direction
+        action_alignment = torch.sum(normalized_actions * desired_action_direction[:, :action_dim], dim=1)
+    
+    # Goal reward component - higher for actions that align with target direction
+    goal_rewards = 2.0 * action_alignment + 0.5 * torch.tanh(state_projections)
+    
+    # 2. Energy efficiency rewards - penalize high-magnitude actions
+    action_magnitude = torch.norm(actions, dim=1)
+    energy_penalty = -0.1 * torch.square(action_magnitude)
+    
+    # 3. Smoothness rewards - simulate by comparing to "previous" actions
+    # Since we don't have actual previous actions, we'll create a proxy using state information
+    proxy_prev_actions = torch.tanh(states[:, :action_dim] * 0.1)
+    action_diff = torch.norm(actions - proxy_prev_actions, dim=1)
+    smoothness_reward = 0.2 * torch.exp(-2.0 * action_diff)
+    
+    # 4. Exploration bonus - reward exploring less-visited regions of state space
+    # Simulate a density estimate using random projections of the state
+    num_projections = 5
+    projection_dims = min(10, state_dim)
+    projections = torch.randn(num_projections, state_dim, projection_dims, device=device)
+    projected_states = torch.stack([torch.matmul(states, proj) for proj in projections])
+    
+    # Quantize projected states to create "visitation buckets"
+    quantized = torch.floor(projected_states * 2.0) / 2.0
+    
+    # Calculate "novelty" as an inverse function of an approximate density
+    state_encodings = torch.cat([q.view(batch_size, -1) for q in quantized], dim=1)
+    # Use self-similarity as a proxy for density
+    similarities = torch.matmul(state_encodings, state_encodings.t())
+    density_estimates = torch.sum(torch.exp(-0.1 * torch.abs(similarities)), dim=1) / batch_size
+    exploration_bonus = 0.1 * (1.0 / (density_estimates + 0.1))
+    
+    # 5. Task-specific rewards
+    # Simulate some task-specific reward conditions based on state features
+    # For example, in control tasks, being close to center might be good
+    state_balance = -0.2 * torch.mean(torch.abs(states), dim=1)  # Reward being close to origin
+    
+    # Add a penalty for actions that are too extreme in either direction
+    boundary_penalty = -0.3 * torch.sum(torch.relu(torch.abs(actions) - 0.8), dim=1)
+    
+    # Combine all reward components
+    rewards = (
+        goal_rewards +
+        energy_penalty +
+        smoothness_reward +
+        exploration_bonus +
+        state_balance +
+        boundary_penalty
+    )
+    
+    # Add some small Gaussian noise to make rewards more realistic
+    noise = 0.05 * torch.randn_like(rewards)
+    rewards += noise
+    
+    # Optional: Additional reward shaping for specific states or actions
+    # For instance, we could add extra rewards for actions that keep the agent balanced
+    state_volatility = torch.std(states, dim=1)
+    volatility_reward = 0.1 * torch.exp(-2.0 * state_volatility)
+    rewards += volatility_reward
+    
+    return rewards
+
+def batch_realistic_reward_model(states: torch.Tensor, actions: torch.Tensor, step_indices: torch.Tensor = None) -> Dict[str, torch.Tensor]:
+    """
+    Batched version of the realistic reward model that provides extended reward information.
+    
+    Args:
+        states: Tensor of shape [batch_size, state_dim]
+        actions: Tensor of shape [batch_size, action_dim]
+        step_indices: Optional tensor of shape [batch_size] containing step indices for time-dependent rewards
+    
+    Returns:
+        Dictionary containing:
+            'total_rewards': Overall rewards tensor [batch_size]
+            'goal_rewards': Goal-oriented reward component
+            'energy_rewards': Energy efficiency component
+            'smoothness_rewards': Action smoothness component
+            'exploration_rewards': Exploration bonus component
+            'task_rewards': Task-specific rewards
+    """
+    # Calculate basic rewards
+    base_rewards = realistic_reward_model(states, actions)
+    
+    # For demonstration, break down into components
+    batch_size = states.size(0)
+    state_dim = states.size(1)
+    action_dim = actions.size(1)
+    device = states.device
+    
+    # Calculate each component separately for reporting
+    # Goal-oriented rewards
+    target_direction = torch.ones(state_dim, device=device) / math.sqrt(state_dim)
+    state_projections = torch.matmul(states, target_direction)
+    
+    action_alignment = torch.zeros(batch_size, device=device)
+    if action_dim >= 2:
+        state_subset = states[:, :min(state_dim, action_dim)]
+        desired_action_direction = torch.nn.functional.normalize(state_subset, dim=1)
+        normalized_actions = torch.nn.functional.normalize(actions, dim=1)
+        action_alignment = torch.sum(normalized_actions * desired_action_direction[:, :action_dim], dim=1)
+    
+    goal_rewards = 2.0 * action_alignment + 0.5 * torch.tanh(state_projections)
+    
+    # Energy efficiency
+    action_magnitude = torch.norm(actions, dim=1)
+    energy_rewards = -0.1 * torch.square(action_magnitude)
+    
+    # Smoothness
+    proxy_prev_actions = torch.tanh(states[:, :action_dim] * 0.1)
+    action_diff = torch.norm(actions - proxy_prev_actions, dim=1)
+    smoothness_rewards = 0.2 * torch.exp(-2.0 * action_diff)
+    
+    # Exploration bonus (simplified for reporting)
+    state_hash = torch.sum(torch.sin(states * 5.0), dim=1)
+    exploration_rewards = 0.1 * torch.cos(state_hash * 3.0)
+    
+    # Task-specific rewards
+    state_balance = -0.2 * torch.mean(torch.abs(states), dim=1)
+    boundary_penalty = -0.3 * torch.sum(torch.relu(torch.abs(actions) - 0.8), dim=1)
+    task_rewards = state_balance + boundary_penalty
+    
+    # Add time-dependent rewards if step indices are provided
+    time_rewards = torch.zeros_like(base_rewards)
+    if step_indices is not None:
+        # Example: Rewards that decay over time to encourage quick task completion
+        time_factor = torch.exp(-0.05 * step_indices.float())
+        time_rewards = 0.5 * time_factor
+    
+    # Return all reward components
+    return {
+        'total_rewards': base_rewards,
+        'goal_rewards': goal_rewards,
+        'energy_rewards': energy_rewards,
+        'smoothness_rewards': smoothness_rewards,
+        'exploration_rewards': exploration_rewards,
+        'task_rewards': task_rewards,
+        'time_rewards': time_rewards
+    }
+
+##############################################
+# Core Attention Components
 ##############################################
 
 class LowRankLinear(nn.Module):
@@ -317,6 +557,149 @@ class FastAttentionEncoderLayer(nn.Module):
 
 ##############################################
 # Policy Network
+##############################################
+
+class PolicyNetworkWithAttention(nn.Module):
+    """Policy network that integrates FastAttention for state processing."""
+    
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256,
+                 attention_config: Optional[FastAttentionConfig] = None,
+                 seq_len: int = 1):
+        super().__init__()
+        self.seq_len = seq_len
+        self.attention = FastAttentionEncoderLayer(attention_config) if attention_config else None
+        self.effective_state_dim = attention_config.d_model if self.attention else state_dim
+        
+        # State encoder if needed to match attention dimensions
+        if attention_config and state_dim != attention_config.d_model:
+            self.state_encoder = nn.Linear(state_dim, attention_config.d_model)
+        else:
+            self.state_encoder = None
+        
+        # MLP for policy outputs
+        self.net = nn.Sequential(
+            nn.Linear(self.effective_state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 2 * action_dim)  # mean, log_std
+        )
+        
+        # Value network head
+        self.value_net = nn.Sequential(
+            nn.Linear(self.effective_state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+    def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Forward pass for both policy and value network.
+        
+        Args:
+            state: State tensor of shape [batch_size, state_dim] or [batch_size, seq_len, state_dim]
+            
+        Returns:
+            mean: Action mean
+            std: Action standard deviation
+            value: State value estimate
+        """
+        if self.attention:
+            # Process state as sequence
+            if len(state.shape) == 2:
+                batch_size = state.size(0)
+                state = state.view(batch_size // self.seq_len, self.seq_len, -1)
+                
+            # Encode state if needed
+            if self.state_encoder:
+                state = self.state_encoder(state)
+                
+            # Apply attention
+            state_features = self.attention(state)
+            state_features = state_features.mean(dim=1)  # [batch, d_model]
+        else:
+            # Use raw state features
+            if len(state.shape) == 3:
+                state_features = state.mean(dim=1)
+            else:
+                state_features = state
+        
+        # Policy head
+        policy_out = self.net(state_features)
+        mean, log_std = torch.chunk(policy_out, 2, dim=-1)
+        log_std = torch.clamp(log_std, -20, 2)  # Limit std range for stability
+        std = log_std.exp()
+        
+        # Value head
+        value = self.value_net(state_features)
+        
+        return mean, std, value
+
+    def get_action(self, state: torch.Tensor, deterministic: bool = False) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+        """
+        Sample action from the policy distribution.
+        
+        Args:
+            state: State tensor
+            deterministic: Whether to return deterministic action (mean) or stochastic
+            
+        Returns:
+            action: Sampled action
+            log_prob: Log probability of the action
+            info: Dictionary with additional info (mean, std, entropy, value)
+        """
+        with torch.no_grad():
+            mean, std, value = self.forward(state)
+            
+            if deterministic:
+                action = mean
+                normal_dist = Normal(mean, std)
+                log_prob = normal_dist.log_prob(action).sum(dim=-1)
+            else:
+                normal_dist = Normal(mean, std)
+                action = normal_dist.rsample()  # Reparameterization trick
+                log_prob = normal_dist.log_prob(action).sum(dim=-1)
+                
+            entropy = normal_dist.entropy().sum(dim=-1)
+            
+            info = {
+                "mean": mean,
+                "std": std,
+                "value": value.squeeze(-1),
+                "entropy": entropy
+            }
+            
+            return action, log_prob, info
+
+##############################################
+# Memory Buffer
+##############################################
+
+class RolloutBuffer:
+    """Buffer to store trajectories collected during training."""
+    
+    def __init__(self, config: TrainingConfig):
+        self.state_dim = config.state_dim
+        self.action_dim = config.action_dim
+        self.seq_len = config.seq_len
+        self.max_size = config.num_samples
+        self.device = config.device
+        
+        # Initialize buffers
+        self.reset()
+        
+    def reset(self):
+        """Reset buffer."""
+        self.states = []
+        self.actions = []
+        self.rewards = []　# Very important: consider consolidation.
+        self.
+
+
+##############################################
+# Policy Network　# ReCall：Very important: consider consolidation.
 ##############################################
 
 class PolicyNetworkWithAttention(nn.Module):
