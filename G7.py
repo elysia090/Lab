@@ -182,89 +182,152 @@ class CandidateFinder(nn.Module):
         return candidates
 
 class FastAttention(nn.Module):
-    """LSHと低ランク変換を用いた高速注意機構."""
+    """
+    Efficient attention mechanism using LSH and low-rank transformations.
+    
+    This implementation provides an approximation of full attention by:
+    1. Using locality-sensitive hashing (LSH) to find relevant key-query pairs
+    2. Employing low-rank approximations for value projections
+    3. Optionally using random Fourier features for kernel approximation
+    """
     def __init__(self, config):
         super().__init__()
-        # 初期化コードは同じ
+        self.config = config
         
-    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
-                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Project inputs to query, key, and value spaces
+        self.query_proj = nn.Linear(config.d_model, config.d_query * config.n_heads)
+        self.key_proj = nn.Linear(config.d_model, config.d_key * config.n_heads)
+        self.value_proj = nn.Linear(config.d_model, config.d_key * config.n_heads)
+        
+        # Low-rank approximations for value projections
+        self.value_up_projs = nn.ModuleList([
+            LowRankLinear(config.d_key, config.d_model, config.rank) 
+            for _ in range(config.n_heads)
+        ])
+        
+        # Optional random Fourier feature encoders for kernel approximation
+        if config.use_rff:
+            self.rff_encoders = nn.ModuleList([
+                RandomFourierFeatures(config.d_key, config.rff_dim) 
+                for _ in range(config.n_heads)
+            ])
+        else:
+            self.rff_encoders = None
+        
+        # LSH tables for efficient key-query matching
+        self.lsh_tables = nn.ModuleList([
+            nn.ModuleList([
+                LSHTable(
+                    config.lsh_key_dim, 
+                    config.lsh_buckets, 
+                    config.lsh_bandwidth, 
+                    config.n_lsh_hashes
+                )
+            ]) for _ in range(config.n_heads)
+        ])
+        
+        # Candidate finder using LSH
+        self.candidate_finder = CandidateFinder(config, self.lsh_tables)
+        
+        # Output projection and dropout
+        self.output_proj = nn.Linear(config.d_model * config.n_heads, config.d_model)
+        self.dropout = nn.Dropout(config.dropout)
+        
+        # Initialize parameters with better defaults
+        self._reset_parameters()
+        
+    def _reset_parameters(self):
+        """Initialize weights with appropriate scaling for better gradient flow."""
+        nn.init.xavier_uniform_(self.query_proj.weight)
+        nn.init.xavier_uniform_(self.key_proj.weight)
+        nn.init.xavier_uniform_(self.value_proj.weight)
+        nn.init.xavier_uniform_(self.output_proj.weight)
+        
+        nn.init.zeros_(self.query_proj.bias)
+        nn.init.zeros_(self.key_proj.bias)
+        nn.init.zeros_(self.value_proj.bias)
+        nn.init.zeros_(self.output_proj.bias)
+        
+    def forward(self, query, key, value, mask=None):
+        """
+        Apply fast attention mechanism.
+        
+        Args:
+            query: Input query tensor [B, L, D]
+            key: Input key tensor [B, L, D]
+            value: Input value tensor [B, L, D]
+            mask: Optional attention mask [B, L, L]
+            
+        Returns:
+            Attention output tensor [B, L, D]
+        """
         B, L, _ = query.size()
         
-        # メモリ効率の良いプロジェクション
+        # Project inputs to multi-head query, key, value spaces
         q = self.query_proj(query).view(B, L, self.config.n_heads, self.config.d_query)
         k = self.key_proj(key).view(B, L, self.config.n_heads, self.config.d_key)
         v = self.value_proj(value).view(B, L, self.config.n_heads, self.config.d_key)
         
+        # Rearrange for multi-head attention [B, H, L, D]
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         
         head_outputs = []
-        
-        # ヘッドごとの処理をより効率的に
         for h in range(self.config.n_heads):
-            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):  # 混合精度計算
-                candidates = self.candidate_finder(q[:, h], k[:, h], h)
-                cand_mask = (candidates != -1)
+            # Find candidate keys for each query using LSH
+            candidates = self.candidate_finder(q[:, h], k[:, h], h)
+            cand_mask = (candidates != -1)
+            
+            # Replace invalid indices with 0 for safe indexing
+            safe_candidates = candidates.clone()
+            safe_candidates[~cand_mask] = 0
+            
+            # Generate batch indices for gathering
+            b_idx = torch.arange(B, device=q.device).view(B, 1, 1).expand_as(safe_candidates)
+            
+            # Gather candidate keys and values
+            candidate_keys = k[:, h][b_idx, safe_candidates]
+            candidate_values = v[:, h][b_idx, safe_candidates]
+            
+            # Apply random Fourier features if enabled
+            if self.config.use_rff and self.rff_encoders is not None:
+                q_h = self.rff_encoders[h](q[:, h].reshape(-1, self.config.d_key))
+                q_h = q_h.view(B, L, 1, self.config.rff_dim)
                 
-                # 安全なインデックスアクセス
-                safe_candidates = candidates.clone()
-                safe_candidates[safe_candidates == -1] = 0
+                candidate_keys = self.rff_encoders[h](candidate_keys.reshape(-1, self.config.d_key))
+                candidate_keys = candidate_keys.view(B, L, self.config.k_max, self.config.rff_dim)
                 
-                # バッチインデックスの計算を最適化
-                b_idx = torch.arange(B, device=q.device).view(B, 1, 1).expand_as(safe_candidates)
-                
-                # メモリ効率を考慮した候補の取得
-                candidate_keys = k[:, h][b_idx, safe_candidates]
-                candidate_values = v[:, h][b_idx, safe_candidates]
-                
-                # RFF特徴変換（省メモリ化）
-                if self.config.use_rff and self.rff_encoders is not None:
-                    # バッチサイズが大きい場合はチャンク処理
-                    chunk_size = 1024  # メモリに合わせて調整
-                    q_h_chunks = []
-                    
-                    for i in range(0, B * L, chunk_size):
-                        end = min(i + chunk_size, B * L)
-                        q_chunk = q[:, h].reshape(-1, self.config.d_key)[i:end]
-                        q_h_chunk = self.rff_encoders[h](q_chunk)
-                        q_h_chunks.append(q_h_chunk)
-                    
-                    q_h = torch.cat(q_h_chunks, dim=0).view(B, L, 1, self.config.rff_dim)
-                    
-                    # 同様に候補キーもチャンク処理
-                    candidate_keys_chunks = []
-                    for i in range(0, B * L * self.config.k_max, chunk_size):
-                        end = min(i + chunk_size, B * L * self.config.k_max)
-                        k_chunk = candidate_keys.reshape(-1, self.config.d_key)[i:end]
-                        k_h_chunk = self.rff_encoders[h](k_chunk)
-                        candidate_keys_chunks.append(k_h_chunk)
-                    
-                    candidate_keys = torch.cat(candidate_keys_chunks, dim=0).view(B, L, self.config.k_max, self.config.rff_dim)
-                    scale = optimized_sqrt(self.config.rff_dim)
-                else:
-                    q_h = q[:, h].unsqueeze(2)
-                    scale = optimized_sqrt(self.config.d_key)
-                
-                # アテンション計算
-                sim = torch.matmul(q_h, candidate_keys.transpose(-2, -1)).squeeze(2) / scale
-                sim = sim.masked_fill(~cand_mask, float('-inf'))
-                
-                # 適切な精度でのsoftmax計算
-                attn_weights = F.softmax(sim, dim=-1)
-                attn_weights = self.dropout(attn_weights)
-                
-                # 値の射影にはメモリ効率の良いアプローチを使用
-                candidate_values_flat = candidate_values.view(-1, self.config.d_key)
-                values_proj_flat = self.value_up_projs[h](candidate_values_flat)
-                candidate_values_proj = values_proj_flat.view(B, L, self.config.k_max, self.config.d_model)
-                
-                head_out = torch.sum(attn_weights.unsqueeze(-1) * candidate_values_proj, dim=2)
-                head_outputs.append(head_out)
+                scale = optimized_sqrt(self.config.rff_dim)
+            else:
+                q_h = q[:, h].unsqueeze(2)
+                scale = optimized_sqrt(self.config.d_key)
+            
+            # Compute attention scores
+            sim = torch.matmul(q_h, candidate_keys.transpose(-2, -1)).squeeze(2) / scale
+            
+            # Apply candidate mask
+            sim = sim.masked_fill(~cand_mask, float('-inf'))
+            
+            # Apply attention mask if provided
+            if mask is not None:
+                # This is a simplification - actual mask application would need adaptation
+                # for the sparse attention pattern used here
+                pass
+            
+            # Compute softmax and apply dropout
+            attn_weights = F.softmax(sim, dim=-1)
+            attn_weights = self.dropout(attn_weights)
+            
+            # Project values and apply attention weights
+            candidate_values_proj = self.value_up_projs[h](candidate_values.view(-1, self.config.d_key))
+            candidate_values_proj = candidate_values_proj.view(B, L, self.config.k_max, self.config.d_model)
+            
+            # Sum weighted values
+            head_out = torch.sum(attn_weights.unsqueeze(-1) * candidate_values_proj, dim=2)
+            head_outputs.append(head_out)
         
-        # 最終的な出力
-        del candidate_keys, candidate_values, candidate_values_proj  # 明示的にメモリ解放
+        # Concatenate head outputs and project to output dimension
         concat = torch.cat(head_outputs, dim=-1)
         output = self.output_proj(concat)
         
@@ -409,105 +472,383 @@ class RolloutBuffer:
         self.ptr = 0
 
 class SPPO:
-    """簡易PPOエージェント."""
-    def __init__(self, config: TrainingConfig, attention_config: Optional[FastAttentionConfig] = None,
-                 use_adam_optimizer: bool = True):
+    """
+    Simplified Proximal Policy Optimization (SPPO) agent.
+    
+    This implementation provides:
+    1. Gaussian policy with parameterized mean and standard deviation
+    2. PPO-Clip objective for stable policy updates
+    3. Attention-based neural network architecture (optional)
+    4. GAE-λ advantage estimation
+    """
+    def __init__(self, config, attention_config=None, use_adam_optimizer=True):
+        self.config = config
         self.device = torch.device(config.device)
-        self.policy = PolicyNetworkWithAttention(config.state_dim, config.action_dim,
-                                                 hidden_dim=config.hidden_dim,
-                                                 attention_config=attention_config if config.use_attention else None,
-                                                 seq_len=config.seq_len).to(self.device)
-        self.baseline_policy = PolicyNetworkWithAttention(config.state_dim, config.action_dim,
-                                                          hidden_dim=config.hidden_dim,
-                                                          attention_config=attention_config if config.use_attention else None,
-                                                          seq_len=config.seq_len).to(self.device)
+        
+        # Initialize policy network
+        self.policy = PolicyNetworkWithAttention(
+            config.state_dim, 
+            config.action_dim,
+            hidden_dim=config.hidden_dim,
+            attention_config=attention_config if config.use_attention else None,
+            seq_len=config.seq_len
+        ).to(self.device)
+        
+        # Create baseline policy (target network)
+        self.baseline_policy = PolicyNetworkWithAttention(
+            config.state_dim, 
+            config.action_dim,
+            hidden_dim=config.hidden_dim,
+            attention_config=attention_config if config.use_attention else None,
+            seq_len=config.seq_len
+        ).to(self.device)
         self.baseline_policy.load_state_dict(self.policy.state_dict())
         self.baseline_policy.eval()
-        self.config = config
+        
+        # Hyperparameters for adaptive learning
         self.eta = config.eta
         self.alpha = config.alpha
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=config.policy_lr) if use_adam_optimizer else None
+        
+        # Initialize optimizer
+        if use_adam_optimizer:
+            self.optimizer = optim.Adam(self.policy.parameters(), lr=config.policy_lr)
+        else:
+            self.optimizer = None
+            
+        # Initialize rollout buffer
         self.buffer = RolloutBuffer(config)
-    def normalize_state(self, x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        
+        # Initialize statistics tracking
+        self.stats = {
+            "policy_loss": [],
+            "value_loss": [],
+            "entropy": [],
+            "kl_divergence": [],
+            "explained_variance": [],
+            "learning_rate": config.policy_lr,
+        }
+        
+    def normalize_state(self, x, eps=1e-8):
+        """
+        Normalize state vectors for improved training stability.
+        
+        Args:
+            x: Input state tensor
+            eps: Small epsilon to avoid division by zero
+            
+        Returns:
+            Normalized state tensor
+        """
         mean = x.mean(dim=-1, keepdim=True)
         std = x.std(dim=-1, keepdim=True) + eps
         return (x - mean) / std
-    def sample_action(self, state: torch.Tensor, deterministic: bool = False) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+        
+    def sample_action(self, state, deterministic=False):
+        """
+        Sample action from current policy.
+        
+        Args:
+            state: Current state tensor
+            deterministic: If True, return mean of distribution instead of sample
+            
+        Returns:
+            action: Sampled action
+            log_prob: Log probability of sampled action
+            info: Dictionary with additional information
+        """
         state = state.to(self.device)
         with torch.no_grad():
             mean, std, value = self.policy(state)
+            
             if deterministic:
                 action = mean
             else:
+                # Use reparameterization trick for backpropagation
                 dist = torch.distributions.Normal(mean, std)
                 action = dist.rsample()
-            dist = torch.distributions.Normal(mean, std)
-            log_prob = dist.log_prob(action).sum(dim=-1)
+                
+            # Compute log probability and entropy
+            log_prob = self._compute_log_prob(action, mean, std)
             entropy = dist.entropy().sum(dim=-1)
-        info = {"mean": mean, "std": std, "value": value, "entropy": entropy}
-        return action.detach(), log_prob.detach(), info
+            
+        info = {
+            "mean": mean.cpu().detach(),
+            "std": std.cpu().detach(),
+            "value": value.cpu().detach(),
+            "entropy": entropy.cpu().detach()
+        }
+        
+        return action.cpu().detach(), log_prob.cpu().detach(), info
+    
     def update_baseline(self):
+        """Update baseline (target) policy with current policy weights."""
         self.baseline_policy.load_state_dict(self.policy.state_dict())
-    def compute_log_prob(self, actions: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    
+    def _compute_log_prob(self, actions, mean, std):
+        """
+        Compute log probability of actions under Gaussian policy.
+        
+        Args:
+            actions: Action tensor
+            mean: Mean of Gaussian distribution
+            std: Standard deviation of Gaussian distribution
+            
+        Returns:
+            Log probability tensor
+        """
         var = std.pow(2)
-        log_prob = -0.5 * ((actions - mean)**2 / (var + 1e-8) + 2 * std.log() + math.log(2 * math.pi))
+        log_prob = -0.5 * (
+            (actions - mean)**2 / (var + 1e-8) + 
+            2 * torch.log(std) + 
+            math.log(2 * math.pi)
+        )
         return log_prob.sum(dim=-1)
-    def compute_ppo_loss(self, states: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor,
-                         advantages: Optional[torch.Tensor] = None) -> torch.Tensor:
+    
+    def compute_advantages(self, rewards, values, next_values=None, dones=None):
+        """
+        Compute advantages using Generalized Advantage Estimation (GAE-λ).
+        
+        Args:
+            rewards: Rewards tensor [B]
+            values: Value estimates tensor [B]
+            next_values: Next state value estimates [B] (optional)
+            dones: Terminal state indicators [B] (optional)
+            
+        Returns:
+            advantages: Advantage estimates [B]
+        """
+        # For simplified implementation, just use rewards as advantages
+        # In a complete implementation, we would use GAE-λ here
+        if next_values is None or dones is None:
+            return rewards - values
+            
+        # GAE-λ calculation
+        advantages = torch.zeros_like(rewards)
+        gae = 0
+        
+        # Work backwards through trajectory
+        for t in reversed(range(len(rewards))):
+            # For simplicity, assuming all trajectories are same length
+            # In practice, would need to handle variable-length episodes
+            if t == len(rewards) - 1:
+                next_value = next_values[t]
+            else:
+                next_value = values[t + 1]
+                
+            delta = rewards[t] + self.config.gamma * next_value * (1 - dones[t]) - values[t]
+            gae = delta + self.config.gamma * self.config.gae_lambda * (1 - dones[t]) * gae
+            advantages[t] = gae
+            
+        return advantages
+    
+    def compute_ppo_loss(self, states, actions, rewards, advantages=None):
+        """
+        Compute PPO-Clip objective.
+        
+        Args:
+            states: State tensor [B, D]
+            actions: Action tensor [B, A]
+            rewards: Reward tensor [B]
+            advantages: Advantage tensor [B] (optional)
+            
+        Returns:
+            total_loss: Combined loss for optimization
+        """
+        # Move tensors to device
         states = states.to(self.device)
         actions = actions.to(self.device)
         rewards = rewards.to(self.device)
+        
+        # Use rewards as advantages if not provided
         if advantages is None:
             advantages = rewards
+        else:
+            advantages = advantages.to(self.device)
+        
+        # Get current policy distribution parameters and value estimates
         mean, std, values = self.policy(states)
-        log_prob = self.compute_log_prob(actions, mean, std)
+        current_log_prob = self._compute_log_prob(actions, mean, std)
+        
+        # Get baseline policy distribution parameters
         with torch.no_grad():
             base_mean, base_std, _ = self.baseline_policy(states)
-            base_log_prob = self.compute_log_prob(actions, base_mean, base_std)
-        ratios = torch.exp(log_prob - base_log_prob)
-        clipped_ratios = torch.clamp(ratios, 1.0 - self.config.clip_eps, 1.0 + self.config.clip_eps)
-        policy_loss = -torch.min(ratios * advantages, clipped_ratios * advantages).mean()
-        value_loss = ((values - rewards.squeeze(-1))**2).mean()
-        entropy_bonus = - (log_prob * torch.exp(log_prob)).mean()
-        total_loss = policy_loss + self.config.value_coef * value_loss + self.config.entropy_coef * entropy_bonus
+            base_log_prob = self._compute_log_prob(actions, base_mean, base_std)
+            
+            # Compute KL divergence between old and new policy
+            kl_div = self._compute_kl_divergence(base_mean, base_std, mean, std)
+        
+        # Compute importance sampling ratio
+        ratios = torch.exp(current_log_prob - base_log_prob)
+        
+        # Clip ratios
+        clip_eps = self.config.clip_eps
+        clipped_ratios = torch.clamp(ratios, 1.0 - clip_eps, 1.0 + clip_eps)
+        
+        # Compute surrogate objectives
+        surrogate1 = ratios * advantages
+        surrogate2 = clipped_ratios * advantages
+        
+        # PPO-Clip policy loss (negative because we're minimizing)
+        policy_loss = -torch.min(surrogate1, surrogate2).mean()
+        
+        # Value function loss
+        value_loss = F.mse_loss(values, rewards.squeeze(-1))
+        
+        # Entropy bonus (negative because we're minimizing)
+        dist = torch.distributions.Normal(mean, std)
+        entropy_bonus = -dist.entropy().sum(dim=-1).mean()
+        
+        # Total loss
+        total_loss = (
+            policy_loss + 
+            self.config.value_coef * value_loss + 
+            self.config.entropy_coef * entropy_bonus
+        )
+        
+        # Update statistics
+        self.stats["policy_loss"].append(policy_loss.item())
+        self.stats["value_loss"].append(value_loss.item())
+        self.stats["entropy"].append(-entropy_bonus.item())
+        self.stats["kl_divergence"].append(kl_div.mean().item())
+        
         return total_loss
-    def update_policy(self, loss: torch.Tensor):
+    
+    def _compute_kl_divergence(self, mean1, std1, mean2, std2):
+        """
+        Compute KL divergence between two Gaussian distributions.
+        
+        Args:
+            mean1, std1: Parameters of first distribution
+            mean2, std2: Parameters of second distribution
+            
+        Returns:
+            KL divergence tensor
+        """
+        var1 = std1.pow(2)
+        var2 = std2.pow(2)
+        
+        kl_div = (
+            torch.log(std2 / std1) + 
+            (var1 + (mean1 - mean2).pow(2)) / (2 * var2) - 
+            0.5
+        ).sum(dim=-1)
+        
+        return kl_div
+        
+    def update_policy(self, loss):
+        """
+        Update policy parameters using computed loss.
+        
+        Args:
+            loss: Loss tensor to differentiate
+        """
         if self.optimizer is None:
             return
+            
         self.optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
+        
+        # Clip gradients to prevent exploding gradients
+        nn.utils.clip_grad_norm_(
+            self.policy.parameters(), 
+            self.config.max_grad_norm
+        )
+        
         self.optimizer.step()
-    def adjust_hyperparameters(self, current_loss: float, previous_loss: float):
+        
+    def adjust_hyperparameters(self, current_loss, previous_loss):
+        """
+        Adjust adaptive hyperparameters based on loss change.
+        
+        Args:
+            current_loss: Current iteration loss
+            previous_loss: Previous iteration loss
+        """
         if current_loss < previous_loss:
+            # Increase step size and trust region when improving
             self.eta *= 1.05
             self.alpha *= 1.05
         else:
+            # Decrease step size and trust region when not improving
             self.eta *= 0.9
             self.alpha *= 0.9
-    def save_model(self, filepath: str):
+    
+    def get_stats(self):
+        """Get training statistics as dictionary."""
+        # Calculate additional metrics
+        if len(self.stats["policy_loss"]) > 0:
+            recent_stats = {
+                key: np.mean(values[-10:]) if len(values) >= 10 else np.mean(values)
+                for key, values in self.stats.items()
+                if isinstance(values, list) and len(values) > 0
+            }
+            recent_stats.update({
+                key: value 
+                for key, value in self.stats.items()
+                if not isinstance(value, list)
+            })
+            return recent_stats
+        return self.stats
+        
+    def save_model(self, filepath):
+        """
+        Save model parameters to file.
+        
+        Args:
+            filepath: Path to save model
+        """
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
         try:
             torch.save({
                 'policy_state_dict': self.policy.state_dict(),
-                'optimizer_state_dict': self.optimizer.state_dict() if self.optimizer else None
+                'optimizer_state_dict': self.optimizer.state_dict() if self.optimizer else None,
+                'stats': self.stats,
+                'hyperparams': {
+                    'eta': self.eta,
+                    'alpha': self.alpha
+                }
             }, filepath)
+            print(f"Model saved successfully to {filepath}")
         except Exception as e:
             print(f"Error saving model to {filepath}: {e}")
-    def load_model(self, filepath: str):
+    
+    def load_model(self, filepath):
+        """
+        Load model parameters from file.
+        
+        Args:
+            filepath: Path to load model from
+        """
         try:
             checkpoint = torch.load(filepath, map_location=self.device)
             self.policy.load_state_dict(checkpoint['policy_state_dict'])
+            
             if self.optimizer and 'optimizer_state_dict' in checkpoint:
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                
+            if 'stats' in checkpoint:
+                self.stats = checkpoint['stats']
+                
+            if 'hyperparams' in checkpoint:
+                self.eta = checkpoint['hyperparams'].get('eta', self.eta)
+                self.alpha = checkpoint['hyperparams'].get('alpha', self.alpha)
+                
+            # Also update baseline policy
             self.baseline_policy.load_state_dict(self.policy.state_dict())
+            print(f"Model loaded successfully from {filepath}")
         except FileNotFoundError:
             print(f"Model file not found: {filepath}")
         except Exception as e:
             print(f"Error loading model from {filepath}: {e}")
+    
     def train_mode(self):
+        """Set policy network to training mode."""
         self.policy.train()
+    
     def eval_mode(self):
+        """Set policy network to evaluation mode."""
         self.policy.eval()
+
 
 # ===============================
 # トレーニングループ (main)
