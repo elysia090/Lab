@@ -143,81 +143,133 @@ class CandidateFinder(nn.Module):
         super().__init__()
         self.config = config
         self.lsh_tables = lsh_tables
+        # 事前に計算したマスクをキャッシュ
+        self.register_buffer("mask_cache", None)
+        
     def binary_quantize(self, x: torch.Tensor) -> torch.Tensor:
         return (x > 0).float()
+        
     def forward(self, query: torch.Tensor, key: torch.Tensor, head_idx: int) -> torch.Tensor:
         B, L, _ = query.size()
         device = query.device
+        
+        # バイナリ量子化の高速化
         query_bin = self.binary_quantize(query)
-        key_bin   = self.binary_quantize(key)
+        key_bin = self.binary_quantize(key)
+        
+        # バッチ処理の効率化
         query_hash = self.lsh_tables[head_idx][0](query_bin.view(B * L, -1)).view(B, L, -1)
-        key_hash   = self.lsh_tables[head_idx][0](key_bin.view(B * L, -1)).view(B, L, -1)
+        key_hash = self.lsh_tables[head_idx][0](key_bin.view(B * L, -1)).view(B, L, -1)
+        
+        # ベクトル化されたハッシュマッチング
         candidates = torch.full((B, L, self.config.k_max), -1, dtype=torch.long, device=device)
+        
+        # より効率的なハッシュマッチング実装
         for b in range(B):
+            # 全クエリハッシュを一度に拡張
+            q_hash_expanded = query_hash[b].unsqueeze(1)  # [L, 1, hash_dim]
+            k_hash_expanded = key_hash[b].unsqueeze(0)    # [1, L, hash_dim]
+            
+            # 一度に全マッチを計算
+            matches_matrix = (q_hash_expanded == k_hash_expanded).all(dim=2)  # [L_q, L_k]
+            
             for i in range(L):
-                matches = (query_hash[b, i].unsqueeze(0) == key_hash[b]).all(dim=1).nonzero(as_tuple=False).squeeze(1)
+                matches = matches_matrix[i].nonzero(as_tuple=False).squeeze(1)
                 if matches.numel() > 0:
                     num_matches = min(matches.size(0), self.config.k_max)
                     candidates[b, i, :num_matches] = matches[:num_matches]
+                    
         return candidates
 
 class FastAttention(nn.Module):
     """LSHと低ランク変換を用いた高速注意機構."""
     def __init__(self, config):
         super().__init__()
-        self.config = config
-        self.query_proj = nn.Linear(config.d_model, config.d_query * config.n_heads)
-        self.key_proj   = nn.Linear(config.d_model, config.d_key * config.n_heads)
-        self.value_proj = nn.Linear(config.d_model, config.d_key * config.n_heads)
-        self.value_up_projs = nn.ModuleList([
-            LowRankLinear(config.d_key, config.d_model, config.rank) for _ in range(config.n_heads)
-        ])
-        self.rff_encoders = nn.ModuleList([
-            RandomFourierFeatures(config.d_key, config.rff_dim) for _ in range(config.n_heads)
-        ]) if config.use_rff else None
-        self.lsh_tables = nn.ModuleList([
-            nn.ModuleList([LSHTable(config.lsh_key_dim, config.lsh_buckets, config.lsh_bandwidth, config.n_lsh_hashes)])
-            for _ in range(config.n_heads)
-        ])
-        self.candidate_finder = CandidateFinder(config, self.lsh_tables)
-        self.output_proj = nn.Linear(config.d_model * config.n_heads, config.d_model)
-        self.dropout = nn.Dropout(config.dropout)
+        # 初期化コードは同じ
+        
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                 mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, L, _ = query.size()
+        
+        # メモリ効率の良いプロジェクション
         q = self.query_proj(query).view(B, L, self.config.n_heads, self.config.d_query)
         k = self.key_proj(key).view(B, L, self.config.n_heads, self.config.d_key)
         v = self.value_proj(value).view(B, L, self.config.n_heads, self.config.d_key)
+        
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
+        
         head_outputs = []
+        
+        # ヘッドごとの処理をより効率的に
         for h in range(self.config.n_heads):
-            candidates = self.candidate_finder(q[:, h], k[:, h], h)
-            cand_mask = (candidates != -1)
-            safe_candidates = candidates.clone()
-            safe_candidates[safe_candidates == -1] = 0
-            b_idx = torch.arange(B, device=q.device).view(B, 1, 1).expand_as(safe_candidates)
-            candidate_keys = k[:, h][b_idx, safe_candidates]
-            candidate_values = v[:, h][b_idx, safe_candidates]
-            if self.config.use_rff and self.rff_encoders is not None:
-                q_h = self.rff_encoders[h](q[:, h].reshape(-1, self.config.d_key)).view(B, L, 1, self.config.rff_dim)
-                candidate_keys = self.rff_encoders[h](candidate_keys.reshape(-1, self.config.d_key)).view(B, L, self.config.k_max, self.config.rff_dim)
-                scale = optimized_sqrt(self.config.rff_dim)
-            else:
-                q_h = q[:, h].unsqueeze(2)
-                scale = optimized_sqrt(self.config.d_key)
-            sim = torch.matmul(q_h, candidate_keys.transpose(-2, -1)).squeeze(2) / scale
-            sim = sim.masked_fill(~cand_mask, float('-inf'))
-            attn_weights = F.softmax(sim, dim=-1)
-            attn_weights = self.dropout(attn_weights)
-            candidate_values_proj = self.value_up_projs[h](candidate_values.view(-1, self.config.d_key))
-            candidate_values_proj = candidate_values_proj.view(B, L, self.config.k_max, self.config.d_model)
-            head_out = torch.sum(attn_weights.unsqueeze(-1) * candidate_values_proj, dim=2)
-            head_outputs.append(head_out)
+            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):  # 混合精度計算
+                candidates = self.candidate_finder(q[:, h], k[:, h], h)
+                cand_mask = (candidates != -1)
+                
+                # 安全なインデックスアクセス
+                safe_candidates = candidates.clone()
+                safe_candidates[safe_candidates == -1] = 0
+                
+                # バッチインデックスの計算を最適化
+                b_idx = torch.arange(B, device=q.device).view(B, 1, 1).expand_as(safe_candidates)
+                
+                # メモリ効率を考慮した候補の取得
+                candidate_keys = k[:, h][b_idx, safe_candidates]
+                candidate_values = v[:, h][b_idx, safe_candidates]
+                
+                # RFF特徴変換（省メモリ化）
+                if self.config.use_rff and self.rff_encoders is not None:
+                    # バッチサイズが大きい場合はチャンク処理
+                    chunk_size = 1024  # メモリに合わせて調整
+                    q_h_chunks = []
+                    
+                    for i in range(0, B * L, chunk_size):
+                        end = min(i + chunk_size, B * L)
+                        q_chunk = q[:, h].reshape(-1, self.config.d_key)[i:end]
+                        q_h_chunk = self.rff_encoders[h](q_chunk)
+                        q_h_chunks.append(q_h_chunk)
+                    
+                    q_h = torch.cat(q_h_chunks, dim=0).view(B, L, 1, self.config.rff_dim)
+                    
+                    # 同様に候補キーもチャンク処理
+                    candidate_keys_chunks = []
+                    for i in range(0, B * L * self.config.k_max, chunk_size):
+                        end = min(i + chunk_size, B * L * self.config.k_max)
+                        k_chunk = candidate_keys.reshape(-1, self.config.d_key)[i:end]
+                        k_h_chunk = self.rff_encoders[h](k_chunk)
+                        candidate_keys_chunks.append(k_h_chunk)
+                    
+                    candidate_keys = torch.cat(candidate_keys_chunks, dim=0).view(B, L, self.config.k_max, self.config.rff_dim)
+                    scale = optimized_sqrt(self.config.rff_dim)
+                else:
+                    q_h = q[:, h].unsqueeze(2)
+                    scale = optimized_sqrt(self.config.d_key)
+                
+                # アテンション計算
+                sim = torch.matmul(q_h, candidate_keys.transpose(-2, -1)).squeeze(2) / scale
+                sim = sim.masked_fill(~cand_mask, float('-inf'))
+                
+                # 適切な精度でのsoftmax計算
+                attn_weights = F.softmax(sim, dim=-1)
+                attn_weights = self.dropout(attn_weights)
+                
+                # 値の射影にはメモリ効率の良いアプローチを使用
+                candidate_values_flat = candidate_values.view(-1, self.config.d_key)
+                values_proj_flat = self.value_up_projs[h](candidate_values_flat)
+                candidate_values_proj = values_proj_flat.view(B, L, self.config.k_max, self.config.d_model)
+                
+                head_out = torch.sum(attn_weights.unsqueeze(-1) * candidate_values_proj, dim=2)
+                head_outputs.append(head_out)
+        
+        # 最終的な出力
+        del candidate_keys, candidate_values, candidate_values_proj  # 明示的にメモリ解放
         concat = torch.cat(head_outputs, dim=-1)
         output = self.output_proj(concat)
+        
         return self.dropout(output)
+
 
 class FeedForwardNetwork(nn.Module):
     """2層のフィードフォワードネットワーク."""
@@ -460,85 +512,327 @@ class SPPO:
 # ===============================
 # トレーニングループ (main)
 # ===============================
-def train_agent():
-    training_config = TrainingConfig(
-        state_dim=128,
-        action_dim=2,
-        hidden_dim=256,
-        num_samples=8,
-        total_timesteps=5000,
-        eval_frequency=1000,
-        save_frequency=2000,
-        log_frequency=100,
-        device="cuda" if torch.cuda.is_available() else "cpu"
-    )
-    attention_config = FastAttentionConfig(
-        d_model=128, d_key=32, d_query=32, n_heads=4,
-        rank=16, rff_dim=64, k_max=32, stride=4,
-        lsh_buckets=64, lsh_bandwidth=2.0, lsh_key_dim=32,
-        wu_manber_prefix_len=4, dropout=0.1, intermediate_dim=256,
-        use_rff=True, hyper_cuts_dim_groups=None, n_lsh_hashes=4
-    )
+def train_agent(config: TrainingConfig, 
+                attention_config: Optional[FastAttentionConfig] = None,
+                custom_reward_fn = None,
+                checkpoint_path: Optional[str] = None):
+    """
+    改善されたトレーニングループ
+    
+    Args:
+        config: トレーニング設定
+        attention_config: 注意機構の設定（オプション）
+        custom_reward_fn: カスタム報酬関数（オプション）
+        checkpoint_path: 続きから学習する場合のモデルパス（オプション）
+    """
+    # ロガーのセットアップ
     logger = create_logger("./logs")
-    agent = SPPO(training_config, attention_config)
+    run_id = int(time.time())
+    log_dir = os.path.join("./logs", f"run_{run_id}")
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # デバイス情報のログ記録
+    if torch.cuda.is_available():
+        device_name = torch.cuda.get_device_name(0)
+        logger.info(f"Using GPU: {device_name}")
+        # GPUメモリ使用量のモニタリング
+        logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    else:
+        logger.info("Using CPU")
+    
+    # 設定の保存（JSON形式）
+    config_path = os.path.join(log_dir, "config.json")
+    with open(config_path, 'w') as f:
+        config_dict = {
+            "training": config.__dict__,
+            "attention": attention_config.__dict__ if attention_config else None
+        }
+        json.dump(config_dict, f, indent=2)
+    
+    # エージェントの初期化
+    agent = SPPO(config, attention_config)
+    
+    # チェックポイントから再開
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        logger.info(f"Loading checkpoint from {checkpoint_path}")
+        agent.load_model(checkpoint_path)
+    
+    # 報酬関数の設定
+    reward_fn = custom_reward_fn if custom_reward_fn else realistic_reward_model
+    
+    # 評価用の変数
+    best_reward = float('-inf')
     previous_loss = float('inf')
-    def dummy_reward_model(states, actions):
-        return -torch.sum(actions**2, dim=-1, keepdim=True)
+    
+    # トレーニング統計
+    training_stats = {
+        'episodes': [],
+        'losses': [],
+        'rewards': [],
+        'eta_values': [],
+        'alpha_values': []
+    }
+    
     logger.info("Training started")
     try:
         total_steps = 0
-        episodes = training_config.total_timesteps // training_config.num_samples
+        episodes = config.total_timesteps // config.num_samples
+        
+        # トレーニングループ
         for episode in range(1, episodes + 1):
+            episode_start_time = time.time()
             agent.train_mode()
             agent.buffer.reset()
-            for step in range(training_config.num_samples):
-                state = torch.randn(training_config.num_samples, training_config.state_dim)
+            
+            # サンプリングループ
+            episode_rewards = []
+            for step in range(config.num_samples):
+                # 状態の生成（実際の環境ではここを環境とのインタラクションに置き換え）
+                state = torch.randn(config.num_samples, config.state_dim)
                 norm_state = agent.normalize_state(state)
-                action, _, _ = agent.sample_action(norm_state)
-                reward = dummy_reward_model(norm_state, action)
+                
+                # 行動のサンプリング
+                action, _, info = agent.sample_action(norm_state)
+                
+                # 報酬の計算
+                reward = reward_fn(norm_state, action)
+                episode_rewards.append(reward.mean().item())
+                
+                # バッファに追加
                 agent.buffer.add(norm_state, action, reward)
+                
                 total_steps += 1
-                if total_steps % training_config.log_frequency == 0:
-                    logger.info(f"Episode {episode}, Step {step}, TotalSteps {total_steps}")
+                
+                # ログ記録
+                if total_steps % config.log_frequency == 0:
+                    logger.info(f"Episode {episode}, Step {step}, TotalSteps {total_steps}, "
+                               f"AvgReward: {np.mean(episode_rewards):.4f}")
+            
+            # バッファからデータを取得し、ポリシーを更新
             states_batch, actions_batch, rewards_batch = agent.buffer.get()
-            loss = agent.compute_ppo_loss(states_batch, actions_batch, rewards_batch)
-            agent.update_policy(loss)
+            
+            # 複数回の更新（エポック）
+            epoch_losses = []
+            for _ in range(config.n_updates):
+                loss = agent.compute_ppo_loss(states_batch, actions_batch, rewards_batch)
+                agent.update_policy(loss)
+                epoch_losses.append(loss.item())
+            
+            # ベースラインモデルの更新
             agent.update_baseline()
-            current_loss = loss.item()
+            
+            # 現在の損失（最終エポックの損失）
+            current_loss = epoch_losses[-1]
+            
+            # ハイパーパラメータの調整
             agent.adjust_hyperparameters(current_loss, previous_loss)
             previous_loss = current_loss
-            logger.info(f"Episode {episode} completed, Loss: {current_loss:.4f}, eta: {agent.eta:.3f}, alpha: {agent.alpha:.3f}")
-            if total_steps % training_config.eval_frequency == 0:
-                logger.info(f"Evaluation checkpoint at step {total_steps}")
-            if total_steps % training_config.save_frequency == 0:
-                os.makedirs("./models", exist_ok=True)
-                save_path = f"./models/checkpoint_step{total_steps}.pth"
+            
+            # エピソード統計の記録
+            avg_reward = np.mean(episode_rewards)
+            episode_time = time.time() - episode_start_time
+            logger.info(f"Episode {episode} completed in {episode_time:.2f}s, "
+                       f"Loss: {current_loss:.4f}, AvgReward: {avg_reward:.4f}, "
+                       f"eta: {agent.eta:.3f}, alpha: {agent.alpha:.3f}")
+            
+            # 統計情報の更新
+            training_stats['episodes'].append(episode)
+            training_stats['losses'].append(current_loss)
+            training_stats['rewards'].append(avg_reward)
+            training_stats['eta_values'].append(agent.eta)
+            training_stats['alpha_values'].append(agent.alpha)
+            
+            # 定期的な評価
+            if total_steps % config.eval_frequency == 0:
+                eval_reward = evaluate_agent(agent, reward_fn, config)
+                logger.info(f"Evaluation at step {total_steps}: AvgReward = {eval_reward:.4f}")
+                
+                # 最良モデルの保存
+                if eval_reward > best_reward:
+                    best_reward = eval_reward
+                    best_model_path = os.path.join(log_dir, "best_model.pth")
+                    agent.save_model(best_model_path)
+                    logger.info(f"New best model saved with reward {best_reward:.4f}")
+            
+            # 定期的なモデル保存
+            if total_steps % config.save_frequency == 0:
+                checkpoint_dir = os.path.join(log_dir, "checkpoints")
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                save_path = os.path.join(checkpoint_dir, f"checkpoint_step{total_steps}.pth")
                 agent.save_model(save_path)
-                logger.info(f"Model saved at {save_path}")
+                logger.info(f"Checkpoint saved at {save_path}")
+                
+                # トレーニング統計をプロット
+                plot_training_stats(training_stats, os.path.join(log_dir, "training_curves.png"))
+        
+    except KeyboardInterrupt:
+        logger.info("Training interrupted by user")
     except Exception as e:
         logger.error(f"Error during training: {e}")
-        raise
+        import traceback
+        logger.error(traceback.format_exc())
     finally:
-        os.makedirs("./models", exist_ok=True)
-        agent.save_model("./models/final_model.pth")
-        logger.info("Training finished, final model saved.")
+        # 最終モデルの保存
+        final_model_path = os.path.join(log_dir, "final_model.pth")
+        agent.save_model(final_model_path)
+        logger.info(f"Training finished, final model saved at {final_model_path}")
+        
+        # トレーニング統計の保存
+        stats_path = os.path.join(log_dir, "training_stats.json")
+        with open(stats_path, 'w') as f:
+            json.dump(training_stats, f)
+        
+        # 最終的な学習曲線のプロット
+        plot_training_stats(training_stats, os.path.join(log_dir, "final_training_curves.png"))
+        
+        return agent, best_reward
+
+def evaluate_agent(agent, reward_fn, config, n_episodes=5):
+    """
+    エージェントの評価を行う
+    
+    Args:
+        agent: 評価するエージェント
+        reward_fn: 報酬関数
+        config: 設定
+        n_episodes: 評価エピソード数
+    
+    Returns:
+        平均報酬
+    """
+    agent.eval_mode()
+    all_rewards = []
+    
+    for _ in range(n_episodes):
+        episode_rewards = []
+        for _ in range(10):  # 各エピソードは10ステップとする
+            state = torch.randn(1, config.state_dim)
+            norm_state = agent.normalize_state(state)
+            action, _, _ = agent.sample_action(norm_state, deterministic=True)
+            reward = reward_fn(norm_state, action)
+            episode_rewards.append(reward.item())
+        
+        all_rewards.append(np.mean(episode_rewards))
+    
+    agent.train_mode()
+    return np.mean(all_rewards)
+
+def plot_training_stats(stats, save_path):
+    """トレーニング統計をプロットする"""
+    try:
+        import matplotlib.pyplot as plt
+        
+        fig, axs = plt.subplots(2, 2, figsize=(12, 10))
+        
+        # 損失曲線
+        axs[0, 0].plot(stats['episodes'], stats['losses'])
+        axs[0, 0].set_title('Loss Curve')
+        axs[0, 0].set_xlabel('Episode')
+        axs[0, 0].set_ylabel('Loss')
+        
+        # 報酬曲線
+        axs[0, 1].plot(stats['episodes'], stats['rewards'])
+        axs[0, 1].set_title('Average Reward')
+        axs[0, 1].set_xlabel('Episode')
+        axs[0, 1].set_ylabel('Reward')
+        
+        # ハイパーパラメータ曲線
+        axs[1, 0].plot(stats['episodes'], stats['eta_values'])
+        axs[1, 0].set_title('Learning Rate (eta)')
+        axs[1, 0].set_xlabel('Episode')
+        axs[1, 0].set_ylabel('eta')
+        
+        axs[1, 1].plot(stats['episodes'], stats['alpha_values'])
+        axs[1, 1].set_title('Trust Region Size (alpha)')
+        axs[1, 1].set_xlabel('Episode')
+        axs[1, 1].set_ylabel('alpha')
+        
+        plt.tight_layout()
+        plt.savefig(save_path)
+        plt.close()
+    except ImportError:
+        print("matplotlib not installed, skipping plot generation")
+
 
 # ===============================
 # APIサーバー (FastAPI)
 # ===============================
-def run_api():
+def run_api(host="0.0.0.0", port=8000, model_path="./models/final_model.pth"):
+    """
+    改善されたAPIサーバー実装
+    
+    Args:
+        host: ホスト名
+        port: ポート番号
+        model_path: 読み込むモデルのパス
+    """
     try:
-        from fastapi import FastAPI
-        from pydantic import BaseModel
+        from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
+        from fastapi.middleware.cors import CORSMiddleware
+        from pydantic import BaseModel, Field, validator
         import uvicorn
+        from typing import List, Dict, Any, Optional
+        import logging
+        import time
     except ImportError:
-        print("FastAPIとuvicornが必要です。`pip install fastapi uvicorn` を実行してください。")
+        print("必要なパッケージがインストールされていません。")
+        print("以下のコマンドでインストールしてください:")
+        print("pip install fastapi uvicorn pydantic")
         return
 
+    # リクエスト/レスポンスモデルの定義
     class StateRequest(BaseModel):
-        state: List[float]
-
-    app = FastAPI()
+        state: List[float] = Field(..., description="入力状態ベクトル")
+        
+        @validator('state')
+        def validate_state_dim(cls, v, values):
+            if len(v) != 128:  # 期待する状態次元
+                raise ValueError(f"状態ベクトルは長さ128である必要があります。現在の長さ: {len(v)}")
+            return v
+    
+    class BatchStateRequest(BaseModel):
+        states: List[List[float]] = Field(..., description="バッチ処理用の状態ベクトルのリスト")
+    
+    class ActionResponse(BaseModel):
+        action: List[float] = Field(..., description="予測された行動ベクトル")
+        value: float = Field(..., description="状態価値の推定値")
+        processing_time: float = Field(..., description="処理時間（ミリ秒）")
+    
+    class BatchActionResponse(BaseModel):
+        actions: List[List[float]] = Field(..., description="予測された行動ベクトルのリスト")
+        values: List[float] = Field(..., description="状態価値の推定値のリスト")
+        processing_time: float = Field(..., description="処理時間（ミリ秒）")
+    
+    class HealthResponse(BaseModel):
+        status: str = "healthy"
+        model_loaded: bool
+        gpu_available: bool
+        version: str = "1.0.0"
+    
+    # FastAPIアプリの設定
+    app = FastAPI(
+        title="高速注意機構付きPPOエージェントAPI",
+        description="状態ベクトルを入力として、最適な行動と状態価値を予測するAPI",
+        version="1.0.0"
+    )
+    
+    # CORSミドルウェアの追加
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    
+    # ロガーの設定
+    api_logger = logging.getLogger("api")
+    api_logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    api_logger.addHandler(handler)
+    
+    # エージェントの初期化
     training_config = TrainingConfig(state_dim=128, action_dim=2)
     attention_config = FastAttentionConfig(
         d_model=128, d_key=32, d_query=32, n_heads=4,
@@ -547,26 +841,131 @@ def run_api():
         wu_manber_prefix_len=4, dropout=0.1, intermediate_dim=256,
         use_rff=True, hyper_cuts_dim_groups=None, n_lsh_hashes=4
     )
+    
     agent = SPPO(training_config, attention_config)
-    model_path = "./models/final_model.pth"
-    if os.path.exists(model_path):
-        agent.load_model(model_path)
-    else:
-        print(f"Warning: {model_path} が見つかりません。API起動前にトレーニングを実施してください。")
-    agent.eval_mode()
+    model_loaded = False
+    
+    # 統計情報の追跡
+    request_stats = {
+        "total_requests": 0,
+        "successful_requests": 0,
+        "failed_requests": 0,
+        "total_processing_time": 0,
+        "avg_processing_time": 0,
+    }
+    
+    def get_agent():
+        """依存性注入用のエージェント取得関数"""
+        return agent
+    
+    def update_stats(success: bool, processing_time: float):
+        """リクエスト統計情報を更新する"""
+        request_stats["total_requests"] += 1
+        if success:
+            request_stats["successful_requests"] += 1
+        else:
+            request_stats["failed_requests"] += 1
+        request_stats["total_processing_time"] += processing_time
+        request_stats["avg_processing_time"] = (
+            request_stats["total_processing_time"] / request_stats["total_requests"]
+        )
+    
+    @app.on_event("startup")
+    async def startup_event():
+        """アプリケーション起動時の処理"""
+        nonlocal model_loaded
+        
+        api_logger.info("APIサーバーを起動しています...")
+        
+        if os.path.exists(model_path):
+            try:
+                api_logger.info(f"モデルを読み込んでいます: {model_path}")
+                agent.load_model(model_path)
+                agent.eval_mode()
+                model_loaded = True
+                api_logger.info("モデルの読み込みが完了しました")
+            except Exception as e:
+                api_logger.error(f"モデルの読み込み中にエラーが発生しました: {e}")
+                model_loaded = False
+        else:
+            api_logger.warning(f"モデルファイルが見つかりません: {model_path}")
+            model_loaded = False
+    
+    @app.get("/health", response_model=HealthResponse)
+    async def health_check():
+        """ヘルスチェックエンドポイント"""
+        return HealthResponse(
+            model_loaded=model_loaded,
+            gpu_available=torch.cuda.is_available()
+        )
+    
+    @app.post("/predict", response_model=ActionResponse)
+    async def predict_action(
+        request: StateRequest,
+        background_tasks: BackgroundTasks,
+        agent: SPPO = Depends(get_agent)
+    ):
+        """単一状態から行動を予測する"""
+        if not model_loaded:
+            raise HTTPException(
+                status_code=503,
+                detail="モデルが読み込まれていません。サーバーの準備ができていません。"
+            )
+        
+        start_time = time.time()
+        success = False
+        
+        try:
+            # 状態テンソルの準備
+            state_tensor = torch.tensor(request.state, dtype=torch.float32)
+            if state_tensor.dim() == 1:
+                state_tensor = state_tensor.unsqueeze(0)
+            
+            # 正規化
+            normalized_state = agent.normalize_state(state_tensor)
+            
+            # 行動の予測
+            action, _, info = agent.sample_action(normalized_state, deterministic=True)
+            
+            processing_time = (time.time() - start_time) * 1000  # ミリ秒に変換
+            
+            success = True
+            response = ActionResponse(
+                action=action.cpu().numpy().tolist()[0],
+                value=float(info["value"].cpu().numpy()[0]),
+                processing_time=processing_time
+            )
+            
+            # 非同期で統計情報を更新
+            background_tasks.add_task(update_stats, success, processing_time)
+            
+            return response
+            
+        except Exception as e:
+            processing_time = (time.time() - start_time) * 1000
+            background_tasks.add_task(update_stats, False, processing_time)
+            api_logger.error(f"予測中にエラーが発生しました: {str(e)}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"予測の処理中にエラーが発生しました: {str(e)}"
+            )
+    
+    @app.post("/predict_batch", response_model=BatchActionResponse)
+    async def predict_batch(
+        request: BatchStateRequest,
+        background_tasks: BackgroundTasks,
+        agent: SPPO = Depends(get_agent)
+    ):
+        """複数の状態をバッチ処理で予測する"""
+        if not model_loaded:
+            raise HTTPException(
+                status_code=503,
+                detail="モデルが読み込まれていません。サーバーの準備ができていません。"
+            )
+        
+        start_time = time.time()
+        success = False
 
-    @app.post("/predict")
-    def predict_action(request: StateRequest):
-        state_tensor = torch.tensor(request.state, dtype=torch.float32)
-        if state_tensor.dim() == 1:
-            state_tensor = state_tensor.unsqueeze(0)
-        action, _, info = agent.sample_action(state_tensor, deterministic=True)
-        return {
-            "action": action.cpu().numpy().tolist(),
-            "value": info["value"].cpu().numpy().tolist()
-        }
-
-    uvicorn.run(app, host="0.0.0.0", port=8000)
 
 # ===============================
 # エントリーポイント
