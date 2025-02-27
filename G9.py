@@ -856,4 +856,19 @@ class LLVMToCudaTranspiler:
             raise
 
 if __name__ == "__main__":
-    unittest.main()
+    # サンプルコード
+    llvm_ir = """
+    define i32 @add(i32 %a) {
+        %result = add i32 %a, 10
+        ret i32 %result
+    }
+    """
+    
+    # 入力データ
+    input_data = 5
+    
+    # CPUで実行
+    executor = CPUExecutor()
+    result = executor.execute(llvm_ir, input_data)
+    print(f"入力: {input_data}")
+    print(f"結果: {result}")  # 15が出力されるはず
