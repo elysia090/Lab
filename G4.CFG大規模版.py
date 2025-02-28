@@ -1,18 +1,19 @@
 """
-Python の ast は Python コード専用の抽象構文木なので、C/C++ コードなどを扱う場合は 
-Clang のパイソンバインディング (clang.cindex) を利用して抽象構文木を生成・トラバースします。
-Clang AST ではノードの種類が 
-CursorKind.FUNCTION_DECL, 
-CursorKind.IF_STMT, 
-CursorKind.FOR_STMT, 
-CursorKind.WHILE_STMT, などになり、
-Python の ast.If / ast.For などと対応付けが必要です。
+Python's ast is an abstract syntax tree specifically for Python code, so when dealing with C/C++ code,
+you can use Clang's Python bindings (clang.cindex) to generate and traverse the abstract syntax tree.
 
-CFG 構築ロジック（ノード生成・エッジ追加など）や
-Dominator 計算部分（GPU でのビットベクトル演算など）は、
-基本的に Python AST であっても Clang AST であっても共通化できます。
+In Clang AST, the node types are
+CursorKind.FUNCTION_DECL,
+CursorKind.IF_STMT,
+CursorKind.FOR_STMT,
+CursorKind.WHILE_STMT, etc., and 
+they need to be mapped to Python's ast.If / ast.For, etc.
 
-変わるのは「どのノードをどうトラバースするか」のみです。
+The CFG construction logic (node ​​generation, edge addition, etc.)
+and the Dominator calculation part (bit vector operations on the GPU, etc.) 
+can basically be shared between Python AST and Clang AST.
+
+The only thing that changes is "which nodes are traversed and how."
 """
 
 import ast
