@@ -1,3 +1,20 @@
+"""
+Python の ast は Python コード専用の抽象構文木なので、C/C++ コードなどを扱う場合は 
+Clang のパイソンバインディング (clang.cindex) を利用して抽象構文木を生成・トラバースします。
+Clang AST ではノードの種類が 
+CursorKind.FUNCTION_DECL, 
+CursorKind.IF_STMT, 
+CursorKind.FOR_STMT, 
+CursorKind.WHILE_STMT, などになり、
+Python の ast.If / ast.For などと対応付けが必要です。
+
+CFG 構築ロジック（ノード生成・エッジ追加など）や
+Dominator 計算部分（GPU でのビットベクトル演算など）は、
+基本的に Python AST であっても Clang AST であっても共通化できます。
+
+変わるのは「どのノードをどうトラバースするか」のみです。
+"""
+
 import ast
 import numpy as np
 import pycuda.autoinit
