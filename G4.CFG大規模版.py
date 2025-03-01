@@ -12,7 +12,9 @@ they need to be mapped to Python's ast.If / ast.For, etc.
 The CFG construction logic (node ​​generation, edge addition, etc.)
 and the Dominator calculation part (bit vector operations on the GPU, etc.) 
 can basically be shared between Python AST and Clang AST.
-source：[https://libclang.readthedocs.io/en/latest/]
+
+Official documentation to refer to when switching from Python AST to Clang AST
+：＝source：[https://libclang.readthedocs.io/en/latest/]
 
 The only thing that changes is "which nodes are traversed and how."
 """
