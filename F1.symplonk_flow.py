@@ -396,7 +396,7 @@ def run_demo() -> None:
     print("="*50)
     print("A geometric approach to zero-knowledge proofs using Kähler manifolds\n")
     
-    symplonk = SymPLONK(n=8, p=17, epsilon=1e-8)
+    symplonk = SymPLONK(n=8, p=17, epsilon=1e-15)
     secret = [1, 2, 3, 4]
     
     commitment = symplonk.alice_prove(secret)
