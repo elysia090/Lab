@@ -4,7 +4,7 @@ from matplotlib.animation import FuncAnimation
 from mpl_toolkits.mplot3d import Axes3D
 import matplotlib.cm as cm
 import math
-from typing import List, Tuple, Dict, Optional, Union, Any, Callable, Set, TypeVar
+from typing import List, Tuple, Dict, Optional, Union, Any, TypeVar
 import numpy.typing as npt
 from dataclasses import dataclass
 from functools import lru_cache
@@ -16,7 +16,7 @@ T = TypeVar('T')
 
 @dataclass
 class Commitment:
-    """Data structure representing zero-knowledge proof commitment"""
+    """Data structure representing the zero-knowledge proof commitment."""
     transformed_evaluations: ComplexArray
     flow_time: float
     secret_original_evaluations: ComplexArray
@@ -25,31 +25,31 @@ class Commitment:
 
 class SymPLONK:
     """
-    SymPLONK: Demonstrates geometric zero-knowledge proofs by mapping finite field
-    interpolation domains to complex numbers via Teichmüller lift through Witt vectors,
-    then applying Hamiltonian flow (rotation).
+    SymPLONK:
+    Demonstrates a geometric zero-knowledge proof protocol by mapping a finite field
+    interpolation domain to complex numbers via the Teichmüller lift, then applying
+    a Hamiltonian flow (rotation) to hide and later verify secret information.
     """
     def __init__(self, n: int = 8, p: int = 17, epsilon: float = 1e-8):
         self.n = n                  # Number of interpolation points
-        self.p = p                  # Prime (finite field F_p)
+        self.p = p                  # Prime for finite field F_p
         self.epsilon = epsilon      # Numerical error tolerance
         
-        # Define interpolation domain D_f in F_p: D_f = {ω_f^0, ω_f^1, ..., ω_f^(n-1)}
+        # Define the interpolation domain in F_p: D_f = { ω_f^0, ω_f^1, ..., ω_f^(n-1) }
         self.omega_f = self._find_primitive_nth_root(n, p)
         if self.omega_f is None:
-            raise ValueError(f"Could not find primitive {n}th root in F_{p}")
-            
+            raise ValueError(f"Could not find a primitive {n}th root in F_{p}")
         self.D_f = [pow(self.omega_f, i, p) for i in range(n)]
         
-        # Primitive element g of F_p^* (for discrete log calculations)
+        # Find a primitive element g of F_p* (used for computing discrete logs)
         self.g = self._find_primitive_root(p)
         if self.g is None:
-            raise ValueError(f"Could not find primitive root for F_{p}")
-            
-        # Apply Teichmüller lift to each a ∈ D_f to get points in C
+            raise ValueError(f"Could not find a primitive root for F_{p}")
+        
+        # Apply the Teichmüller lift to each element in D_f to obtain complex points
         self.D = np.array([self.teichmuller_lift(a) for a in self.D_f], dtype=np.complex128)
         
-        # Hamiltonian function H(z) = 1/2 |z|^2
+        # Define Hamiltonian function H(z) = 1/2 |z|^2 (for potential energy, etc.)
         self.H_func = lambda z: 0.5 * np.abs(z)**2
 
         print(f"Setup complete: n={self.n}, p={self.p}")
@@ -58,28 +58,27 @@ class SymPLONK:
     
     def _find_primitive_nth_root(self, n: int, p: int) -> Optional[int]:
         """
-        Find primitive nth root of unity ω_f in F_p (requires n | (p-1))
+        Find a primitive nth root of unity ω_f in F_p.
+        Requires that n divides (p - 1).
         """
         if (p - 1) % n != 0:
             print(f"Warning: n={n} is not a divisor of p-1={p-1}")
             
-        # Precompute proper divisors of n for efficiency
+        # Precompute proper divisors for efficiency
         divisors = self._divisors(n)
         proper_divisors = [d for d in divisors if d < n]
         
         for candidate in range(2, p):
             if pow(candidate, n, p) != 1:
                 continue
-                
             if all(pow(candidate, d, p) != 1 for d in proper_divisors):
                 return candidate
-                
         return None
 
     @staticmethod
     @lru_cache(maxsize=128)
     def _divisors(n: int) -> List[int]:
-        """Compute divisors of integer n"""
+        """Compute all divisors of the integer n."""
         divs = set()
         for i in range(1, int(math.sqrt(n)) + 1):
             if n % i == 0:
@@ -88,20 +87,18 @@ class SymPLONK:
         return sorted(list(divs))
     
     def _find_primitive_root(self, p: int) -> Optional[int]:
-        """Find primitive element (generator) of F_p (order p-1)"""
-        # Precompute coprimes for efficiency
+        """Find a primitive element (generator) of F_p (of order p-1)."""
         factors = self._prime_factors(p - 1)
-        coprimes = [(p - 1) // f for f in factors]
+        coprime_exponents = [(p - 1) // f for f in factors]
         
         for candidate in range(2, p):
-            if all(pow(candidate, coprime, p) != 1 for coprime in coprimes):
+            if all(pow(candidate, exp, p) != 1 for exp in coprime_exponents):
                 return candidate
-                
         return None
     
     @staticmethod
     def _prime_factors(n: int) -> List[int]:
-        """Compute prime factors of integer n"""
+        """Compute the prime factors of the integer n."""
         i, factors = 2, []
         while i * i <= n:
             if n % i:
@@ -116,64 +113,56 @@ class SymPLONK:
 
     def discrete_log(self, a: int, g: int, p: int) -> int:
         """
-        Compute discrete logarithm: find k where g^k ≡ a (mod p)
-        Uses Baby-step Giant-step algorithm for large p
+        Compute the discrete logarithm: find k such that g^k ≡ a (mod p).
+        For small p, brute-force search is used; for larger p, Baby-step Giant-step can be applied.
         """
-        if p < 100:  # Brute force for small p
+        if p < 100:  # Brute-force for small p
             for k in range(p - 1):
                 if pow(g, k, p) == a:
                     return k
-        else:  # Baby-step Giant-step for larger p
+        else:
             m = int(math.sqrt(p - 1)) + 1
-            
-            # Baby steps
+            # Baby-step
             baby_steps = {pow(g, j, p): j for j in range(m)}
-                
-            # Giant steps
             g_inv = pow(g, p - 1 - m, p)  # g^(-m) mod p
             value = a
-            
             for i in range(m):
                 if value in baby_steps:
                     return (i * m + baby_steps[value]) % (p - 1)
                 value = (value * g_inv) % p
-                
         raise ValueError(f"No discrete log exists: a={a}, g={g}, p={p}")
 
     def teichmuller_lift(self, a: int) -> complex:
         """
-        Teichmüller lift of element a in F_p:
-         - 0 maps to 0
-         - For non-zero a, find k where a ≡ g^k (mod p), then lift(a)=exp(2πi*k/(p-1))
+        Teichmüller lift of an element a in F_p.
+          - If a == 0, returns 0.
+          - For nonzero a, find k such that a ≡ g^k (mod p), then return exp(2πi * k/(p-1)).
         """
         if a == 0:
             return complex(0.0, 0.0)
-            
         if self.g is None:
-            raise ValueError("Primitive root not set")
-            
+            raise ValueError("Primitive root is not set")
         k = self.discrete_log(a, self.g, self.p)
         return np.exp(2j * np.pi * k / (self.p - 1))
     
     def apply_flow(self, points: ComplexArray, t: float) -> ComplexArray:
         """
-        Apply Hamiltonian flow (rotation) to complex points
-        
-        For circular Hamiltonian flow, analytical solution: z(t) = z(0) * exp(it)
+        Apply the Hamiltonian flow (rotation) to complex points.
+        For circular flow, the analytical solution is: z(t) = z(0) * exp(i*t)
         """
-        if abs(t) < self.epsilon:  # Skip calculation for very small t
+        if abs(t) < self.epsilon:
             return points
-        
         return points * np.exp(1j * t)
     
     def apply_inverse_flow(self, points: ComplexArray, t: float) -> ComplexArray:
-        """Apply inverse Hamiltonian flow"""
+        """Apply the inverse Hamiltonian flow."""
         return self.apply_flow(points, -t)
     
     def polynomial_encode(self, secret: List[int]) -> ComplexArray:
         """
-        Encode secret (as F_p elements) as polynomial f(x), evaluate at domain points,
-        then apply Teichmüller lift to get complex numbers
+        Encode the secret (a list of elements in F_p) as a polynomial f(x) and evaluate it at the domain points.
+        Then, apply the Teichmüller lift to convert each evaluation to a complex number.
+        Horner's method is used for efficient polynomial evaluation.
         """
         coeffs = [0] * self.n
         for j in range(min(len(secret), self.n)):
@@ -181,31 +170,31 @@ class SymPLONK:
             
         evaluations = []
         for x in self.D_f:
-            # Horner's method for polynomial evaluation
             val = 0
             for coeff in reversed(coeffs):
                 val = (val * x + coeff) % self.p
-                
             evaluations.append(self.teichmuller_lift(val))
             
         return np.array(evaluations, dtype=np.complex128)
     
     def blind_evaluations(self, evaluations: ComplexArray, r: Optional[complex] = None) -> Tuple[ComplexArray, complex, ComplexArray]:
         """
-        Apply random blinding to polynomial evaluations (complex numbers)
+        Apply random blinding to the polynomial evaluations (complex numbers).
+        A normalized random mask is generated for numerical stability.
         """
         if r is None:
             r = complex(np.random.normal(), np.random.normal())
-            
-        # Generate and normalize mask for numerical stability
         mask = np.array([complex(np.random.normal(), np.random.normal()) for _ in range(self.n)], dtype=np.complex128)
-        mask = mask / np.linalg.norm(mask)  # Normalize mask to unit L2 norm
-        
+        mask = mask / np.linalg.norm(mask)
         return evaluations + r * mask, r, mask
     
     def alice_prove(self, secret: List[int], flow_time: float = np.pi/4) -> Commitment:
         """
-        Alice's protocol: Polynomial encode → Blind → Apply Hamiltonian flow
+        Alice's protocol:
+          1. Encode the secret as a polynomial and evaluate it on the domain.
+          2. Apply random blinding.
+          3. Apply Hamiltonian flow (rotation).
+          4. Generate and return the commitment.
         """
         print("\n=== Alice (Prover) ===")
         print(f"Secret data (finite field elements mod {self.p}): {secret}")
@@ -232,12 +221,14 @@ class SymPLONK:
     
     def bob_verify(self, commitment: Union[Commitment, Dict[str, Any]]) -> bool:
         """
-        Bob's protocol: Apply inverse Hamiltonian flow and verify geometric invariants
+        Bob's protocol:
+          1. Apply the inverse Hamiltonian flow to the commitment.
+          2. Verify that the masked (blinded) evaluations are preserved.
+        Verification is performed by computing the L2 norm of the difference.
         """
         print("\n=== Bob (Verifier) ===")
         print("Received commitment from Alice")
         
-        # Convert dict to Commitment if needed
         if isinstance(commitment, dict):
             comm = Commitment(
                 transformed_evaluations=commitment['transformed_evaluations'],
@@ -260,7 +251,6 @@ class SymPLONK:
         mask = comm.mask
         blinded = original + r * mask
         
-        # Use L2 norm difference for stable verification
         norm_diff = np.linalg.norm(recovered_evals - blinded)
         print(f"L2 norm of difference: {norm_diff:.8e}")
         
@@ -271,7 +261,7 @@ class SymPLONK:
     
     def visualize_domain_transformation(self, flow_time: float = np.pi/4, num_steps: int = 50, save_gif: bool = False) -> None:
         """
-        Visualize transformation of interpolation domain under Hamiltonian flow
+        Visualize the transformation of the interpolation domain under Hamiltonian flow.
         """
         fig, ax = plt.subplots(figsize=(10, 8))
         ax.set_xlim(-1.5, 1.5)
@@ -285,12 +275,11 @@ class SymPLONK:
         domain_points = self.D.copy()
         all_trajectories = [domain_points.copy()]
         
-        # Draw unit circle
+        # Draw the unit circle
         theta = np.linspace(0, 2*np.pi, 100)
         circle = np.exp(1j * theta)
         ax.plot(circle.real, circle.imag, 'k-', alpha=0.3)
         
-        # Calculate trajectories using analytical solution
         delta_t = flow_time / num_steps
         for step in range(1, num_steps + 1):
             t = step * delta_t
@@ -299,8 +288,6 @@ class SymPLONK:
         
         colors = cm.viridis(np.linspace(0, 1, self.n))
         scatter = ax.scatter(self.D.real, self.D.imag, c=colors, s=100, label='Domain Points')
-        
-        # Draw trajectories for each point
         for i in range(self.n):
             trajectory = np.array([traj[i] for traj in all_trajectories])
             ax.plot(trajectory.real, trajectory.imag, '-', color=colors[i], alpha=0.2)
@@ -316,7 +303,6 @@ class SymPLONK:
             return scatter, time_text
         
         ani = FuncAnimation(fig, update, frames=len(all_trajectories), interval=100, blit=True)
-        
         if save_gif:
             ani.save('symplonk_flow.gif', writer='pillow', fps=10, dpi=100)
             print("Animation saved as 'symplonk_flow.gif'")
@@ -327,7 +313,7 @@ class SymPLONK:
     
     def visualize_flow_3d_enhanced(self, flow_time: float = np.pi, num_points: int = 16, num_steps: int = 100) -> None:
         """
-        Enhanced 3D visualization of Hamiltonian flow on complex grid points
+        Enhanced 3D visualization of the Hamiltonian flow on a complex grid.
         """
         fig = plt.figure(figsize=(12, 10))
         ax = fig.add_subplot(111, projection='3d')
@@ -342,31 +328,20 @@ class SymPLONK:
         colors = colormap(np.linspace(0, 1, len(initial_points)))
         times = np.linspace(0, flow_time, num_steps)
         
-        # Display mesh grid planes at initial and final times
+        # Plot grid planes at t=0 and t=flow_time
         for t_idx in [0, num_steps-1]:
-            t = times[t_idx]
-            tz_plane = np.ones((grid_size, grid_size)) * t
+            t_val = times[t_idx]
+            tz_plane = np.ones((grid_size, grid_size)) * t_val
             ax.plot_surface(X, Y, tz_plane, alpha=0.1, color='gray')
         
-        # Calculate and display trajectories for each point
+        # Plot trajectories for each initial point
         for idx, z0 in enumerate(initial_points):
-            # Analytical solution: z(t) = z0 * exp(i*t)
             zs = z0 * np.exp(1j * times)
             xs, ys = zs.real, zs.imag
-            
-            # Draw trajectory with color gradient based on time
             for i in range(len(times) - 1):
                 t_ratio = times[i] / flow_time
-                ax.plot(
-                    [xs[i], xs[i+1]], 
-                    [ys[i], ys[i+1]], 
-                    [times[i], times[i+1]],
-                    color=colormap(t_ratio), 
-                    alpha=0.7, 
-                    linewidth=1.5
-                )
-            
-            # Emphasize initial and final points
+                ax.plot([xs[i], xs[i+1]], [ys[i], ys[i+1]], [times[i], times[i+1]],
+                        color=colormap(t_ratio), alpha=0.7, linewidth=1.5)
             ax.scatter(z0.real, z0.imag, 0, color=colors[idx], s=40, edgecolor='black')
             ax.scatter(xs[-1], ys[-1], flow_time, color=colors[idx], s=40, edgecolor='white')
         
@@ -377,7 +352,7 @@ class SymPLONK:
         ax.view_init(elev=30, azim=45)
         plt.tight_layout()
         
-        # Interactive view rotation
+        # Optionally rotate the view for better visualization
         if hasattr(plt, 'ion'):
             plt.ion()
             print("Rotating view for better visualization...")
@@ -388,9 +363,74 @@ class SymPLONK:
             plt.ioff()
             
         plt.show()
+    
+    def visualize_flow_3d_comparison(self, secret: List[int], flow_time: float = np.pi, num_points: int = 16, num_steps: int = 100) -> None:
+        """
+        3D visualization comparing the trajectories before and after branding.
+        
+        Left subplot: Plain domain (Teichmüller-lifted points without blinding)
+        Right subplot: Masked evaluations (after applying polynomial encoding and random blinding)
+        Both are rotated according to the analytical Hamiltonian flow.
+        """
+        times = np.linspace(0, flow_time, num_steps)
+        
+        # Compute plain trajectories from the precomputed Teichmüller-lifted domain (self.D)
+        plain_start = self.D
+        plain_trajs = []
+        for z in plain_start:
+            traj = z * np.exp(1j * times)
+            plain_trajs.append(traj)
+        
+        # Compute polynomial encoding and then apply random blinding (without flow)
+        plain_evals = self.polynomial_encode(secret)
+        blinded_evals, r, mask = self.blind_evaluations(plain_evals)
+        blinded_start = blinded_evals
+        blinded_trajs = []
+        for z in blinded_start:
+            traj = z * np.exp(1j * times)
+            blinded_trajs.append(traj)
+        
+        # Create 3D subplots for comparison
+        fig = plt.figure(figsize=(16, 8))
+        
+        # Left subplot: Before branding
+        ax1 = fig.add_subplot(121, projection='3d')
+        ax1.set_title("Before Branding")
+        ax1.set_xlabel("Re(z)")
+        ax1.set_ylabel("Im(z)")
+        ax1.set_zlabel("Time t")
+        ax1.set_xlim(-1.5, 1.5)
+        ax1.set_ylim(-1.5, 1.5)
+        ax1.set_zlim(0, flow_time)
+        colors = cm.viridis(np.linspace(0, 1, self.n))
+        for i, traj in enumerate(plain_trajs):
+            xs = traj.real
+            ys = traj.imag
+            ax1.plot(xs, ys, times, color=colors[i], lw=2)
+            ax1.scatter(xs[0], ys[0], times[0], color=colors[i], s=50, edgecolor='black')
+            ax1.scatter(xs[-1], ys[-1], times[-1], color=colors[i], s=50, edgecolor='white')
+        
+        # Right subplot: After branding
+        ax2 = fig.add_subplot(122, projection='3d')
+        ax2.set_title("After Branding")
+        ax2.set_xlabel("Re(z)")
+        ax2.set_ylabel("Im(z)")
+        ax2.set_zlabel("Time t")
+        ax2.set_xlim(-1.5, 1.5)
+        ax2.set_ylim(-1.5, 1.5)
+        ax2.set_zlim(0, flow_time)
+        for i, traj in enumerate(blinded_trajs):
+            xs = traj.real
+            ys = traj.imag
+            ax2.plot(xs, ys, times, color=colors[i], lw=2)
+            ax2.scatter(xs[0], ys[0], times[0], color=colors[i], s=50, edgecolor='black')
+            ax2.scatter(xs[-1], ys[-1], times[-1], color=colors[i], s=50, edgecolor='white')
+        
+        plt.tight_layout()
+        plt.show()
 
 def run_demo() -> None:
-    """Run demonstration of SymPLONK protocol"""
+    """Run demonstration of the SymPLONK protocol with 3D visualizations and comparison."""
     print("="*50)
     print("SymPLONK Protocol Demonstration (Finite Field with Teichmüller Lift)")
     print("="*50)
@@ -411,6 +451,9 @@ def run_demo() -> None:
     
     print("\nVisualizing enhanced 3D Hamiltonian flow...")
     symplonk.visualize_flow_3d_enhanced(flow_time=np.pi)
+    
+    print("\nVisualizing 3D comparison (Before vs. After Branding)...")
+    symplonk.visualize_flow_3d_comparison(secret, flow_time=np.pi, num_points=16, num_steps=100)
     
     print("\nDemonstration complete!")
 
