@@ -3,7 +3,7 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Union, Dict, Any, TypeVar
+from typing import List, Tuple, Optional, Union, Dict, Any, Callable
 import numpy.typing as npt
 
 # Try to import CuPy for GPU array operations.
@@ -17,19 +17,21 @@ except ImportError:
 # Type aliases
 ComplexArray = npt.NDArray[np.complex128]
 RealArray = npt.NDArray[np.float64]
-T = TypeVar("T")
 
-# Constants
+# Constants – tuned for performance
 TEICH_THRESHOLD: int = 20000          # Threshold for full Teichmüller lift precomputation
-BATCH_SIZE: int = 4096                # Batch size for processing
+BATCH_SIZE: int = 4096                # Batch size for processing large arrays
 MAX_THREADS_PER_BLOCK: int = 1024     # Maximum CUDA threads per block
-MODULUS_THRESHOLD: int = (1 << 63) - 1  # Upper bound for using GPU kernel (64-bit)
+MODULUS_THRESHOLD: int = (1 << 63) - 1  # Use GPU kernel only if p fits in a 64-bit integer
+
+# Known primitive roots for common primes
+KNOWN_PRIMITIVE_ROOTS: Dict[int, int] = {
+    (1 << 256) - (1 << 32) - 977: 7  # secp256k1 prime
+}
 
 @dataclass
 class Commitment:
-    """
-    Data structure representing the zero-knowledge proof commitment.
-    """
+    """Data structure representing the zero-knowledge proof commitment."""
     transformed_evaluations: ComplexArray
     flow_time: float
     secret_original_evaluations: ComplexArray
@@ -38,9 +40,9 @@ class Commitment:
 
 class FiniteFieldUtils:
     """
-    Utility class for finite field operations optimized with caching.
-    The evaluation domain is assumed to be a fixed cyclic subgroup:
-       D_f = { g^0, g^1, …, g^(n-1) }
+    Utility class for finite field operations with caching.
+    Assumes the evaluation domain is a fixed cyclic subgroup:
+      D_f = { g^0, g^1, …, g^(n-1) }
     so that each element's index is implicit.
     """
     _divisors_cache: Dict[int, List[int]] = {}
@@ -82,11 +84,16 @@ class FiniteFieldUtils:
 
     @classmethod
     def find_primitive_root(cls, p: int) -> Optional[int]:
+        # Check cache
         if p in cls._primitive_root_cache:
             return cls._primitive_root_cache[p]
+        # Special cases
         if p == 2:
             cls._primitive_root_cache[p] = 1
             return 1
+        if p in KNOWN_PRIMITIVE_ROOTS:
+            cls._primitive_root_cache[p] = KNOWN_PRIMITIVE_ROOTS[p]
+            return KNOWN_PRIMITIVE_ROOTS[p]
         common_roots: List[int] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
         factors: List[int] = cls.prime_factors(p - 1)
         exponents: List[int] = [(p - 1) // f for f in factors]
@@ -140,7 +147,7 @@ def teichmuller_lift_batch(indices: np.ndarray, n: int) -> np.ndarray:
 
 def gpu_teichmuller_lift_batch(indices: Any, n: int, xp: Any) -> Any:
     """
-    GPU-optimized version of teichmuller_lift_batch using xp (either cp or np).
+    GPU-optimized version of teichmuller_lift_batch.
     """
     if indices.dtype != xp.float64:
         indices = indices.astype(xp.float64)
@@ -151,7 +158,7 @@ class HamiltonianFlow:
     """
     Class implementing Hamiltonian flow operations.
     For the quadratic Hamiltonian H(z)=1/2|z|^2, the flow is a rotation:
-        z(t) = z(0) * exp(i*t)
+         z(t) = z(0) * exp(i*t)
     """
     def __init__(self, xp: Any) -> None:
         self.xp: Any = xp
@@ -175,6 +182,7 @@ class HamiltonianFlow:
         return self.apply_flow(points, -t, epsilon)
 
 if CUPY_AVAILABLE:
+    # GPU kernel for Horner's method for polynomial evaluation.
     poly_eval_kernel: cp.RawKernel = cp.RawKernel(r'''
     extern "C" __global__
     void poly_eval_horner(const long long* x_vals, const long long* coeffs, 
@@ -194,11 +202,12 @@ if CUPY_AVAILABLE:
 
 class SymPLONK:
     """
-    Optimized SymPLONK protocol implementation using a fixed cyclic subgroup.
-    The evaluation domain is:
-        D_f = { g^0, g^1, …, g^(n-1) }
-    and the Teichmüller lift is computed as:
-        τ(g^i) = exp(2πi * i/n)
+    Optimized implementation of the SymPLONK protocol using a fixed cyclic subgroup.
+    The evaluation domain is defined as:
+          D_f = { g^0, g^1, …, g^(n-1) }
+    and the Teichmüller lift is computed by:
+          τ(g^i) = exp(2πi * i/n)
+    This avoids runtime discrete log computations.
     """
     def __init__(self, n: int, p: int, epsilon: float = 1e-10, use_gpu: bool = True) -> None:
         self.n: int = n
@@ -233,10 +242,11 @@ class SymPLONK:
 
     def _setup_domains(self) -> None:
         """
-        Construct D_f as the cyclic subgroup { g^0, g^1, …, g^(n-1) }.
-        Precompute a lookup table mapping each element to its index,
-        then compute the Teichmüller lift vector L where:
-            L[i] = exp(2πi * i/n)
+        Set up the finite field domain D_f as the cyclic subgroup:
+           D_f = { g^0, g^1, …, g^(n-1) }.
+        A lookup table mapping each element to its index is precomputed.
+        Then, the Teichmüller lift vector L is computed as:
+           L[i] = exp(2πi * i/n)
         """
         start_primitive: float = time.perf_counter()
         self.omega_f: Optional[int] = FiniteFieldUtils.find_primitive_nth_root(self.n, self.p)
@@ -254,12 +264,20 @@ class SymPLONK:
         self.D_f_indices: Dict[int, int] = {int(elem): i for i, elem in enumerate(self.D_f)}
         start_teich: float = time.perf_counter()
         indices: np.ndarray = np.arange(self.n, dtype=np.float64)
-        if self.using_gpu:
-            indices_gpu = self.xp.array(indices)
-            self.D = gpu_teichmuller_lift_batch(indices_gpu, self.n, self.xp)
+        # Use batch processing for large domains when on GPU.
+        if self.using_gpu and self.n > TEICH_THRESHOLD:
+            self.D = self.xp.empty(self.n, dtype=self.xp.complex128)
+            for i in range(0, self.n, BATCH_SIZE):
+                end: int = min(i + BATCH_SIZE, self.n)
+                batch_indices = self.xp.arange(i, end, dtype=self.xp.float64)
+                self.D[i:end] = gpu_teichmuller_lift_batch(batch_indices, self.n, self.xp)
         else:
-            domain_lifts: np.ndarray = teichmuller_lift_batch(indices, self.n)
-            self.D = self.xp.array(domain_lifts, dtype=self.xp.complex128)
+            if self.using_gpu:
+                indices_gpu = self.xp.array(indices)
+                self.D = gpu_teichmuller_lift_batch(indices_gpu, self.n, self.xp)
+            else:
+                domain_lifts: np.ndarray = teichmuller_lift_batch(indices, self.n)
+                self.D = self.xp.array(domain_lifts, dtype=self.xp.complex128)
         end_teich: float = time.perf_counter()
         print(f"Teichmüller lift computation: {end_teich - start_teich:.4f} seconds")
 
@@ -269,8 +287,11 @@ class SymPLONK:
             self.common_flows[t] = self.xp.exp(1j * t)
 
     def poly_eval_horner_batch_cpu(self, x_vals: np.ndarray, coeffs: np.ndarray, p: int) -> np.ndarray:
-        x_vals = np.array(x_vals, dtype=np.int64)
-        coeffs = np.array(coeffs, dtype=np.int64)
+        """
+        Vectorized Horner's method for polynomial evaluation on CPU using chunking.
+        """
+        x_vals = np.asarray(x_vals, dtype=np.int64)
+        coeffs = np.asarray(coeffs, dtype=np.int64)
         n_points: int = len(x_vals)
         result: np.ndarray = np.zeros(n_points, dtype=np.int64)
         chunk_size: int = 1024
@@ -284,6 +305,10 @@ class SymPLONK:
         return result
 
     def poly_eval_horner_batch_gpu(self, x_vals: Any, coeffs: Any, p: int, threads_per_block: int) -> Any:
+        """
+        GPU-accelerated polynomial evaluation using Horner's method.
+        Falls back to CPU evaluation if p exceeds MODULUS_THRESHOLD.
+        """
         if p > MODULUS_THRESHOLD:
             print("Modulus too large for GPU kernel; using CPU evaluation.")
             return self.poly_eval_horner_batch_cpu(x_vals, coeffs, p)
@@ -293,15 +318,15 @@ class SymPLONK:
         n_coeffs: int = len(coeffs_gpu)
         result_gpu: Any = cp.zeros_like(x_vals_gpu)
         blocks_per_grid: int = (n_points + threads_per_block - 1) // threads_per_block
-        poly_eval_kernel((blocks_per_grid,), (threads_per_block,), 
+        poly_eval_kernel((blocks_per_grid,), (threads_per_block,),
                          (x_vals_gpu, coeffs_gpu, result_gpu, n_points, n_coeffs, p))
         return result_gpu
 
     def polynomial_encode(self, secret: List[int]) -> Any:
         """
-        Encode the secret as polynomial evaluations on D_f, and compute the Teichmüller lift.
-        Assumes the polynomial's outputs lie in D_f so that each value corresponds to g^i,
-        and then τ(g^i) = exp(2πi * i/n) is computed.
+        Encode the secret as polynomial evaluations on D_f, then compute the Teichmüller lift.
+        The polynomial's outputs are assumed to lie in D_f, so each value corresponds to g^i.
+        The lift is then τ(g^i) = exp(2πi * i/n).
         """
         encoding_start: float = time.perf_counter()
         coeffs: np.ndarray = np.array([c % self.p for c in secret] + [0] * (self.n - len(secret)), dtype=np.int64)
@@ -321,6 +346,9 @@ class SymPLONK:
         return result
 
     def blind_evaluations(self, evaluations: Any, r: Optional[complex] = None) -> Tuple[Any, complex, Any]:
+        """
+        Apply random blinding to the evaluations.
+        """
         xp: Any = self.xp
         if r is None:
             r = complex(xp.random.normal(), xp.random.normal())
@@ -332,6 +360,9 @@ class SymPLONK:
         return evaluations + r * mask, r, mask
 
     def alice_prove(self, secret: List[int], flow_time: float = np.pi/4) -> Commitment:
+        """
+        Generate a proof from the secret by polynomial encoding, blinding, and applying the Hamiltonian flow.
+        """
         print("\n=== Alice (Prover) ===")
         print(f"Secret (mod {self.p}): {secret}")
         start_time: float = time.perf_counter()
@@ -358,6 +389,9 @@ class SymPLONK:
         )
 
     def bob_verify(self, commitment: Union[Commitment, Dict[str, Any]]) -> bool:
+        """
+        Verify the proof by applying the inverse Hamiltonian flow and checking consistency.
+        """
         print("\n=== Bob (Verifier) ===")
         if isinstance(commitment, dict):
             comm: Commitment = Commitment(**commitment)
