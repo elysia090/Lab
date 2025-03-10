@@ -690,3 +690,5 @@ def run_symplonk_demo() -> None:
 
 if __name__ == "__main__":
     run_symplonk_demo()
+
+##TODO： Barrett縮小法を利用し、CPUでのポリノミアル計算を回避する
