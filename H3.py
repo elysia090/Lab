@@ -2,12 +2,13 @@ import math
 import time
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Union, Dict, Any
+
 import numpy as np
 import numpy.typing as npt
 import matplotlib.pyplot as plt
 from functools import lru_cache
 
-# Try to import CuPy for GPU array operations
+# Attempt to import CuPy for GPU acceleration; fall back to CPU (NumPy) if unavailable.
 try:
     import cupy as cp
     CUPY_AVAILABLE = True
@@ -15,20 +16,20 @@ except ImportError:
     cp = None
     CUPY_AVAILABLE = False
 
-# Type aliases for improved readability
+# Type aliases for clarity.
 ComplexArray = npt.NDArray[np.complex128]
 RealArray = npt.NDArray[np.float64]
 IntArray = npt.NDArray[np.int64]
 
-# Performance-tuned constants
-TEICH_THRESHOLD = 20000          # Threshold for full Teichmüller lift precomputation
-BATCH_SIZE = 4096                # Batch size for processing large arrays
-MAX_THREADS_PER_BLOCK = 1024     # Maximum CUDA threads per block
-MODULUS_THRESHOLD = (1 << 63) - 1  # Use GPU kernel only if p fits in a 64-bit integer
+# Performance and configuration constants.
+TEICH_THRESHOLD = 20000           # Threshold for precomputing full Teichmüller lift on large domains.
+BATCH_SIZE = 4096                 # Batch size for processing large arrays.
+MAX_THREADS_PER_BLOCK = 1024      # Maximum CUDA threads per block.
+MODULUS_THRESHOLD = (1 << 63) - 1  # Use GPU kernel only if modulus p fits in a 64-bit integer.
 
-# Known primitive roots for common cryptographic primes
+# Known primitive roots for common cryptographic primes.
 KNOWN_PRIMITIVE_ROOTS = {
-    (1 << 256) - (1 << 32) - 977: 7  # secp256k1 prime
+    (1 << 256) - (1 << 32) - 977: 7  # secp256k1 prime.
 }
 
 @dataclass
@@ -43,12 +44,12 @@ class Commitment:
     mask: ComplexArray
 
 class FiniteFieldUtils:
-    """Utility class for finite field operations with caching."""
+    """Utility class for finite field operations with caching support."""
     
     @staticmethod
     @lru_cache(maxsize=128)
     def divisors(n: int) -> List[int]:
-        """Compute all divisors of an integer n."""
+        """Return all divisors of the integer n."""
         divs = set()
         for i in range(1, int(math.sqrt(n)) + 1):
             if n % i == 0:
@@ -59,120 +60,123 @@ class FiniteFieldUtils:
     @staticmethod
     @lru_cache(maxsize=128)
     def prime_factors(n: int) -> List[int]:
-        """Compute the prime factorization of an integer n."""
+        """Return the unique prime factors of the integer n."""
         factors = []
-        
-        # Handle factors of 2
+        # Handle the factor 2.
         while n % 2 == 0:
             factors.append(2)
             n //= 2
-            
-        # Handle remaining odd factors
+        # Handle odd factors.
         i = 3
         while i * i <= n:
             while n % i == 0:
                 factors.append(i)
                 n //= i
             i += 2
-            
-        # Add remaining prime factor if any
         if n > 1:
             factors.append(n)
-            
         return sorted(set(factors))
 
     @classmethod
     @lru_cache(maxsize=64)
     def find_primitive_root(cls, p: int) -> Optional[int]:
-        """Find a primitive root modulo p."""
-        # Special cases
+        """
+        Find a primitive root modulo p.
+        Returns None if no suitable primitive root is found.
+        """
         if p == 2:
             return 1
-            
         if p in KNOWN_PRIMITIVE_ROOTS:
             return KNOWN_PRIMITIVE_ROOTS[p]
-            
-        # Try common small primes first for efficiency
+
         common_roots = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
-        
-        # Get prime factors of p-1 for testing primitive root property
         factors = cls.prime_factors(p - 1)
         exponents = [(p - 1) // f for f in factors]
-        
-        # Check common roots first
+
         for candidate in common_roots:
             if candidate >= p:
                 continue
             if all(pow(candidate, exp, p) != 1 for exp in exponents):
                 return candidate
-                
-        # Fall back to sequential search with a practical limit
+
         for candidate in range(2, min(p, 100)):
             if all(pow(candidate, exp, p) != 1 for exp in exponents):
                 return candidate
-                
+
         return None
 
     @classmethod
     @lru_cache(maxsize=64)
     def find_primitive_nth_root(cls, n: int, p: int) -> Optional[int]:
-        """Find a primitive nth root of unity in F_p."""
-        # A primitive nth root exists only if n divides p-1
+        """
+        Find a primitive n-th root of unity in the finite field F_p.
+        Returns None if one does not exist.
+        """
         if (p - 1) % n != 0:
             return None
-            
-        # Find a primitive root
+
         g = cls.find_primitive_root(p)
         if g is None:
             return None
-            
-        # Compute a candidate nth root
+
         k = (p - 1) // n
         candidate = pow(g, k, p)
-        
-        # Verify it's a primitive nth root
+
         proper_divisors = [d for d in cls.divisors(n) if d < n]
         if all(pow(candidate, d, p) != 1 for d in proper_divisors):
             return candidate
-            
         return None
 
 def teichmuller_lift_batch(indices: np.ndarray, n: int) -> np.ndarray:
-    """Vectorized Teichmüller lift computation."""
+    """
+    Compute the Teichmüller lift for a batch of indices.
+    
+    The lift is defined as: exp(2πi * index / n)
+    """
     indices = indices.astype(np.float64)
     return np.exp(1j * 2.0 * np.pi * indices / n)
 
 def gpu_teichmuller_lift_batch(indices: Any, n: int, xp: Any) -> Any:
-    """GPU-optimized version of teichmuller_lift_batch."""
+    """
+    GPU-optimized version of the Teichmüller lift computation.
+    
+    Uses the provided array module xp (either NumPy or CuPy).
+    """
     indices = indices.astype(xp.float64)
     return xp.exp(1j * 2.0 * xp.pi * indices / n)
 
 class HamiltonianFlow:
-    """Class implementing Hamiltonian flow operations."""
+    """
+    Implements Hamiltonian flow operations.
     
+    This class caches computed flow factors to improve efficiency.
+    """
     def __init__(self, xp: Any) -> None:
-        """Initialize the Hamiltonian flow calculator."""
+        """
+        Initialize with an array module (NumPy or CuPy).
+        """
         self.xp = xp
-        self._flow_cache = {}
+        self._flow_cache: Dict[float, Any] = {}
 
     def apply_flow(self, points: Any, t: float, epsilon: float = 1e-8) -> Any:
-        """Apply Hamiltonian flow to a set of points for time t."""
+        """
+        Apply Hamiltonian flow to the points for time t.
+        If |t| < epsilon, returns the original points.
+        """
         if abs(t) < epsilon:
             return points
-            
-        if t in self._flow_cache:
-            exp_factor = self._flow_cache[t]
-        else:
-            exp_factor = self.xp.exp(1j * t)
-            self._flow_cache[t] = exp_factor
-            
-        return points * exp_factor
+
+        if t not in self._flow_cache:
+            self._flow_cache[t] = self.xp.exp(1j * t)
+        return points * self._flow_cache[t]
 
     def apply_inverse_flow(self, points: Any, t: float, epsilon: float = 1e-8) -> Any:
-        """Apply inverse Hamiltonian flow for time t."""
+        """
+        Apply the inverse Hamiltonian flow for time t.
+        """
         return self.apply_flow(points, -t, epsilon)
 
-# Define GPU kernel for polynomial evaluation if CuPy is available
+# Define a GPU kernel for polynomial evaluation using Horner's method if CuPy is available.
 if CUPY_AVAILABLE:
     poly_eval_kernel = cp.RawKernel(r'''
     extern "C" __global__
@@ -192,67 +196,68 @@ if CUPY_AVAILABLE:
     ''', 'poly_eval_horner')
 
 class SymPLONK:
-    """Optimized implementation of the SymPLONK protocol using a fixed cyclic subgroup."""
-    
+    """
+    Optimized implementation of the SymPLONK protocol using a fixed cyclic subgroup.
+    """
     def __init__(self, n: int, p: int, epsilon: float = 1e-10, use_gpu: bool = True) -> None:
-        """Initialize the SymPLONK protocol."""
+        """
+        Initialize the SymPLONK protocol with domain size n and prime p.
+        
+        If use_gpu is True and CuPy is available, GPU acceleration is used.
+        """
         self.n = n
         self.p = p
         self.epsilon = epsilon
         self.using_gpu = False
         self.threads_per_block = MAX_THREADS_PER_BLOCK
 
-        # Initialize the array module (NumPy or CuPy)
+        # Select the appropriate array module.
         if use_gpu and CUPY_AVAILABLE:
             try:
                 _ = cp.array([1, 2, 3])
                 self.xp = cp
                 self.using_gpu = True
                 print("Using GPU acceleration with CuPy.")
-                
-                # Get GPU device properties
+
+                # Retrieve GPU device properties.
                 device_props = cp.cuda.runtime.getDeviceProperties(0)
-                print(f"GPU: {device_props['name'].decode('utf-8')}, Memory: {device_props['totalGlobalMem'] / 1e9:.2f} GB")
-                
-                # Set thread configuration
+                print(f"GPU: {device_props['name'].decode('utf-8')}, "
+                      f"Memory: {device_props['totalGlobalMem'] / 1e9:.2f} GB")
                 self.threads_per_block = min(MAX_THREADS_PER_BLOCK, device_props['maxThreadsPerBlock'])
             except Exception as e:
-                print(f"GPU initialization failed: {e}. Falling back to CPU.")
+                print(f"GPU initialization failed: {e}. Falling back to CPU (NumPy).")
                 self.xp = np
         else:
             self.xp = np
             print("Using CPU (NumPy).")
 
-        # Set up evaluation domains
+        # Set up the finite field evaluation domain.
         self._setup_domains()
-        
-        # Initialize Hamiltonian flow
+        # Initialize Hamiltonian flow.
         self.flow = HamiltonianFlow(self.xp)
         self._precompute_flows()
 
     def _setup_domains(self) -> None:
-        """Set up the finite field domain D_f as a cyclic subgroup and compute Teichmüller lifts."""
-        # Find a primitive nth root of unity
+        """
+        Set up the finite field domain D_f as a cyclic subgroup and compute Teichmüller lifts.
+        """
         self.omega_f = FiniteFieldUtils.find_primitive_nth_root(self.n, self.p)
-        
-        # Generate the finite field domain
+
         if self.omega_f is None:
-            print(f"Warning: No primitive {self.n}th root found in F_{self.p}. Using sequential domain.")
+            print(f"Warning: No primitive {self.n}-th root found in F_{self.p}. Using sequential domain.")
             self.D_f = np.arange(1, self.n + 1, dtype=np.int64)
         else:
-            self.D_f = np.zeros(self.n, dtype=np.int64)
+            self.D_f = np.empty(self.n, dtype=np.int64)
             value = 1
             for i in range(self.n):
                 self.D_f[i] = value
                 value = (value * self.omega_f) % self.p
-                
-        # Create lookup map from domain elements to indices
+
+        # Create a lookup map from domain element to its index.
         self.D_f_indices = {int(elem): i for i, elem in enumerate(self.D_f)}
-        
-        # Compute Teichmüller lifts
+
+        # Compute Teichmüller lifts.
         indices = np.arange(self.n, dtype=np.float64)
-        
-        # Use batch processing for large domains when on GPU
         if self.using_gpu and self.n > TEICH_THRESHOLD:
             self.D = self.xp.empty(self.n, dtype=self.xp.complex128)
             for i in range(0, self.n, BATCH_SIZE):
@@ -268,66 +273,66 @@ class SymPLONK:
                 self.D = self.xp.array(domain_lifts, dtype=self.xp.complex128)
 
     def _precompute_flows(self) -> None:
-        """Precompute common Hamiltonian flow values for efficiency."""
+        """
+        Precompute common Hamiltonian flow values for faster operations.
+        """
         self.common_flows = {}
         common_angles = [np.pi/8, np.pi/6, np.pi/4, np.pi/3, np.pi/2, 
                          2*np.pi/3, 3*np.pi/4, np.pi, 2*np.pi]
-                         
         for t in common_angles:
             self.common_flows[t] = self.xp.exp(1j * t)
 
     def poly_eval_horner_batch_cpu(self, x_vals: np.ndarray, coeffs: np.ndarray, p: int) -> np.ndarray:
-        """Vectorized Horner's method for polynomial evaluation on CPU using chunking."""
+        """
+        Evaluate a polynomial at multiple points using Horner's method (CPU version).
+        Processes the data in chunks for improved cache performance.
+        """
         x_vals = np.asarray(x_vals, dtype=np.int64)
         coeffs = np.asarray(coeffs, dtype=np.int64)
         n_points = len(x_vals)
         result = np.zeros(n_points, dtype=np.int64)
-        
-        # Process in chunks to improve cache efficiency
         chunk_size = 1024
+
         for chunk_start in range(0, n_points, chunk_size):
             chunk_end = min(chunk_start + chunk_size, n_points)
             x_chunk = x_vals[chunk_start:chunk_end]
-            
-            # Apply Horner's method
             r_chunk = np.full_like(x_chunk, coeffs[-1])
             for c in reversed(coeffs[:-1]):
                 r_chunk = (r_chunk * x_chunk + c) % p
-                
             result[chunk_start:chunk_end] = r_chunk
-            
+
         return result
 
     def poly_eval_horner_batch_gpu(self, x_vals: Any, coeffs: Any, p: int, threads_per_block: int) -> Any:
-        """GPU-accelerated polynomial evaluation using Horner's method."""
-        # Fall back to CPU for large moduli
+        """
+        Evaluate a polynomial using Horner's method on the GPU.
+        Falls back to the CPU implementation if the modulus p is too large.
+        """
         if p > MODULUS_THRESHOLD:
             print("Modulus too large for GPU kernel; using CPU evaluation.")
             return self.poly_eval_horner_batch_cpu(x_vals, coeffs, p)
-            
-        # Copy data to GPU
+
+        # Transfer data to the GPU.
         x_vals_gpu = cp.asarray(x_vals, dtype=cp.int64)
         coeffs_gpu = cp.asarray(coeffs, dtype=cp.int64)
         n_points = len(x_vals_gpu)
         n_coeffs = len(coeffs_gpu)
-        
-        # Prepare result array
         result_gpu = cp.zeros_like(x_vals_gpu)
-        
-        # Launch kernel
+
         blocks_per_grid = (n_points + threads_per_block - 1) // threads_per_block
         poly_eval_kernel((blocks_per_grid,), (threads_per_block,),
                          (x_vals_gpu, coeffs_gpu, result_gpu, n_points, n_coeffs, p))
-                         
         return result_gpu
 
     def polynomial_encode(self, secret: List[int]) -> Any:
-        """Encode a secret as polynomial evaluations on D_f and compute the Teichmüller lift."""
-        # Pad coefficients to length n with zeros
-        coeffs = np.array([c % self.p for c in secret] + 
-                          [0] * (self.n - len(secret)), dtype=np.int64)
+        """
+        Encode a secret as polynomial evaluations over the domain D_f.
+        Returns the Teichmüller lift of the polynomial evaluation.
+        """
+        # Pad secret coefficients to length n.
+        coeffs = np.array([c % self.p for c in secret] + [0] * (self.n - len(secret)), dtype=np.int64)
         
-        # Evaluate polynomial at all points in D_f
+        # Evaluate the polynomial on D_f.
         if self.using_gpu:
             if self.p > MODULUS_THRESHOLD:
                 poly_vals = self.poly_eval_horner_batch_cpu(self.D_f, coeffs, self.p)
@@ -337,55 +342,43 @@ class SymPLONK:
         else:
             poly_vals = self.poly_eval_horner_batch_cpu(self.D_f, coeffs, self.p)
         
-        # Convert field elements to indices in D_f
-        indices = np.array([self.D_f_indices.get(int(val), 0) 
-                           for val in poly_vals], dtype=np.float64)
-        
-        # Apply Teichmüller lift
+        # Map field elements to their corresponding indices.
+        indices = np.array([self.D_f_indices.get(int(val), 0) for val in poly_vals], dtype=np.float64)
         lifts = teichmuller_lift_batch(indices, self.n)
-        result = self.xp.array(lifts, dtype=self.xp.complex128)
-        
-        return result
+        return self.xp.array(lifts, dtype=self.xp.complex128)
 
     def blind_evaluations(self, evaluations: Any, r: Optional[complex] = None) -> Tuple[Any, complex, Any]:
-        """Apply random blinding to the evaluations for zero-knowledge."""
+        """
+        Apply random blinding to evaluations for zero-knowledge purposes.
+        Returns a tuple (blinded evaluations, blinding factor r, mask).
+        """
         xp = self.xp
-        
-        # Generate random blinding factor if not provided
         if r is None:
             r = complex(xp.random.normal(), xp.random.normal())
-            
-        # Generate random mask
         if self.using_gpu:
             mask = xp.random.normal(size=self.n) + 1j * xp.random.normal(size=self.n)
         else:
             mask = xp.array(np.random.normal(size=self.n) + 1j * np.random.normal(size=self.n))
-            
-        # Normalize mask
         mask = mask / xp.linalg.norm(mask)
-        
-        # Apply blinding
         return evaluations + r * mask, r, mask
 
     def alice_prove(self, secret: List[int], flow_time: float = np.pi/4) -> Commitment:
-        """Generate a zero-knowledge proof from a secret."""
+        """
+        Prover (Alice) generates a zero-knowledge proof commitment from the secret.
+        """
         print("\n=== Alice (Prover) ===")
         print(f"Secret (mod {self.p}): {secret}")
-        
         start_time = time.perf_counter()
         
-        # Step 1: Encode the secret as polynomial evaluations
+        # Encode the secret as polynomial evaluations.
         encoding = self.polynomial_encode(secret)
-        
-        # Step 2: Blind the evaluations with a random mask
+        # Blind the evaluations.
         blind, r, mask = self.blind_evaluations(encoding)
-        
-        # Step 3: Apply the Hamiltonian flow for time t
+        # Apply the Hamiltonian flow.
         transformed = self.flow.apply_flow(blind, flow_time, self.epsilon)
         
-        # Move data to CPU if needed
-        xp = self.xp
-        if xp is cp:
+        # Ensure data is on CPU for further processing.
+        if self.xp is cp:
             transformed_cpu = cp.asnumpy(transformed)
             encoding_cpu = cp.asnumpy(encoding)
             mask_cpu = cp.asnumpy(mask)
@@ -397,7 +390,6 @@ class SymPLONK:
         end_time = time.perf_counter()
         print(f"Total proof generation time: {end_time - start_time:.4f} seconds")
         
-        # Create and return the commitment
         return Commitment(
             transformed_evaluations=transformed_cpu,
             flow_time=flow_time,
@@ -407,71 +399,54 @@ class SymPLONK:
         )
 
     def bob_verify(self, commitment: Union[Commitment, Dict[str, Any]]) -> bool:
-        """Verify a zero-knowledge proof."""
+        """
+        Verifier (Bob) checks the zero-knowledge proof commitment.
+        Returns True if the proof is verified within tolerance; otherwise, False.
+        """
         print("\n=== Bob (Verifier) ===")
-        
-        # Convert dict to Commitment if needed
-        if isinstance(commitment, dict):
-            comm = Commitment(**commitment)
-        else:
-            comm = commitment
-            
+        comm = Commitment(**commitment) if isinstance(commitment, dict) else commitment
         print(f"Flow time: t = {comm.flow_time:.4f}")
         start_time = time.perf_counter()
         
-        # Get array module
         xp = self.xp
-        
-        # Move data to appropriate device
         transformed = xp.array(comm.transformed_evaluations, dtype=xp.complex128)
         original = xp.array(comm.secret_original_evaluations, dtype=xp.complex128)
         mask = xp.array(comm.mask, dtype=xp.complex128)
         
-        # Apply inverse flow to recover blinded evaluations
+        # Recover the original blinded evaluations.
         recovered = self.flow.apply_inverse_flow(transformed, comm.flow_time, self.epsilon)
-        
-        # Compute expected blinded evaluations
         expected = original + comm.r * mask
         
-        # Compute L2 distance between recovered and expected values
-        if xp is cp:
-            diff_norm = float(xp.linalg.norm(recovered - expected).get())
-        else:
-            diff_norm = float(xp.linalg.norm(recovered - expected))
-            
-        # Check if distance is within tolerance
+        # Compute the L2 norm difference.
+        diff_norm = float(xp.linalg.norm(recovered - expected).get() if xp is cp 
+                          else xp.linalg.norm(recovered - expected))
         verified = diff_norm < self.epsilon
         
         print(f"L2 norm difference: {diff_norm:.8e}")
         print(f"Verification {'SUCCESS' if verified else 'FAILED'}")
-        
-        end_time = time.perf_counter()
-        print(f"Total verification time: {end_time - start_time:.4f} seconds")
-        
+        print(f"Total verification time: {time.perf_counter() - start_time:.4f} seconds")
         return verified
 
 def run_symplonk_demo() -> None:
-    """Run a demonstration of the SymPLONK protocol."""
-    # Parameters: n = 256 (power of two) and p = 2^256 - 2^32 - 977 (secp256k1 prime)
+    """
+    Run a demonstration of the SymPLONK protocol.
+    
+    Uses domain size n = 4096 and the secp256k1 prime.
+    """
     n_val = 4096
     p_val = (1 << 256) - (1 << 32) - 977
-    
-    # Initialize SymPLONK
     symplonk = SymPLONK(n=n_val, p=p_val, use_gpu=True)
     
-    # Example secret data
+    # Example secret.
     secret = [1, 2, 3, 4]
     
-    # Generate and verify proof
     start_time = time.perf_counter()
     commitment = symplonk.alice_prove(secret)
     verification_success = symplonk.bob_verify(commitment)
     end_time = time.perf_counter()
     
-    # Report results
     print("\n=== Verification Result ===")
     print(f"Verification result: {verification_success}")
-    
     print("\n=== Total Execution Time ===")
     print(f"Total execution time (proof generation to verification): {end_time - start_time:.4f} seconds")
 
