@@ -1,3 +1,6 @@
+"TODO:GPUネイティブにする"
+"TODO:Horner法をPaterson-Stockmeyer+Barrett reduction+NTTに変更する"
+
 import math
 import time
 from dataclasses import dataclass
