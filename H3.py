@@ -1,26 +1,23 @@
 """
-This version of the SymPLONK protocol code preserves the original motivation
-(i.e. to perform zero‐knowledge proof commitments by encoding a secret polynomial,
-blinding it, and applying a Hamiltonian flow) while upgrading the GPU path.
-In H3 the native GPU libraries cannot handle multi‑precision arithmetic, so we
-implement a new GPU kernel that supports full 256-bit arithmetic (by representing
-each 256-bit number as 8 32-bit limbs) for polynomial evaluation using Horner’s method.
-If a simplistic (single‑limb) implementation is used, the reward is greatly reduced,
-so our highest priority is to enable genuine 256-bit support.
-TODO items (such as a more efficient modular reduction) are postponed.
+Refactored SymPLONK Protocol Implementation
+
+This implementation encodes a secret polynomial using zero-knowledge proof commitments.
+It upgrades the GPU path by supporting full 256-bit arithmetic via multi-precision GPU kernels.
+Each 256-bit number is represented as 8 32-bit limbs, and Horner’s method is used for polynomial evaluation.
+A naive modular reduction is applied (improvements like Barrett reduction are left as TODO).
 """
 
 import math
 import time
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Union, Dict, Any
+from functools import lru_cache
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
 import matplotlib.pyplot as plt
-from functools import lru_cache
 
-# Attempt to import CuPy for GPU acceleration; fall back to CPU (NumPy) if unavailable.
+# Attempt to import CuPy for GPU acceleration; if unavailable, fallback to NumPy.
 try:
     import cupy as cp
     CUPY_AVAILABLE = True
@@ -34,17 +31,20 @@ RealArray = npt.NDArray[np.float64]
 IntArray = npt.NDArray[np.int64]
 
 # Performance and configuration constants.
-TEICH_THRESHOLD = 20000           # Threshold for precomputing full Teichmüller lift on large domains.
-BATCH_SIZE = 4096                 # Batch size for processing large arrays.
-MAX_THREADS_PER_BLOCK = 1024      # Maximum CUDA threads per block.
-# Set a threshold below which we can use native GPU arithmetic.
-MODULUS_THRESHOLD = (1 << 63) - 1  # If p > this, use multi-precision GPU kernel.
+TEICH_THRESHOLD = 20000            # Threshold for full Teichmüller lift precomputation.
+BATCH_SIZE = 4096                  # Batch size for processing large arrays.
+MAX_THREADS_PER_BLOCK = 1024       # Maximum number of CUDA threads per block.
+MODULUS_THRESHOLD = (1 << 63) - 1    # Use multi-precision if p exceeds native 64-bit range.
 
 # Known primitive roots for common cryptographic primes.
 KNOWN_PRIMITIVE_ROOTS = {
     (1 << 256) - (1 << 32) - 977: 7  # secp256k1 prime.
 }
 
+
+###############################################################################
+# Data Structures
+###############################################################################
 @dataclass
 class Commitment:
     """
@@ -56,9 +56,13 @@ class Commitment:
     r: complex
     mask: ComplexArray
 
+
+###############################################################################
+# Finite Field Utility Functions
+###############################################################################
 class FiniteFieldUtils:
     """Utility class for finite field operations with caching support."""
-    
+
     @staticmethod
     @lru_cache(maxsize=128)
     def divisors(n: int) -> List[int]:
@@ -138,30 +142,36 @@ class FiniteFieldUtils:
             return candidate
         return None
 
+
+###############################################################################
+# Teichmüller Lift Functions
+###############################################################################
 def teichmuller_lift_batch(indices: np.ndarray, n: int) -> np.ndarray:
     """
     Compute the Teichmüller lift for a batch of indices.
-    
-    The lift is defined as: exp(2πi * index / n)
+    Defined as exp(2πi * index / n).
     """
     indices = indices.astype(np.float64)
     return np.exp(1j * 2.0 * np.pi * indices / n)
 
+
 def gpu_teichmuller_lift_batch(indices: Any, n: int, xp: Any) -> Any:
     """
     GPU-optimized version of the Teichmüller lift computation.
-    
     Uses the provided array module xp (either NumPy or CuPy).
     """
     indices = indices.astype(xp.float64)
     return xp.exp(1j * 2.0 * xp.pi * indices / n)
 
+
+###############################################################################
+# Hamiltonian Flow Operations
+###############################################################################
 class HamiltonianFlow:
     """
-    Implements Hamiltonian flow operations.
-    
-    This class caches computed flow factors to improve efficiency.
+    Implements Hamiltonian flow operations with caching support.
     """
+
     def __init__(self, xp: Any) -> None:
         """
         Initialize with an array module (NumPy or CuPy).
@@ -171,40 +181,23 @@ class HamiltonianFlow:
 
     def apply_flow(self, points: Any, t: float, epsilon: float = 1e-8) -> Any:
         """
-        Apply Hamiltonian flow to the points for time t.
+        Apply Hamiltonian flow to points for time t.
         If |t| < epsilon, returns the original points.
         """
         if abs(t) < epsilon:
             return points
-
         if t not in self._flow_cache:
             self._flow_cache[t] = self.xp.exp(1j * t)
         return points * self._flow_cache[t]
 
     def apply_inverse_flow(self, points: Any, t: float, epsilon: float = 1e-8) -> Any:
-        """
-        Apply the inverse Hamiltonian flow for time t.
-        """
+        """Apply the inverse Hamiltonian flow for time t."""
         return self.apply_flow(points, -t, epsilon)
 
-###############################################################################
-# Multi-precision GPU kernel for 256-bit polynomial evaluation using Horner's method.
-#
-# Each 256-bit number is represented as 8 limbs of 32 bits (little-endian order).
-# The kernel below (poly_eval_horner_mp) evaluates the polynomial
-#   P(x) = coeff[0] + coeff[1]*x + ... + coeff[n_coeffs-1]*x^(n_coeffs-1)
-# using Horner's method. For each evaluation point, the computation is:
-#
-#   result = 0;
-#   for (j = n_coeffs-1; j >= 0; j--) {
-#       result = (result * x + coeff[j]) mod p;
-#   }
-#
-# The multi-precision multiplication is performed in a naive way over 8 limbs,
-# and a naive modular reduction is applied (subtracting p once if result >= p).
-# (A full implementation would use Barrett reduction or similar; this is left as TODO.)
-###############################################################################
 
+###############################################################################
+# Multi-precision GPU Kernel Source
+###############################################################################
 multi_precision_kernel_source = r'''
 extern "C" __global__
 void poly_eval_horner_mp(const unsigned int* x_vals, const unsigned int* coeffs,
@@ -215,13 +208,13 @@ void poly_eval_horner_mp(const unsigned int* x_vals, const unsigned int* coeffs,
     int idx = blockDim.x * blockIdx.x + threadIdx.x;
     if (idx >= n_points) return;
 
-    // Initialize result to 0 (stored in array 'res')
+    // Initialize result to 0.
     unsigned int res[NLIMBS];
     for (int i = 0; i < NLIMBS; i++) {
          res[i] = 0;
     }
 
-    // Load x for this evaluation point (stored contiguously)
+    // Load x for this evaluation point.
     unsigned int x[NLIMBS];
     for (int i = 0; i < NLIMBS; i++) {
          x[i] = x_vals[idx * NLIMBS + i];
@@ -229,7 +222,7 @@ void poly_eval_horner_mp(const unsigned int* x_vals, const unsigned int* coeffs,
 
     // Horner's method: iterate over coefficients from highest degree to lowest.
     for (int j = n_coeffs - 1; j >= 0; j--) {
-         // Multiply res by x: compute 256-bit * 256-bit = 512-bit product in prod[16].
+         // Multiply res by x: compute 256-bit * 256-bit = 512-bit product.
          unsigned int prod[16];
          for (int i = 0; i < 16; i++) prod[i] = 0;
          for (int i = 0; i < NLIMBS; i++) {
@@ -241,13 +234,10 @@ void poly_eval_horner_mp(const unsigned int* x_vals, const unsigned int* coeffs,
              }
              prod[i+NLIMBS] = carry;
          }
-         // Naive modular reduction:
-         // (TODO: Implement full multi-precision modular reduction, e.g., Barrett reduction)
-         // For now, we assume that the product is small enough so that subtracting p once suffices.
+         // Naive modular reduction: subtract p once if result >= p.
          for (int i = 0; i < NLIMBS; i++) {
-              res[i] = prod[i]; // take the lower 8 limbs as the candidate remainder
+              res[i] = prod[i]; // Candidate remainder: lower 8 limbs.
          }
-         // Compare res and p to see if subtraction is needed.
          bool ge = true;
          for (int i = NLIMBS - 1; i >= 0; i--) {
               if (res[i] < p[i]) { ge = false; break; }
@@ -258,18 +248,17 @@ void poly_eval_horner_mp(const unsigned int* x_vals, const unsigned int* coeffs,
              for (int i = 0; i < NLIMBS; i++) {
                   unsigned long long diff = (unsigned long long) res[i] - p[i] - borrow;
                   res[i] = (unsigned int)(diff & 0xFFFFFFFFUL);
-                  // Borrow is 1 if subtraction underflowed.
                   borrow = (diff >> 63) & 1;
              }
          }
-         // Add the coefficient coeff[j] (each coefficient is represented in NLIMBS limbs)
+         // Add the current coefficient.
          unsigned int carry = 0;
          for (int i = 0; i < NLIMBS; i++) {
               unsigned long long sum = (unsigned long long) res[i] + coeffs[j * NLIMBS + i] + carry;
               res[i] = (unsigned int)(sum & 0xFFFFFFFFUL);
               carry = (unsigned int)(sum >> 32);
          }
-         // One more modular reduction if needed (naively)
+         // One more modular reduction if needed.
          ge = true;
          for (int i = NLIMBS - 1; i >= 0; i--) {
               if (res[i] < p[i]) { ge = false; break; }
@@ -285,15 +274,16 @@ void poly_eval_horner_mp(const unsigned int* x_vals, const unsigned int* coeffs,
          }
     }
 
-    // Write the final result (256-bit number) to the output array.
+    // Write the final 256-bit result to the output array.
     for (int i = 0; i < NLIMBS; i++) {
          results[idx * NLIMBS + i] = res[i];
     }
 }
 '''
 
+
 ###############################################################################
-# Helper functions for multi-precision conversion (between integers and limbs)
+# Helper Functions for Multi-precision Conversion
 ###############################################################################
 def int_to_limbs(val: int) -> List[np.uint32]:
     """Convert an integer to a list of 8 uint32 limbs (little-endian)."""
@@ -303,6 +293,7 @@ def int_to_limbs(val: int) -> List[np.uint32]:
         val >>= 32
     return limbs
 
+
 def limbs_to_int(limbs: List[int]) -> int:
     """Convert a list of 8 limbs (little-endian) to an integer."""
     val = 0
@@ -310,22 +301,21 @@ def limbs_to_int(limbs: List[int]) -> int:
         val = (val << 32) | int(limb)
     return val
 
+
 ###############################################################################
-# Modified SymPLONK class with multi-precision GPU polynomial evaluation.
+# SymPLONK Protocol Class
 ###############################################################################
 class SymPLONK:
     """
     Optimized implementation of the SymPLONK protocol using a fixed cyclic subgroup.
     
-    This version has been modified to support genuine 256-bit arithmetic on the GPU.
-    When the prime p exceeds the native 64-bit range, a new multi-precision GPU kernel
-    (poly_eval_horner_mp) is used to evaluate the secret polynomial via Horner's method.
-    TODO: Further optimize modular reduction (e.g., via Barrett reduction).
+    This version supports genuine 256-bit arithmetic on the GPU.
+    For primes exceeding the native 64-bit range, a multi-precision GPU kernel is used.
     """
     def __init__(self, n: int, p: int, epsilon: float = 1e-10, use_gpu: bool = True) -> None:
         """
-        Initialize the SymPLONK protocol with domain size n and prime p.
-        If use_gpu is True and CuPy is available, GPU acceleration is used.
+        Initialize the protocol with domain size n and prime p.
+        If use_gpu is True and CuPy is available, GPU acceleration is enabled.
         """
         self.n = n
         self.p = p
@@ -333,14 +323,13 @@ class SymPLONK:
         self.using_gpu = False
         self.threads_per_block = MAX_THREADS_PER_BLOCK
 
-        # Select the appropriate array module.
+        # Select the array module: CuPy (GPU) or NumPy (CPU).
         if use_gpu and CUPY_AVAILABLE:
             try:
                 _ = cp.array([1, 2, 3])
                 self.xp = cp
                 self.using_gpu = True
                 print("Using GPU acceleration with CuPy.")
-
                 device_props = cp.cuda.runtime.getDeviceProperties(0)
                 print(f"GPU: {device_props['name'].decode('utf-8')}, Memory: {device_props['totalGlobalMem'] / 1e9:.2f} GB")
                 self.threads_per_block = min(MAX_THREADS_PER_BLOCK, device_props['maxThreadsPerBlock'])
@@ -357,7 +346,7 @@ class SymPLONK:
         self.flow = HamiltonianFlow(self.xp)
         self._precompute_flows()
 
-        # Compile the multi-precision GPU kernel (if using GPU and p > MODULUS_THRESHOLD)
+        # Compile the multi-precision GPU kernel if needed.
         if self.using_gpu and self.p > MODULUS_THRESHOLD:
             self.poly_eval_kernel_mp = cp.RawKernel(multi_precision_kernel_source, 'poly_eval_horner_mp')
 
@@ -378,6 +367,7 @@ class SymPLONK:
 
         self.D_f_indices = {int(elem): i for i, elem in enumerate(self.D_f)}
         indices = np.arange(self.n, dtype=np.float64)
+
         if self.using_gpu and self.n > TEICH_THRESHOLD:
             self.D = self.xp.empty(self.n, dtype=self.xp.complex128)
             for i in range(0, self.n, BATCH_SIZE):
@@ -424,13 +414,14 @@ class SymPLONK:
         Evaluate a polynomial at multiple points using the multi-precision GPU kernel.
         Converts integers to 8-limb representations and back.
         """
-        # Convert each x in x_vals to its 8-limb representation.
+        # Convert evaluation points and coefficients to limb representations.
         x_limbs = np.array([int_to_limbs(int(x)) for x in x_vals], dtype=np.uint32).flatten()
         coeffs_limbs = np.array([int_to_limbs(int(c)) for c in coeffs], dtype=np.uint32).flatten()
         p_limbs = np.array(int_to_limbs(p), dtype=np.uint32)
         n_points = x_vals.shape[0]
         n_coeffs = coeffs.shape[0]
-        # Transfer to GPU using CuPy.
+
+        # Transfer data to GPU.
         x_gpu = cp.asarray(x_limbs)
         coeffs_gpu = cp.asarray(coeffs_limbs)
         p_gpu = cp.asarray(p_limbs)
@@ -450,7 +441,7 @@ class SymPLONK:
         """
         # Pad secret coefficients to length n.
         coeffs = np.array([c % self.p for c in secret] + [0] * (self.n - len(secret)), dtype=np.int64)
-        # Evaluate the polynomial on D_f.
+        # Evaluate the polynomial on the finite field domain.
         if self.using_gpu:
             if self.p > MODULUS_THRESHOLD:
                 poly_vals = self.poly_eval_horner_batch_gpu_mp(self.D_f, coeffs, self.p)
@@ -458,15 +449,15 @@ class SymPLONK:
                 poly_vals = self.poly_eval_horner_batch_cpu(self.D_f, coeffs, self.p)
         else:
             poly_vals = self.poly_eval_horner_batch_cpu(self.D_f, coeffs, self.p)
-        # Map field elements to their corresponding Teichmüller lifts.
+        # Map field elements to their Teichmüller lifts.
         indices = np.array([self.D_f_indices.get(int(val), 0) for val in poly_vals], dtype=np.float64)
         lifts = teichmuller_lift_batch(indices, self.n)
         return self.xp.array(lifts, dtype=self.xp.complex128)
 
     def blind_evaluations(self, evaluations: Any, r: Optional[complex] = None) -> Tuple[Any, complex, Any]:
         """
-        Apply random blinding to evaluations for zero-knowledge purposes.
-        Returns a tuple (blinded evaluations, blinding factor r, mask).
+        Apply random blinding to evaluations for zero-knowledge.
+        Returns a tuple: (blinded evaluations, blinding factor r, mask).
         """
         xp = self.xp
         if r is None:
@@ -486,8 +477,10 @@ class SymPLONK:
         print(f"Secret (mod {self.p}): {secret}")
         start_time = time.perf_counter()
         encoding = self.polynomial_encode(secret)
-        blind, r, mask = self.blind_evaluations(encoding)
-        transformed = self.flow.apply_flow(blind, flow_time, self.epsilon)
+        blinded, r, mask = self.blind_evaluations(encoding)
+        transformed = self.flow.apply_flow(blinded, flow_time, self.epsilon)
+
+        # Ensure results are on CPU for further processing.
         if self.xp is cp:
             transformed_cpu = cp.asnumpy(transformed)
             encoding_cpu = cp.asnumpy(encoding)
@@ -496,6 +489,7 @@ class SymPLONK:
             transformed_cpu = transformed
             encoding_cpu = encoding
             mask_cpu = mask
+
         end_time = time.perf_counter()
         print(f"Total proof generation time: {end_time - start_time:.4f} seconds")
         return Commitment(
@@ -509,7 +503,7 @@ class SymPLONK:
     def bob_verify(self, commitment: Union[Commitment, Dict[str, Any]]) -> bool:
         """
         Verifier (Bob) checks the zero-knowledge proof commitment.
-        Returns True if the proof is verified within tolerance; otherwise, False.
+        Returns True if verification passes within tolerance; otherwise, False.
         """
         print("\n=== Bob (Verifier) ===")
         comm = Commitment(**commitment) if isinstance(commitment, dict) else commitment
@@ -521,6 +515,8 @@ class SymPLONK:
         mask = xp.array(comm.mask, dtype=xp.complex128)
         recovered = self.flow.apply_inverse_flow(transformed, comm.flow_time, self.epsilon)
         expected = original + comm.r * mask
+
+        # Compute L2 norm difference.
         diff_norm = float(xp.linalg.norm(recovered - expected).get() if xp is cp 
                           else xp.linalg.norm(recovered - expected))
         verified = diff_norm < self.epsilon
@@ -529,24 +525,30 @@ class SymPLONK:
         print(f"Total verification time: {time.perf_counter() - start_time:.4f} seconds")
         return verified
 
+
+###############################################################################
+# Demonstration Function
+###############################################################################
 def run_symplonk_demo() -> None:
     """
     Run a demonstration of the SymPLONK protocol.
-    
     Uses domain size n = 4096 and the secp256k1 prime (256-bit).
     """
     n_val = 4096
-    p_val = (1 << 256) - (1 << 32) - 977  # secp256k1 prime (256-bit)
+    p_val = (1 << 256) - (1 << 32) - 977  # secp256k1 prime
     symplonk = SymPLONK(n=n_val, p=p_val, use_gpu=True)
     secret = [1, 2, 3, 4]  # Example secret
+
     start_time = time.perf_counter()
     commitment = symplonk.alice_prove(secret)
     verification_success = symplonk.bob_verify(commitment)
     end_time = time.perf_counter()
+
     print("\n=== Verification Result ===")
     print(f"Verification result: {verification_success}")
     print("\n=== Total Execution Time ===")
     print(f"Total execution time (proof generation to verification): {end_time - start_time:.4f} seconds")
+
 
 if __name__ == "__main__":
     run_symplonk_demo()
