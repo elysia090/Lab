@@ -1,206 +1,159 @@
-#define ulong unsigned long long
-#define uint unsigned int
+import numpy as np
+import random
+import pycuda.autoinit
+import pycuda.driver as drv
+from pycuda.compiler import SourceModule
 
-
-//A*B%MODP
-__device__ uint ABModC(uint a,uint b){
-	ulong tmp=((ulong)(__umulhi(a,b)))*(1ULL<<32)+(ulong)(a*b);
-	return (uint)(tmp%MODP);
-}
-
-//exp(a,b)%MODP
-__device__ uint ModExp(uint a,uint b){
-	ulong ans=1ULL;
-	ulong aa=a;
-	
-	while(b!=0){
-		if (b%2==1) ans=ans*aa%MODP;
-		aa=aa*aa%MODP;
-		b/=2;
-	}
-	return (uint)ans;
-}
-
-
-//逆変換後は、FFTでいうNで除算しないといけない。
-// a/arrayLength mod P
-__device__ uint DivN_f(uint a,uint arrayLength)
+# CUDA kernel code: Multiply two 256-bit integers.
+# Each 256-bit integer is represented as 4 unsigned long long values.
+# The product is stored as 8 unsigned long long values.
+kernel_code = r"""
+// Device function to multiply two 256-bit integers (each represented as 4 64-bit words)
+// and store the 512-bit result in an array of 8 64-bit words.
+// The multiplication is performed using schoolbook multiplication with proper carry propagation.
+__device__ void multiply_256(const unsigned long long *A, const unsigned long long *B, unsigned long long *C)
 {
-	uint as    =a/arrayLength;
-	uint ar    =a-as*arrayLength;
-	uint pn    =MODP/arrayLength;
-	if (ar!=0){
-		as+=(arrayLength-ar)*pn+1;
-	}
-	return as;
+    // Initialize an 8-word (512-bit) product array to zero.
+    unsigned long long prod[8] = {0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL};
+    
+    // Loop over each word of A and B.
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            int k = i + j;
+            unsigned long long a = A[i];
+            unsigned long long b = B[j];
+            // Compute the 128-bit product of a and b:
+            // lo holds the low 64 bits; hi is computed using __umul64hi.
+            unsigned long long lo = a * b;
+            unsigned long long hi = __umul64hi(a, b);
+            
+            // Add the low part to prod[k] with carry.
+            unsigned long long sum = prod[k] + lo;
+            unsigned long long carry = (sum < prod[k]) ? 1ULL : 0ULL;
+            prod[k] = sum;
+            
+            // Now add hi and the carry to the next word, propagating the carry.
+            int pos = k + 1;
+            unsigned long long temp = prod[pos] + hi + carry;
+            carry = (temp < prod[pos]) ? 1ULL : 0ULL;
+            prod[pos] = temp;
+            pos++;
+            while (carry != 0 && pos < 8) {
+                temp = prod[pos] + carry;
+                carry = (temp < prod[pos]) ? 1ULL : 0ULL;
+                prod[pos] = temp;
+                pos++;
+            }
+        }
+    }
+    
+    // Write the computed 512-bit product to the output array.
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        C[i] = prod[i];
+    }
 }
 
-
-
-
-//arrayLength2 = arrayLength/2
-__global__ void FMT(uint *arrayA,uint loopCnt_Pow2,uint omega,uint arrayLength2 ) {
-	uint idx = threadIdx.x+blockIdx.x*256;
-	uint t2 = idx%loopCnt_Pow2;
-	uint t0 = idx*2-t2;
-	uint t1 = t0+loopCnt_Pow2;
-	uint w0;
-	uint w1;
-	uint arrayAt0=arrayA[t0];
-	uint arrayAt1=arrayA[t1];
-	uint r0;
-	uint r1;
-	w0=ModExp(omega,t2*(arrayLength2/loopCnt_Pow2));
-	w1=ABModC(arrayAt1,w0);
-	r0=arrayAt0-w1+MODP;
-	r1=arrayAt0+w1;
-	if (r0>=MODP){r0-=MODP;}
-	if (r1>=MODP){r1-=MODP;}
-	arrayA[t1]=r0;
-	arrayA[t0]=r1;
+// Kernel: each thread multiplies one pair of 256-bit integers.
+// The input arrays d_A and d_B store the 256-bit integers consecutively (4 words each),
+// and the output array d_C will store the 512-bit result (8 words each).
+__global__ void kernel_multiply_256(const unsigned long long *d_A,
+                                    const unsigned long long *d_B,
+                                    unsigned long long *d_C,
+                                    int num_elements)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_elements) {
+        // Get pointers to the idx-th 256-bit numbers in d_A and d_B.
+        const unsigned long long *A = d_A + idx * 4;
+        const unsigned long long *B = d_B + idx * 4;
+        // Get pointer to the output 512-bit result.
+        unsigned long long *C = d_C + idx * 8;
+        multiply_256(A, B, C);
+    }
 }
+"""
 
-__global__ void uFMT(uint *arrayA,uint loopCnt_Pow2,uint omega,uint arrayLength2 ) {
-	uint idx = threadIdx.x+blockIdx.x*256;
-	uint t2 = idx%loopCnt_Pow2;
-	uint t0 = idx*2-t2;
-	uint t1 = t0+loopCnt_Pow2;
-	uint w0;
-	uint w1;
-	uint arrayAt0=arrayA[t0];
-	uint arrayAt1=arrayA[t1];
-	uint r0;
-	uint r1;
-	w0=ModExp(omega,t2*(arrayLength2/loopCnt_Pow2));
-	r0=arrayAt0-arrayAt1+MODP;
-	r1=arrayAt0+arrayAt1;
-	if (r0>=MODP){r0-=MODP;}
-	if (r1>=MODP){r1-=MODP;}
-	w1=ABModC(r0,w0);
-	arrayA[t1]=w1;
-	arrayA[t0]=r1;	
-}
+# Compile the kernel
+mod = SourceModule(kernel_code)
+kernel_multiply_256 = mod.get_function("kernel_multiply_256")
 
+def random_256bit_numbers(num_elements):
+    """
+    Create a numpy array of shape (num_elements, 4) containing random 256-bit integers.
+    Each 256-bit integer is split into 4 unsigned 64-bit words (little-endian order).
+    """
+    A = np.empty((num_elements, 4), dtype=np.uint64)
+    for i in range(num_elements):
+        # Use Python's built-in function to generate a random 256-bit integer.
+        rand_int = random.getrandbits(256)
+        for j in range(4):
+            A[i, j] = (rand_int >> (64 * j)) & ((1 << 64) - 1)
+    return A
 
-__global__ void iFMT(uint *arrayA,uint loopCnt_Pow2,uint omega,uint arrayLength2 ) {
-	uint idx = threadIdx.x+blockIdx.x*256;
-	uint t2 = idx%loopCnt_Pow2;
-	uint t0 = idx*2-t2;
-	uint t1 = t0+loopCnt_Pow2;
-	uint w0;
-	uint w1;
-	uint arrayAt0=arrayA[t0];
-	uint arrayAt1=arrayA[t1];
-	uint r0;
-	uint r1;
-	w0=ModExp(omega,arrayLength2*2-t2*(arrayLength2/loopCnt_Pow2));
-	w1=ABModC(arrayAt1,w0);
-	r0=arrayAt0-w1+MODP;
-	r1=arrayAt0+w1;
-	if (r0>=MODP){r0-=MODP;}
-	if (r1>=MODP){r1-=MODP;}
-	arrayA[t1]=r0;
-	arrayA[t0]=r1;
-}
+def verify_multiplication(A_host, B_host, C_host):
+    """
+    Verify that for each index, the 512-bit product computed on the GPU in C_host
+    matches the product of the corresponding 256-bit integers computed in Python.
+    """
+    num_elements = A_host.shape[0]
+    for i in range(num_elements):
+        # Reconstruct the 256-bit integers from 4 words (little-endian order).
+        a_val = 0
+        b_val = 0
+        for j in range(4):
+            a_val += int(A_host[i, j]) << (64 * j)
+            b_val += int(B_host[i, j]) << (64 * j)
+        product_cpu = a_val * b_val
+        
+        # Reconstruct the 512-bit product from 8 words.
+        product_gpu = 0
+        for j in range(8):
+            product_gpu += int(C_host[i, j]) << (64 * j)
+        
+        if product_cpu != product_gpu:
+            print(f"Mismatch at index {i}:")
+            print(f"CPU product = {product_cpu}")
+            print(f"GPU product = {product_gpu}")
+            return False
+    return True
 
+def main():
+    num_elements = 10  # Number of 256-bit integer pairs to multiply.
+    # Create random 256-bit numbers for A and B (each with shape (num_elements, 4)).
+    A_host = random_256bit_numbers(num_elements)
+    B_host = random_256bit_numbers(num_elements)
+    
+    # Allocate output array for C (shape (num_elements, 8)).
+    C_host = np.empty((num_elements, 8), dtype=np.uint64)
+    
+    # Flatten the arrays to 1D since the kernel expects contiguous memory.
+    A_flat = np.ravel(A_host).astype(np.uint64)
+    B_flat = np.ravel(B_host).astype(np.uint64)
+    C_flat = np.empty(num_elements * 8, dtype=np.uint64)
+    
+    # Transfer host data to device.
+    d_A = drv.mem_alloc(A_flat.nbytes)
+    drv.memcpy_htod(d_A, A_flat)
+    d_B = drv.mem_alloc(B_flat.nbytes)
+    drv.memcpy_htod(d_B, B_flat)
+    d_C = drv.mem_alloc(C_flat.nbytes)
+    
+    # Launch the kernel.
+    threads_per_block = 256
+    blocks = (num_elements + threads_per_block - 1) // threads_per_block
+    kernel_multiply_256(d_A, d_B, d_C, np.int32(num_elements),
+                          block=(threads_per_block, 1, 1), grid=(blocks, 1, 1))
+    
+    # Copy the result back to host.
+    drv.memcpy_dtoh(C_flat, d_C)
+    C_host = C_flat.reshape((num_elements, 8))
+    
+    # Verify the multiplication.
+    if verify_multiplication(A_host, B_host, C_host):
+        print("Multiplication verified successfully for all elements!")
+    else:
+        print("Multiplication verification failed.")
 
-__global__ void iuFMT(uint *arrayA,uint loopCnt_Pow2,uint omega,uint arrayLength2 ) {
-	uint idx = threadIdx.x+blockIdx.x*256;
-	uint t2 = idx%loopCnt_Pow2;
-	uint t0 = idx*2-t2;
-	uint t1 = t0+loopCnt_Pow2;
-	uint w0;
-	uint w1;
-	uint arrayAt0=arrayA[t0];
-	uint arrayAt1=arrayA[t1];
-	uint r0;
-	uint r1;
-	w0=ModExp(omega,arrayLength2*2-t2*(arrayLength2/loopCnt_Pow2));
-	r0=arrayAt0-arrayAt1+MODP;
-	r1=arrayAt0+arrayAt1;
-	if (r0>=MODP){r0-=MODP;}
-	if (r1>=MODP){r1-=MODP;}
-	w1=ABModC(r0,w0);
-	arrayA[t1]=w1;
-	arrayA[t0]=r1;
-}
-
-
-//同じ要素同士の掛け算
-__global__ void Mul_i_i(uint *arrayA,uint *arrayB ) {
-	uint idx = threadIdx.x+blockIdx.x*256;
-	uint w0;
-	w0=ABModC(arrayB[idx],arrayA[idx]);
-	arrayB[idx]=w0;
-}
-
-//逆変換後のNで割るやつ。剰余下で割るには特殊処理が必要
-__global__ void DivN(uint *arrayA,uint arrayLength ) {
-	uint idx = threadIdx.x+blockIdx.x*256;
-	arrayA[idx]=DivN_f(arrayA[idx],arrayLength);
-}
-
-
-
-//負巡回計算の前処理
-//sqrt_omegaの2N乗が1 (mod P)
-//a[0]*=ModExp(sqrt_omega,0)
-//a[1]*=ModExp(sqrt_omega,1)
-//a[2]*=ModExp(sqrt_omega,2)
-//a[3]*=ModExp(sqrt_omega,3)
-__global__ void PreNegFMT(uint *arrayA,uint *arrayB,uint sqrt_omega,uint arrayLength) {
-	uint idx = threadIdx.x+blockIdx.x*256;
-	arrayA[idx]%=MODP;
-	uint w0=ModExp(sqrt_omega,idx);
-	arrayB[idx]=ABModC(arrayA[idx],w0);
-}
-
-//負巡回計算の後処理
-//sqrt_omegaの2N乗が1 (mod P)
-//a[0]*=ModExp(sqrt_omega,-0)
-//a[1]*=ModExp(sqrt_omega,-1)
-//a[2]*=ModExp(sqrt_omega,-2)
-//a[3]*=ModExp(sqrt_omega,-3)
-__global__ void PostNegFMT(uint *arrayA,uint sqrt_omega,uint arrayLength) {
-	uint idx = threadIdx.x+blockIdx.x*256;
-	uint w0=ModExp(sqrt_omega,arrayLength*2-idx);
-	arrayA[idx]=ABModC(arrayA[idx],w0);
-}
-
-//負巡回計算と正巡回計算結果から、上半分桁と下半分桁を求める
-__global__ void PosNeg_To_HiLo(uint *arrayE,uint *arrayA,uint *arrayB,uint arrayLength) {
-	uint idx = threadIdx.x+blockIdx.x*256;
-	uint a=arrayA[idx];
-	uint b=arrayB[idx];
-	uint subab=(a-b+MODP);//まず(a-b)/2を求めたい
-	uint flag=subab%2;
-	subab-=MODP*((subab>=MODP)*2-1)*flag;//ここで絶対偶数になる
-	subab/=2;//(a-b)/2 MOD Pを算出
-	arrayE[idx+arrayLength]=subab;//上位桁は(a-b)/2 MOD P
-	arrayE[idx]=a-subab+MODP*(a<subab);//a-((a-b)/2)=a/2+b/2 つまり(a+b)/2が下位桁
-}
-
-
-//vramへの書き込み回数を減らす目的に作った関数
-//PostNegFMT関数とDivN関数とPosNeg_To_HiLo関数の統合版
-__global__ void PostFMT_DivN_HiLo(uint *arrayE,uint *arrayA,uint *arrayB,uint arrayLength,uint sqrt_omega) {
-	uint idx = threadIdx.x+blockIdx.x*256;
-	uint a=arrayA[idx];
-	uint b=arrayB[idx];
-
-	//ここは負巡回の後処理計算部分
-	uint w0=ModExp(sqrt_omega,idx+(idx%2)*arrayLength);
-	b=ABModC(b,w0);
-	
-	//Nで除算する関数
-	a=DivN_f(a,arrayLength);
-	b=DivN_f(b,arrayLength);
-	
-	//あとは一緒
-	uint subab=(a-b+MODP);//まず(a-b)/2を求めたい
-	uint flag=subab%2;
-	subab-=MODP*((subab>=MODP)*2-1)*flag;//ここで絶対偶数になる
-	subab/=2;//(a-b)/2 MOD Pを算出
-	arrayE[idx+arrayLength]=subab;//上位桁は(a-b)/2 MOD P
-	arrayE[idx]=a-subab+MODP*(a<subab);//a-((a-b)/2)=a/2+b/2 つまり(a+b)/2が下位桁
-}
+if __name__ == '__main__':
+    main()
