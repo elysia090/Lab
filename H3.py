@@ -1,10 +1,11 @@
 """
-Refactored SymPLONK Protocol Implementation
+Refactored SymPLONK Protocol Implementation with Reduced Computational Complexity
 
-This implementation encodes a secret polynomial using zero-knowledge proof commitments.
-It upgrades the GPU path by supporting full 256-bit arithmetic via multi-precision GPU kernels.
-Each 256-bit number is represented as 8 32-bit limbs, and Horner’s method is used for polynomial evaluation.
-A naive modular reduction is applied (improvements like Barrett reduction are left as TODO).
+This implementation encodes a secret polynomial using zero‐knowledge proof commitments.
+It upgrades the GPU path by supporting full 256‑bit arithmetic via a multi‐precision GPU kernel.
+For cases where the prime p fits in 64 bits, a vectorized (and thus less complex) CPU method is used.
+Each 256‑bit number is represented as 8 32‑bit limbs, and Horner’s method is used for polynomial evaluation.
+A naive modular reduction is applied (improvements such as Barrett reduction remain TODO).
 """
 
 import math
@@ -34,7 +35,7 @@ IntArray = npt.NDArray[np.int64]
 TEICH_THRESHOLD = 20000            # Threshold for full Teichmüller lift precomputation.
 BATCH_SIZE = 4096                  # Batch size for processing large arrays.
 MAX_THREADS_PER_BLOCK = 1024       # Maximum number of CUDA threads per block.
-MODULUS_THRESHOLD = (1 << 63) - 1    # Use multi-precision if p exceeds native 64-bit range.
+MODULUS_THRESHOLD = (1 << 63) - 1    # For p <= this, we can use native 64-bit arithmetic.
 
 # Known primitive roots for common cryptographic primes.
 KNOWN_PRIMITIVE_ROOTS = {
@@ -309,8 +310,8 @@ class SymPLONK:
     """
     Optimized implementation of the SymPLONK protocol using a fixed cyclic subgroup.
     
-    This version supports genuine 256-bit arithmetic on the GPU.
-    For primes exceeding the native 64-bit range, a multi-precision GPU kernel is used.
+    For primes that fit in 64 bits, a vectorized CPU polynomial evaluation is used.
+    For large (256-bit) primes, a multi-precision GPU kernel is employed.
     """
     def __init__(self, n: int, p: int, epsilon: float = 1e-10, use_gpu: bool = True) -> None:
         """
@@ -393,21 +394,32 @@ class SymPLONK:
 
     def poly_eval_horner_batch_cpu(self, x_vals: np.ndarray, coeffs: np.ndarray, p: int) -> np.ndarray:
         """
-        Evaluate a polynomial at multiple points using Horner's method (CPU version).
+        Evaluate a polynomial at multiple points modulo p.
+        
+        For p <= MODULUS_THRESHOLD, a vectorized method is used:
+          P(x) = sum_{j=0}^{deg} coeffs[j] * x^j (mod p)
+        Otherwise, a fallback iterative Horner's method is employed.
+        
+        Note: The polynomial is assumed to have the constant term first.
         """
         x_vals = np.asarray(x_vals, dtype=np.int64)
         coeffs = np.asarray(coeffs, dtype=np.int64)
         n_points = len(x_vals)
-        result = np.zeros(n_points, dtype=np.int64)
-        chunk_size = 1024
-        for chunk_start in range(0, n_points, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, n_points)
-            x_chunk = x_vals[chunk_start:chunk_end]
-            r_chunk = np.full_like(x_chunk, coeffs[-1])
+        deg = len(coeffs) - 1
+
+        if p <= MODULUS_THRESHOLD:
+            # Vectorized evaluation (reduces loop overhead)
+            exponents = np.arange(0, deg + 1, dtype=np.int64)
+            # Compute powers for all x in one shot and take mod p
+            powers = np.mod(np.power(x_vals[:, None], exponents), p)
+            result = np.mod(np.sum(powers * coeffs, axis=1), p)
+            return result
+        else:
+            # Fallback iterative Horner's method (for multi-precision, though slower)
+            result = np.full(n_points, coeffs[-1], dtype=np.int64)
             for c in reversed(coeffs[:-1]):
-                r_chunk = (r_chunk * x_chunk + c) % p
-            result[chunk_start:chunk_end] = r_chunk
-        return result
+                result = (result * x_vals + c) % p
+            return result
 
     def poly_eval_horner_batch_gpu_mp(self, x_vals: np.ndarray, coeffs: np.ndarray, p: int) -> np.ndarray:
         """
@@ -438,15 +450,15 @@ class SymPLONK:
         """
         Encode a secret as polynomial evaluations over the domain D_f.
         Returns the Teichmüller lift of the polynomial evaluation.
+        
+        The secret is interpreted as the coefficients of the polynomial in
+        increasing order (constant term first).
         """
         # Pad secret coefficients to length n.
         coeffs = np.array([c % self.p for c in secret] + [0] * (self.n - len(secret)), dtype=np.int64)
         # Evaluate the polynomial on the finite field domain.
-        if self.using_gpu:
-            if self.p > MODULUS_THRESHOLD:
-                poly_vals = self.poly_eval_horner_batch_gpu_mp(self.D_f, coeffs, self.p)
-            else:
-                poly_vals = self.poly_eval_horner_batch_cpu(self.D_f, coeffs, self.p)
+        if self.using_gpu and self.p > MODULUS_THRESHOLD:
+            poly_vals = self.poly_eval_horner_batch_gpu_mp(self.D_f, coeffs, self.p)
         else:
             poly_vals = self.poly_eval_horner_batch_cpu(self.D_f, coeffs, self.p)
         # Map field elements to their Teichmüller lifts.
@@ -532,7 +544,9 @@ class SymPLONK:
 def run_symplonk_demo() -> None:
     """
     Run a demonstration of the SymPLONK protocol.
+    
     Uses domain size n = 4096 and the secp256k1 prime (256-bit).
+    For large primes, the multi-precision GPU kernel is employed.
     """
     n_val = 4096
     p_val = (1 << 256) - (1 << 32) - 977  # secp256k1 prime
