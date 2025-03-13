@@ -124,7 +124,6 @@ class FiniteFieldUtils:
             return candidate
         return None
 
-
 def teichmuller_lift_batch(indices: np.ndarray, n: int) -> np.ndarray:
     """Compute Teichmüller lift using NumPy."""
     indices = indices.astype(np.float64)
