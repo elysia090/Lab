@@ -42,8 +42,6 @@ class Commitment:
     r: complex
     mask: ComplexArray
 
-
-
 class FiniteFieldUtils:
     """Optimized finite field utility functions with caching.
     
