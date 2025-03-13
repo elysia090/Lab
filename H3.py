@@ -1,9 +1,9 @@
 import math
 import time
+import threading
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union
-import threading
 
 import numpy as np
 import numpy.typing as npt
@@ -26,10 +26,10 @@ IntArray = npt.NDArray[np.int64]
 TEICH_THRESHOLD = 20000
 BATCH_SIZE = 4096
 MAX_THREADS_PER_BLOCK = 1024
-# If the modulus p is huge, we use multi-precision GPU kernel.
+# When modulus is huge, we use the multi-precision GPU kernel.
 MODULUS_THRESHOLD = (1 << 63) - 1  
 
-# Known primitive roots
+# Known primitive roots (to speed up computation)
 KNOWN_PRIMITIVE_ROOTS = {
     (1 << 256) - (1 << 32) - 977: 7  # secp256k1 prime
 }
@@ -44,7 +44,7 @@ class Commitment:
     mask: ComplexArray
 
 class FiniteFieldUtils:
-    """Finite field operations with caching."""
+    """Finite field utility functions with caching."""
     @staticmethod
     @lru_cache(maxsize=128)
     def divisors(n: int) -> List[int]:
@@ -108,16 +108,16 @@ class FiniteFieldUtils:
         return None
 
 def teichmuller_lift_batch(indices: np.ndarray, n: int) -> np.ndarray:
-    """Compute Teichmüller lift: exp(2πi * index / n) using NumPy."""
+    """Compute Teichmüller lift using NumPy."""
     indices = indices.astype(np.float64)
     return np.exp(1j * 2.0 * np.pi * indices / n)
 
 def gpu_teichmuller_lift_batch(indices: Any, n: int, xp: Any) -> Any:
-    """GPU-optimized Teichmüller lift computation using xp.exp."""
+    """Compute Teichmüller lift using xp.exp (GPU version)."""
     indices = indices.astype(xp.float64)
     return xp.exp(1j * 2.0 * xp.pi * indices / n)
 
-# Multi-precision GPU kernel source for Horner's method
+# Multi-precision GPU kernel source for Horner's method.
 multi_precision_kernel_source = r'''
 extern "C" __global__
 void poly_eval_horner_mp(const unsigned int* x_vals, const unsigned int* coeffs,
@@ -185,6 +185,7 @@ void poly_eval_horner_mp(const unsigned int* x_vals, const unsigned int* coeffs,
 '''
 
 def int_to_limbs(val: int) -> List[np.uint32]:
+    """Convert an integer to a list of 8 uint32 limbs (little-endian)."""
     limbs = []
     for _ in range(8):
         limbs.append(np.uint32(val & 0xFFFFFFFF))
@@ -192,17 +193,18 @@ def int_to_limbs(val: int) -> List[np.uint32]:
     return limbs
 
 def limbs_to_int(limbs: List[int]) -> int:
+    """Convert a list of 8 limbs (little-endian) to an integer."""
     val = 0
     for limb in reversed(limbs):
         val = (val << 32) | int(limb)
     return val
 
 class SymPLONK:
-    """GPU-native SymPLONK protocol with asynchronous processing via CuPy streams."""
+    """GPU-native SymPLONK protocol with asynchronous processing and rationalized code structure."""
     def __init__(self, n: int, p: int, epsilon: float = 1e-10, use_gpu: bool = True) -> None:
         """
         Initialize with domain size n and prime p.
-        All processing is performed on the GPU using CuPy in an asynchronous manner.
+        All processing is done on the GPU using asynchronous CuPy streams.
         """
         self.n = n
         self.p = p
@@ -226,9 +228,9 @@ class SymPLONK:
             self.xp = np
             print("Using CPU (NumPy).")
 
-        self._setup_domains()    # Domain setup with asynchronous precomputation
+        self._setup_domains()
         self.flow = HamiltonianFlow(self.xp)
-        self._precompute_flows()   # Precompute flow factors asynchronously
+        self._precompute_flows()
 
         if self.using_gpu and self.p > MODULUS_THRESHOLD:
             self.poly_eval_kernel_mp = cp.RawKernel(multi_precision_kernel_source, 'poly_eval_horner_mp')
@@ -236,7 +238,7 @@ class SymPLONK:
         self._split_eval_cache: Dict[str, Any] = {}
 
     def _setup_domains(self) -> None:
-        """Precompute finite field domain D_f and Teichmüller lifts using GPU arrays with asynchronous streams."""
+        """Compute finite field domain D_f and Teichmüller lifts on the GPU using asynchronous streams."""
         self.omega_f = FiniteFieldUtils.find_primitive_nth_root(self.n, self.p)
         if self.omega_f is None:
             print(f"Warning: No primitive {self.n}-th root found in F_{self.p}. Using sequential domain.")
@@ -250,7 +252,6 @@ class SymPLONK:
         self.D_f_indices = {int(elem): i for i, elem in enumerate(self.D_f)}
         indices_float = np.arange(self.n, dtype=np.float64)
         if self.using_gpu and self.n > TEICH_THRESHOLD:
-            # Create an asynchronous stream for Teichmüller lift computation
             stream = cp.cuda.Stream(non_blocking=True)
             with stream:
                 self.D = self.xp.empty(self.n, dtype=self.xp.complex128)
@@ -264,9 +265,10 @@ class SymPLONK:
             self.D = self.xp.array(domain_lifts, dtype=self.xp.complex128)
 
     def _precompute_flows(self) -> None:
-        """Precompute Hamiltonian flow factors using an asynchronous stream."""
+        """Precompute common Hamiltonian flow factors using an asynchronous stream."""
         stream = self.xp.cuda.Stream(non_blocking=True)
-        common_angles = [math.pi/8, math.pi/6, math.pi/4, math.pi/3, math.pi/2, 2*math.pi/3, 3*math.pi/4, math.pi, 2*math.pi]
+        common_angles = [math.pi/8, math.pi/6, math.pi/4, math.pi/3, math.pi/2,
+                         2*math.pi/3, 3*math.pi/4, math.pi, 2*math.pi]
         with stream:
             for t in common_angles:
                 self.flow._flow_cache[t] = self.xp.exp(1j * t)
@@ -274,8 +276,8 @@ class SymPLONK:
 
     def poly_eval_horner_split(self, x_vals: Any, coeffs: np.ndarray, p: int, d: Optional[int] = None) -> Any:
         """
-        Evaluate polynomial modulo p via split evaluation.
-        This function now runs entirely on GPU arrays.
+        Evaluate a polynomial modulo p via split evaluation on GPU.
+        Uses cached power terms to avoid redundant computation.
         """
         xp_local = self.xp
         x_vals = xp_local.asarray(x_vals, dtype=xp_local.int64)
@@ -285,8 +287,7 @@ class SymPLONK:
             return xp_local.zeros_like(x_vals, dtype=xp_local.int64)
         if d is None:
             d = 2 ** int(math.floor(math.log(math.sqrt(deg), 2))) if deg > 0 else 1
-            if d < 1:
-                d = 1
+            d = max(d, 1)
         cache_key = f"split_{len(coeffs)}_{d}"
         if cache_key in self._split_eval_cache:
             x_pow, X_d, d = self._split_eval_cache[cache_key]
@@ -308,7 +309,7 @@ class SymPLONK:
 
     def poly_eval_horner_batch_gpu_mp(self, x_vals: np.ndarray, coeffs: np.ndarray, p: int) -> np.ndarray:
         """
-        Evaluate polynomial using the multi-precision GPU kernel in an asynchronous stream.
+        Evaluate a polynomial using the multi-precision GPU kernel with asynchronous processing.
         """
         x_limbs = np.array([int_to_limbs(int(x)) for x in x_vals], dtype=np.uint32).flatten()
         coeffs_limbs = np.array([int_to_limbs(int(c)) for c in coeffs], dtype=np.uint32).flatten()
@@ -335,14 +336,14 @@ class SymPLONK:
     def polynomial_encode(self, secret: List[int]) -> Any:
         """
         Encode the secret polynomial (with constant term first) as evaluations over the domain.
-        This method is fully GPU-native and uses asynchronous processing.
+        Fully GPU-native and asynchronous.
         """
         coeffs = np.array([c % self.p for c in secret] + [0]*(self.n - len(secret)), dtype=np.int64)
         if self.using_gpu and self.p > MODULUS_THRESHOLD:
             poly_vals = self.poly_eval_horner_batch_gpu_mp(self.D_f, coeffs, self.p)
         else:
             poly_vals = self.poly_eval_horner_split(self.D_f, coeffs, self.p)
-        # Build indices as a CuPy array (remain on GPU)
+        # Build indices as a GPU (CuPy) array without converting back to NumPy.
         if self.using_gpu:
             indices = cp.array([self.D_f_indices.get(int(val), 0) for val in poly_vals])
         else:
@@ -352,8 +353,7 @@ class SymPLONK:
 
     def blind_evaluations(self, evaluations: Any, r: Optional[complex] = None) -> Tuple[Any, complex, Any]:
         """
-        Apply random blinding for zero-knowledge.
-        All operations are performed using GPU arrays.
+        Apply random blinding for zero-knowledge using GPU arrays.
         """
         xp = self.xp
         if r is None:
@@ -365,7 +365,7 @@ class SymPLONK:
     def alice_prove(self, secret: List[int], flow_time: float = math.pi/4) -> Commitment:
         """
         Prover (Alice) generates a zero-knowledge proof commitment.
-        The polynomial encoding and blinding are performed asynchronously on the GPU.
+        Uses asynchronous processing for polynomial encoding and blinding.
         """
         print("\n=== Alice (Prover) ===")
         print(f"Secret (mod {self.p}): {secret}")
@@ -375,7 +375,6 @@ class SymPLONK:
         def compute_encoding():
             nonlocal encoding
             encoding = self.polynomial_encode(secret)
-        # Launch the encoding computation in a separate thread
         thread = threading.Thread(target=compute_encoding)
         thread.start()
         thread.join()
@@ -408,7 +407,7 @@ class SymPLONK:
     def bob_verify(self, commitment: Union[Commitment, Dict[str, Any]]) -> bool:
         """
         Verifier (Bob) checks the zero-knowledge proof commitment.
-        The entire verification remains GPU-native.
+        Entire verification remains on GPU if available.
         """
         print("\n=== Bob (Verifier) ===")
         comm = Commitment(**commitment) if isinstance(commitment, dict) else commitment
@@ -451,4 +450,3 @@ def run_symplonk_demo() -> None:
 
 if __name__ == "__main__":
     run_symplonk_demo()
-
