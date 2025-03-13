@@ -4,7 +4,6 @@ import threading
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union
-
 import numpy as np
 import numpy.typing as npt
 from tqdm import tqdm
@@ -43,42 +42,61 @@ class Commitment:
     r: complex
     mask: ComplexArray
 
+
+
 class FiniteFieldUtils:
-    """Finite field utility functions with caching."""
+    """Optimized finite field utility functions with caching.
+    
+    For numbers that are powers of two, we short-circuit the divisor computation.
+    For prime factorization of small numbers, we use a dynamically updated trial division.
+    """
+    
     @staticmethod
     @lru_cache(maxsize=128)
     def divisors(n: int) -> List[int]:
+        # If n is a power of 2, then divisors are simply 2^i for i=0..k
+        if (n & (n - 1)) == 0:
+            k = n.bit_length() - 1  # because 2**k == n
+            return [2**i for i in range(k + 1)]
         divs = set()
         for i in range(1, int(math.sqrt(n)) + 1):
             if n % i == 0:
                 divs.add(i)
                 divs.add(n // i)
         return sorted(divs)
-
+    
     @staticmethod
     @lru_cache(maxsize=128)
     def prime_factors(n: int) -> List[int]:
+        # Use trial division for small n with dynamic adjustment of limit.
         factors = []
+        # Extract factor 2
         while n % 2 == 0:
             factors.append(2)
             n //= 2
         i = 3
-        while i * i <= n:
+        max_factor = math.isqrt(n) + 1
+        while i <= max_factor and n != 1:
             while n % i == 0:
                 factors.append(i)
                 n //= i
+                max_factor = math.isqrt(n) + 1
             i += 2
         if n > 1:
             factors.append(n)
         return sorted(set(factors))
-
+    
     @classmethod
     @lru_cache(maxsize=64)
     def find_primitive_root(cls, p: int) -> Optional[int]:
-        if p == 2:
-            return 1
+        # Return known primitive root if available.
+        KNOWN_PRIMITIVE_ROOTS = {
+            (1 << 256) - (1 << 32) - 977: 7  # secp256k1 prime
+        }
         if p in KNOWN_PRIMITIVE_ROOTS:
             return KNOWN_PRIMITIVE_ROOTS[p]
+        if p == 2:
+            return 1
         common_roots = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
         factors = cls.prime_factors(p - 1)
         exponents = [(p - 1) // f for f in factors]
@@ -91,10 +109,11 @@ class FiniteFieldUtils:
             if all(pow(candidate, exp, p) != 1 for exp in exponents):
                 return candidate
         return None
-
+    
     @classmethod
     @lru_cache(maxsize=64)
     def find_primitive_nth_root(cls, n: int, p: int) -> Optional[int]:
+        # Check divisibility condition.
         if (p - 1) % n != 0:
             return None
         g = cls.find_primitive_root(p)
@@ -102,10 +121,11 @@ class FiniteFieldUtils:
             return None
         k = (p - 1) // n
         candidate = pow(g, k, p)
-        proper_divisors = [d for d in cls.divisors(n) if d < n]
-        if all(pow(candidate, d, p) != 1 for d in proper_divisors):
+        proper_divs = [d for d in cls.divisors(n) if d < n]
+        if all(pow(candidate, d, p) != 1 for d in proper_divs):
             return candidate
         return None
+
 
 def teichmuller_lift_batch(indices: np.ndarray, n: int) -> np.ndarray:
     """Compute Teichmüller lift using NumPy."""
