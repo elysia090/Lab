@@ -526,8 +526,3 @@ def main():
 
 if __name__=="__main__":
     main()
-
-    print("[Log saved to final_logs.json]")
-
-if __name__=="__main__":
-    main()
