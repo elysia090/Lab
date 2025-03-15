@@ -1,3 +1,8 @@
+# TODO: 
+# Exception handling, lack of cryptographic random number generator, 
+# input validation, secure JSON processing, sanitizing file paths,
+# missing argument validation, improved logging, better side-channel protection
+
 import math
 import time
 import json
