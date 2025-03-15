@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 # Version metadata
 __version__ = "1.0.0"
-__author__ = "Refactored by Claude"
+
 
 # JSON schema definitions
 CONFIG_SCHEMA = {
