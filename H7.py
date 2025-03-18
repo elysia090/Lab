@@ -81,15 +81,14 @@ def ec_mul_g1(point: Tuple[FQ, FQ], scalar: int) -> Tuple[FQ, FQ]:
 
 def ec_mul_g2(point: Tuple[FQ2, FQ2], scalar: int) -> Tuple[FQ2, FQ2]:
     """
-    Stub for G2 scalar multiplication.
-    A complete implementation would perform the proper multiplication on G2.
+    Perform scalar multiplication on the G2 curve using the bn128_curve.multiply function.
     """
-    return point
+    return bn128_curve.multiply(point, scalar)
 
 def pairing_full(g1: Tuple[FQ, FQ], g2: Tuple[FQ2, FQ2]) -> int:
     """
-    Compute the complete pairing using py_ecc.bn128. The pairing value is hashed
-    (using SHA-256) and reduced modulo BN128.p.
+    Compute the complete pairing using py_ecc.bn128.
+    The pairing value is hashed (using SHA-256) and reduced modulo BN128.p.
     """
     pairing_value = bn128_pairing.pairing(g2, g1)
     pairing_str = str(pairing_value)
