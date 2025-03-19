@@ -5,48 +5,50 @@ import hashlib
 import secrets
 import os
 from typing import List, Dict, Tuple, Any, Optional
-import numpy as np
+import numpy as np  # used as default; will be replaced by CuPy if available
 from dataclasses import dataclass
 
-# ====================================================
-# 1. GPU Detection
-# ====================================================
+# --------------------------------------------------
+# GPU Detection and Setting xp to either CuPy or NumPy
+# --------------------------------------------------
 try:
     import cupy as cp
     from pycuda import driver as cuda
     import pycuda.autoinit
     GPU_AVAILABLE = True
+    xp = cp  # Use CuPy for GPU arrays
     print("[INFO] GPU acceleration enabled")
 except ImportError:
     GPU_AVAILABLE = False
+    xp = np  # Fallback to NumPy for CPU arrays
     print("[INFO] Using CPU-only mode")
 
-# ====================================================
-# 2. Import BN128 Parameters and Group Operations
-# ====================================================
+# --------------------------------------------------
+# Import BN128 Parameters and Group Operations from py_ecc.bn128
+# --------------------------------------------------
 from py_ecc.bn128.bn128_curve import (
-    field_modulus,  # Base field prime
-    b as curve_b,   # Curve coefficient (FQ(3))
-    G1,             # Generator for G1
-    G2,             # Generator for G2
+    field_modulus,     # Prime modulus of the base field
+    b as curve_b,      # Curve coefficient (FQ(3))
+    G1,                # Generator for G1 (affine coordinates)
+    G2,                # Generator for G2
     multiply as ec_multiply,  # Scalar multiplication
-    curve_order     # Order of the subgroup (prime order)
+    curve_order        # Order of the subgroup (prime order)
 )
 from py_ecc.bn128 import bn128_pairing
 from py_ecc.bn128.bn128_curve import add, neg  # Group addition and negation
 
-# ====================================================
-# 3. BN128 Wrapper Class
-# ====================================================
+# --------------------------------------------------
+# BN128 Wrapper Class
+# --------------------------------------------------
 class BN128:
     p = field_modulus
     b = curve_b
     G1_gen: Tuple[Any, Any] = G1
     G2_gen: Tuple[Any, Any] = G2
 
-# ====================================================
-# 4. Global Constants and Secure Random Generator
-# ====================================================
+# --------------------------------------------------
+# Global Constants and Secure Random Generation
+# --------------------------------------------------
 CONSTANTS = {
     'S_VAL': int.from_bytes(hashlib.sha256(b'S_VAL_SEED').digest()[:4], 'big') % curve_order,
     'H_VAL': int.from_bytes(hashlib.sha256(b'H_VAL_SEED').digest()[:4], 'big') % curve_order,
@@ -60,14 +62,14 @@ def secure_random(bits: int = 256) -> int:
     except Exception as e:
         raise RuntimeError("Secure random generation failed") from e
 
-# ====================================================
-# 5. Enhanced JSON Encoder
-# ====================================================
+# --------------------------------------------------
+# Enhanced JSON Encoder
+# --------------------------------------------------
 class EnhancedJSONEncoder(json.JSONEncoder):
     def default(self, obj):
         try:
-            if isinstance(obj, np.ndarray):
-                return obj.tolist()
+            if isinstance(obj, xp.ndarray):
+                return obj.get() if GPU_AVAILABLE else obj.tolist()
             elif isinstance(obj, (np.integer, int)):
                 return int(obj)
             elif isinstance(obj, (np.floating, float)):
@@ -80,9 +82,9 @@ class EnhancedJSONEncoder(json.JSONEncoder):
         except Exception:
             return f"[ENCODING_ERROR: {type(obj).__name__}]"
 
-# ====================================================
-# 6. Group Operations: G1 and G2 Multiplication and Pairing
-# ====================================================
+# --------------------------------------------------
+# Elliptic Curve Operations for G1 and G2
+# --------------------------------------------------
 def ec_mul_g1(point: Tuple[Any, Any], scalar: int) -> Tuple[Any, Any]:
     if point is None:
         raise ValueError("Invalid G1 point: None")
@@ -107,11 +109,11 @@ def pairing_full(g1: Tuple[Any, Any], g2: Tuple[Any, Any]) -> int:
     except Exception as e:
         raise RuntimeError("Pairing computation failed") from e
 
-# ====================================================
-# 7. Polynomial Helper Functions
-# ====================================================
+# --------------------------------------------------
+# Polynomial Helper Functions
+# --------------------------------------------------
 def poly_eval(coeffs: List[int], x: int) -> int:
-    """Evaluate f(x) = a0 + a1*x + ... + ad*x^d mod curve_order."""
+    """Evaluate f(x)=a0+a1*x+...+ad*x^d mod curve_order."""
     result = 0
     power = 1
     for coeff in coeffs:
@@ -121,8 +123,8 @@ def poly_eval(coeffs: List[int], x: int) -> int:
 
 def poly_division(coeffs: List[int], c: int) -> List[int]:
     """
-    Synthetic division of f(x) - f(c) by (x - c).
-    Coefficients are in increasing order. Returns quotient coefficients.
+    Synthetic division of f(x)-f(c) by (x-c).
+    Coeffs are in ascending order. Returns quotient coefficients.
     """
     d = len(coeffs) - 1
     rev = coeffs[::-1]
@@ -131,16 +133,16 @@ def poly_division(coeffs: List[int], c: int) -> List[int]:
         q.append((rev[i] + c * q[i - 1]) % curve_order)
     return q[:-1][::-1]  # Discard remainder and reverse back
 
-# ====================================================
-# 8. Generalized KZG Polynomial Commitment (Arbitrary Degree)
-# ====================================================
+# --------------------------------------------------
+# Generalized KZG Polynomial Commitment (Arbitrary Degree)
+# --------------------------------------------------
 class KZGPoly:
     @staticmethod
     def commit(degree: int, t: int) -> Tuple[Tuple[Any, Any], List[int]]:
         """
-        Generate random polynomial f(x)=a0+...+ad*x^d (degree d) in Z_curve_order.
-        Commitment: C = g^(f(t)).
-        Returns the commitment (a G1 point) and polynomial coefficients.
+        Generate random polynomial f(x)=a0+...+ad*x^d (degree d) and commit:
+          C = g^(f(t))
+        Returns the commitment and the polynomial coefficients.
         """
         try:
             coeffs = [secure_random(128) for _ in range(degree + 1)]
@@ -154,8 +156,8 @@ class KZGPoly:
     def open(coeffs: List[int], alpha: int, t: int) -> Tuple[int, Tuple[Any, Any]]:
         """
         Open the commitment at challenge alpha.
-        Compute f(alpha) and the witness proof π = g^(q(t)), where
-        q(x) = (f(x) - f(alpha))/(x - α) is the quotient polynomial.
+        Compute f(alpha) and produce witness π = g^(q(t)), where
+          q(x) = (f(x)-f(alpha))/(x-α)
         """
         try:
             evaluation = poly_eval(coeffs, alpha)
@@ -170,13 +172,12 @@ class KZGPoly:
     def verify(commitment: Tuple[Any, Any], evaluation: int,
                proof: Tuple[Any, Any], alpha: int, t: int) -> bool:
         """
-        Verify opening by checking:
-          e(C / g^(f(alpha)), h) == e(π, h^(t - α))
-        using group subtraction and pairing functions.
+        Verify the opening using the pairing check:
+          e(C / g^(f(α)), h) ?= e(π, h^(t-α))
         """
         try:
             g_falpha = ec_mul_g1(BN128.G1_gen, evaluation)
-            C_div = add(commitment, neg(g_falpha))
+            C_div = add(commitment, neg(g_falpha))  # C - g^(f(α))
             exponent = (t - alpha) % curve_order
             h_factor = ec_mul_g2(BN128.G2_gen, exponent)
             left = pairing_full(C_div, BN128.G2_gen)
@@ -189,9 +190,9 @@ class KZGPoly:
             print("Error in KZG polynomial verification:", e)
             return False
 
-# ====================================================
-# 9. Complex Transformations for Binding
-# ====================================================
+# --------------------------------------------------
+# Complex Transformations and Binding using xp (CuPy or NumPy)
+# --------------------------------------------------
 class ComplexTransformations:
     @staticmethod
     def teichmuller_lift(val: int, n: int) -> complex:
@@ -202,46 +203,46 @@ class ComplexTransformations:
             raise RuntimeError("Teichmuller lift failed") from e
 
     @staticmethod
-    def apply_flow(arr: np.ndarray, flow_time: float) -> np.ndarray:
+    def apply_flow(arr: xp.ndarray, flow_time: float) -> xp.ndarray:
         try:
-            return arr * np.exp(complex(0, flow_time))
+            return arr * xp.exp(complex(0, flow_time))
         except Exception as e:
             raise RuntimeError("Flow application failed") from e
 
     @staticmethod
-    def apply_flow_inverse(arr: np.ndarray, flow_time: float) -> np.ndarray:
+    def apply_flow_inverse(arr: xp.ndarray, flow_time: float) -> xp.ndarray:
         try:
-            return arr * np.exp(complex(0, -flow_time))
+            return arr * xp.exp(complex(0, -flow_time))
         except Exception as e:
             raise RuntimeError("Inverse flow application failed") from e
 
     @staticmethod
-    def derive_binding(metadata: Dict) -> np.ndarray:
+    def derive_binding(metadata: Dict) -> xp.ndarray:
         try:
             serialized = json.dumps(metadata, sort_keys=True).encode('utf-8')
             hash_value = hashlib.sha256(serialized).digest()
             hmac_key = b"binding_derivation_key"
             hmac_result = hmac_sha256(hmac_key, hash_value)
-            binding = np.zeros(len(hmac_result) * 4, dtype=np.complex128)
+            binding = xp.zeros(len(hmac_result) * 4, dtype=xp.complex128)
             for i, byte in enumerate(hmac_result):
                 for j in range(4):
                     bits = (byte >> (j * 2)) & 0x03
-                    binding[i * 4 + j] = np.exp(complex(0, bits * (math.pi / 2)))
+                    binding[i * 4 + j] = xp.exp(complex(0, bits * (math.pi / 2)))
             return binding
         except Exception as e:
             raise RuntimeError("Binding derivation failed") from e
 
     @staticmethod
-    def resize_binding(binding: np.ndarray, target_size: int) -> np.ndarray:
+    def resize_binding(binding: xp.ndarray, target_size: int) -> xp.ndarray:
         try:
-            if len(binding) == target_size:
+            if binding.size == target_size:
                 return binding
-            if len(binding) < 2:
-                return np.full(target_size, binding[0] if binding.size > 0 else complex(1, 0))
-            indices = np.linspace(0, len(binding) - 1, target_size)
-            binding_resized = np.zeros(target_size, dtype=np.complex128)
-            idx_floor = np.floor(indices).astype(int)
-            idx_ceil = np.minimum(np.ceil(indices).astype(int), len(binding) - 1)
+            if binding.size < 2:
+                return xp.full(target_size, binding[0] if binding.size > 0 else complex(1, 0))
+            indices = xp.linspace(0, binding.size - 1, target_size)
+            binding_resized = xp.zeros(target_size, dtype=xp.complex128)
+            idx_floor = xp.floor(indices).astype(int)
+            idx_ceil = xp.minimum(xp.ceil(indices).astype(int), binding.size - 1)
             t = indices - idx_floor
             same_idx = (idx_floor == idx_ceil)
             binding_resized[same_idx] = binding[idx_floor[same_idx]]
@@ -252,44 +253,44 @@ class ComplexTransformations:
             raise RuntimeError("Binding resize failed") from e
 
     @staticmethod
-    def apply_binding(base_arr: np.ndarray, metadata: Dict, strength: float = 0.3) -> np.ndarray:
+    def apply_binding(base_arr: xp.ndarray, metadata: Dict, strength: float = 0.3) -> xp.ndarray:
         try:
             binding = ComplexTransformations.derive_binding(metadata)
             if binding.size != base_arr.size:
                 binding = ComplexTransformations.resize_binding(binding, base_arr.size)
-            norm = np.linalg.norm(binding)
+            norm = xp.linalg.norm(binding)
             binding_norm = binding / norm if norm > 1e-12 else binding
             noise_factor = 1e-10
-            noise = np.random.normal(0, noise_factor, base_arr.shape) + 1j * np.random.normal(0, noise_factor, base_arr.shape)
+            noise = xp.random.normal(0, noise_factor, base_arr.shape) + 1j * xp.random.normal(0, noise_factor, base_arr.shape)
             return base_arr + strength * binding_norm + noise
         except Exception as e:
             raise RuntimeError("Applying binding failed") from e
 
     @staticmethod
-    def verify_binding(bound_arr: np.ndarray, metadata: Dict, strength: float = 0.3, threshold: float = 0.15) -> Tuple[bool, float]:
+    def verify_binding(bound_arr: xp.ndarray, metadata: Dict, strength: float = 0.3, threshold: float = 0.15) -> Tuple[bool, float]:
         try:
             n = metadata["n"]
             base_val = ComplexTransformations.teichmuller_lift(17, n)
-            base_arr = np.full(n, base_val, dtype=np.complex128)
+            base_arr = xp.full(n, base_val, dtype=xp.complex128)
             extracted = (bound_arr - base_arr) / strength
             expected = ComplexTransformations.derive_binding(metadata)
             if expected.size != extracted.size:
                 expected = ComplexTransformations.resize_binding(expected, extracted.size)
-            norm_expected = np.linalg.norm(expected)
-            norm_extracted = np.linalg.norm(extracted)
+            norm_expected = xp.linalg.norm(expected)
+            norm_extracted = xp.linalg.norm(extracted)
             if norm_expected > 1e-12:
                 expected /= norm_expected
             if norm_extracted > 1e-12:
                 extracted /= norm_extracted
-            similarity = float(np.abs(np.vdot(extracted, expected)))
+            similarity = float(xp.abs(xp.vdot(extracted, expected)))
             return similarity >= threshold, similarity
         except Exception as e:
             print("Error in binding verification:", e)
             return False, 0.0
 
-# ====================================================
+# --------------------------------------------------
 # 10. HMAC-SHA256 Utility
-# ====================================================
+# --------------------------------------------------
 def hmac_sha256(key: bytes, message: bytes) -> bytes:
     try:
         block_size = 64
@@ -303,9 +304,9 @@ def hmac_sha256(key: bytes, message: bytes) -> bytes:
     except Exception as e:
         raise RuntimeError("HMAC-SHA256 computation failed") from e
 
-# ====================================================
-# 11. Audit Logging
-# ====================================================
+# --------------------------------------------------
+# 11. Audit Logging Classes
+# --------------------------------------------------
 @dataclass
 class AuditEntry:
     timestamp: float
@@ -379,9 +380,9 @@ class AuditLog:
         except Exception as e:
             raise RuntimeError("Audit log integrity verification failed") from e
 
-# ====================================================
-# 12. Prover Session and Aggregator (Generalized)
-# ====================================================
+# --------------------------------------------------
+# 12. Prover Session and MultiProver Aggregator Classes
+# --------------------------------------------------
 class ProverSession:
     def __init__(self, aggregator: "MultiProverAggregator", session_id: str, n: int = 128, chunk_size: int = 64, poly_degree: int = 3):
         self.agg = aggregator
@@ -396,20 +397,19 @@ class ProverSession:
         self.last_activity = self.creation_time
         self.activity_count = 0
         self.status = "INITIALIZED"
-        # Generate trusted setup parameter t for the SRS.
+        # Trusted setup parameter t
         self.t = secure_random(128)
-        print(f"[INFO] {'GPU' if self.use_gpu else 'CPU'} mode for session {session_id} with trusted setup parameter t = {self.t}")
+        print(f"[INFO] {'GPU' if self.use_gpu else 'CPU'} mode for session {session_id} with t = {self.t}")
 
     def _update_activity(self):
         self.last_activity = time.time()
         self.activity_count += 1
 
-    def commit(self) -> Tuple[Tuple[Any, Any], np.ndarray, float, Dict]:
+    def commit(self) -> Tuple[Tuple[Any, Any], xp.ndarray, float, Dict]:
         try:
             self._update_activity()
-            # Commit to polynomial f(x)=a0+...+ad*x^d using KZGPoly
             commit_val, coeffs = KZGPoly.commit(self.poly_degree, self.t)
-            base_arr = np.full(self.n, ComplexTransformations.teichmuller_lift(17, self.n), dtype=np.complex128)
+            base_arr = xp.full(self.n, ComplexTransformations.teichmuller_lift(17, self.n), dtype=xp.complex128)
             metadata = {
                 "session_id": self.session_id,
                 "commit_timestamp": time.time(),
@@ -438,7 +438,7 @@ class ProverSession:
         except Exception as e:
             raise RuntimeError("Commit phase in ProverSession failed") from e
 
-    def respond(self, alpha: int, final_arr: np.ndarray, flow_t: float, metadata: Dict) -> Tuple[int, Tuple[Any, Any]]:
+    def respond(self, alpha: int, final_arr: xp.ndarray, flow_t: float, metadata: Dict) -> Tuple[int, Tuple[Any, Any]]:
         try:
             self._update_activity()
             if self.status != "COMMITTED":
@@ -502,7 +502,7 @@ class MultiProverAggregator:
             raise RuntimeError("Challenge generation failed") from e
 
     def verify(self, sid: str, commit_val: Tuple[Any, Any], alpha: int, 
-               evaluation: int, proof: Tuple[Any, Any], final_arr: np.ndarray, 
+               evaluation: int, proof: Tuple[Any, Any], final_arr: xp.ndarray, 
                flow_t: float, metadata: Dict) -> Tuple[bool, Dict]:
         if sid not in self.sessions:
             raise ValueError(f"Unknown session ID: {sid}")
@@ -510,8 +510,8 @@ class MultiProverAggregator:
             ok_kzg = KZGPoly.verify(commit_val, evaluation, proof, alpha, metadata["t"])
             undone = ComplexTransformations.apply_flow_inverse(final_arr, flow_t)
             binding_ok, similarity = ComplexTransformations.verify_binding(undone, metadata)
-            mean_magnitude = float(np.mean(np.abs(undone)))
-            magnitude_diff = abs(mean_magnitude - 1.0)
+            mean_mag = float(xp.mean(xp.abs(undone)).get() if GPU_AVAILABLE else xp.mean(xp.abs(undone)))
+            magnitude_diff = abs(mean_mag - 1.0)
             ok_flow = (magnitude_diff < 0.02)
             metadata_ok = (
                 metadata.get("session_id") == sid and
@@ -577,9 +577,9 @@ class SecurityError(Exception):
     """Raised for security-related issues."""
     pass
 
-# ====================================================
+# --------------------------------------------------
 # 13. Demonstration Function
-# ====================================================
+# --------------------------------------------------
 def run_demonstration():
     try:
         print("=== Starting Enhanced Cryptographic Protocol Demonstration ===\n")
@@ -639,4 +639,5 @@ def run_demonstration():
 
 if __name__ == "__main__":
     run_demonstration()
+
 
