@@ -9,7 +9,7 @@ import numpy as np
 from dataclasses import dataclass
 
 # --------------------------------------------------
-# GPU Detection
+# GPU Detection (if available)
 # --------------------------------------------------
 try:
     import cupy as cp
@@ -26,26 +26,26 @@ except ImportError:
 # --------------------------------------------------
 from py_ecc.bn128.bn128_curve import (
     field_modulus,     # Prime modulus of the base field
-    b as curve_b,      # Curve coefficient (typically FQ(3))
+    b as curve_b,      # Curve coefficient (FQ(3))
     G1,                # Generator for G1 (affine coordinates)
     G2,                # Generator for G2
-    multiply as ec_multiply,  # Scalar multiplication function
+    multiply as ec_multiply,  # Scalar multiplication
     curve_order        # Order of the subgroup (prime order)
 )
 from py_ecc.bn128 import bn128_pairing
-from py_ecc.bn128.bn128_curve import add, neg  # For group addition and negation
+from py_ecc.bn128.bn128_curve import add, neg  # Group operations
 
 # --------------------------------------------------
-# BN128 Class Definition (Aligned with Library)
+# BN128 Class (Aligned with Library)
 # --------------------------------------------------
 class BN128:
-    p = field_modulus       # Base field prime
-    b = curve_b             # Curve coefficient
-    G1_gen: Tuple[Any, Any] = G1   # G1 generator
-    G2_gen: Tuple[Any, Any] = G2   # G2 generator
+    p = field_modulus
+    b = curve_b
+    G1_gen: Tuple[Any, Any] = G1
+    G2_gen: Tuple[Any, Any] = G2
 
 # --------------------------------------------------
-# Global Constants and Secure Random Number Generation
+# Global Constants and Secure Random Generation
 # --------------------------------------------------
 CONSTANTS = {
     'S_VAL': int.from_bytes(hashlib.sha256(b'S_VAL_SEED').digest()[:4], 'big') % curve_order,
@@ -81,7 +81,7 @@ class EnhancedJSONEncoder(json.JSONEncoder):
             return f"[ENCODING_ERROR: {type(obj).__name__}]"
 
 # --------------------------------------------------
-# Elliptic Curve Operations (G1 and G2)
+# Elliptic Curve Operations for G1 and G2
 # --------------------------------------------------
 def ec_mul_g1(point: Tuple[Any, Any], scalar: int) -> Tuple[Any, Any]:
     if point is None:
@@ -108,52 +108,89 @@ def pairing_full(g1: Tuple[Any, Any], g2: Tuple[Any, Any]) -> int:
         raise RuntimeError("Pairing computation failed") from e
 
 # --------------------------------------------------
-# Simplified KZG Commitment Scheme for Degree-1 Polynomial
+# Polynomial Helper Functions
 # --------------------------------------------------
-class KZG_Deg1:
+def poly_eval(coeffs: List[int], x: int) -> int:
+    """Evaluate polynomial f(x) = a0 + a1*x + ... + ad*x^d modulo curve_order."""
+    result = 0
+    power = 1
+    for coeff in coeffs:
+        result = (result + coeff * power) % curve_order
+        power = (power * x) % curve_order
+    return result
+
+def poly_division(coeffs: List[int], c: int) -> List[int]:
+    """
+    Perform synthetic division of polynomial f(x) by (x - c).
+    Coeffs are in increasing order: [a0, a1, ..., ad].
+    Returns quotient coefficients q such that f(x) - f(c) = (x - c)*q(x).
+    """
+    d = len(coeffs) - 1
+    # Reverse to get highest degree first.
+    rev = coeffs[::-1]
+    q = [rev[0]]  # q[0] is the leading coefficient of the quotient.
+    for i in range(1, d + 1):
+        # q[i] = rev[i] + c * q[i-1] mod curve_order.
+        q.append((rev[i] + c * q[i - 1]) % curve_order)
+    # The last element is the remainder f(c). Discard it.
+    quotient = q[:-1]
+    # Reverse back to ascending order.
+    return quotient[::-1]
+
+# --------------------------------------------------
+# Generalized KZG Polynomial Commitment (Arbitrary Degree)
+# --------------------------------------------------
+class KZGPoly:
     @staticmethod
-    def commit(t: int) -> Tuple[Tuple[Any, Any], Dict]:
+    def commit(degree: int, t: int) -> Tuple[Tuple[Any, Any], List[int]]:
         """
-        Commit to a degree-1 polynomial f(x) = a0 + a1*x.
-        Evaluate f(t) using the trusted setup parameter t.
-        Returns commitment: C = g^(f(t)) and metadata containing a0, a1, and t.
+        Generate a random polynomial f(x) = a0 + a1*x + ... + ad*x^d (degree d)
+        with coefficients in Z_curve_order. Compute the commitment:
+          C = g^{f(t)} = g^{a0 + a1*t + ... + ad*t^d}
+        Returns the commitment (a G1 point) and the list of coefficients.
         """
         try:
-            a0 = secure_random(128)
-            a1 = secure_random(128)
-            f_t = (a0 + a1 * t) % curve_order
+            coeffs = [secure_random(128) for _ in range(degree + 1)]
+            f_t = poly_eval(coeffs, t)
             commitment = ec_mul_g1(BN128.G1_gen, f_t)
-            metadata = {"a0": a0, "a1": a1, "t": t}
-            return commitment, metadata
+            return commitment, coeffs
         except Exception as e:
-            raise RuntimeError("KZG commitment failed") from e
+            raise RuntimeError("KZG polynomial commitment failed") from e
 
     @staticmethod
-    def open(metadata: Dict, alpha: int) -> Tuple[int, Tuple[Any, Any]]:
+    def open(coeffs: List[int], alpha: int, t: int) -> Tuple[int, Tuple[Any, Any]]:
         """
         Open the commitment at challenge alpha.
-        Compute f(alpha) = a0 + a1*alpha mod curve_order and output proof = g^(a1).
+        Compute evaluation f(alpha) and compute the witness (proof) as
+          π = g^{q(t)},
+        where q(x) is the quotient polynomial of (f(x)-f(alpha))/(x-α).
         """
         try:
-            a0 = metadata["a0"]
-            a1 = metadata["a1"]
-            evaluation = (a0 + a1 * alpha) % curve_order
-            proof = ec_mul_g1(BN128.G1_gen, a1)
+            evaluation = poly_eval(coeffs, alpha)
+            # Compute quotient polynomial q(x) = (f(x)-f(alpha))/(x - alpha)
+            # This division is exact because f(alpha) is the evaluation.
+            q_coeffs = poly_division(coeffs, alpha)
+            q_t = poly_eval(q_coeffs, t)
+            proof = ec_mul_g1(BN128.G1_gen, q_t)
             return evaluation, proof
         except Exception as e:
-            raise RuntimeError("KZG opening failed") from e
+            raise RuntimeError("KZG polynomial opening failed") from e
 
     @staticmethod
-    def verify(commitment: Tuple[Any, Any], evaluation: int,
-               proof: Tuple[Any, Any], metadata: Dict, alpha: int) -> bool:
+    def verify(commitment: Tuple[Any, Any], evaluation: int, proof: Tuple[Any, Any],
+               alpha: int, t: int) -> bool:
         """
-        Verify the commitment using the pairing check:
-        Verify that e(C - g^(f(alpha)), g2) equals e(proof, g2^(t - alpha)).
+        Verify the KZG opening using the pairing check.
+        Check whether:
+          e(C / g^{f(alpha)}, h) == e(π, h^{t - α})
+        where division is implemented as group subtraction.
         """
         try:
-            t = metadata["t"]
+            # Compute g^{f(alpha)}
             g_falpha = ec_mul_g1(BN128.G1_gen, evaluation)
-            C_div = add(commitment, neg(g_falpha))  # Group subtraction: C - g^(f(alpha))
+            # Compute C_div = commitment * inv(g^{f(alpha)}) = commitment - g^{f(alpha)}
+            C_div = add(commitment, neg(g_falpha))
+            # Compute h^{(t - alpha)} in G2
             exponent = (t - alpha) % curve_order
             h_factor = ec_mul_g2(BN128.G2_gen, exponent)
             left = pairing_full(C_div, BN128.G2_gen)
@@ -163,11 +200,11 @@ class KZG_Deg1:
                 result |= ((left >> i) & 1) ^ ((right >> i) & 1)
             return result == 0
         except Exception as e:
-            print("Error in KZG verification:", e)
+            print("Error in KZG polynomial verification:", e)
             return False
 
 # --------------------------------------------------
-# Complex Transformations for Binding Operations
+# Complex Transformations for Binding (Unchanged)
 # --------------------------------------------------
 class ComplexTransformations:
     @staticmethod
@@ -271,7 +308,7 @@ class ComplexTransformations:
 # --------------------------------------------------
 def hmac_sha256(key: bytes, message: bytes) -> bytes:
     try:
-        block_size = 64  # SHA-256 block size
+        block_size = 64
         if len(key) > block_size:
             key = hashlib.sha256(key).digest()
         key = key.ljust(block_size, b'\x00')
@@ -367,22 +404,23 @@ class AuditLog:
             raise RuntimeError("Audit log integrity verification failed") from e
 
 # --------------------------------------------------
-# Prover Session and MultiProver Aggregator Classes
+# Prover Session and MultiProver Aggregator Classes (Generalized)
 # --------------------------------------------------
 class ProverSession:
-    def __init__(self, aggregator: "MultiProverAggregator", session_id: str, n: int = 128, chunk_size: int = 64):
+    def __init__(self, aggregator: "MultiProverAggregator", session_id: str, n: int = 128, chunk_size: int = 64, poly_degree: int = 3):
         self.agg = aggregator
         self.log = aggregator.log
         self.session_id = session_id
         self.n = n
         self.chunk_size = chunk_size
+        self.poly_degree = poly_degree
         self.use_gpu = GPU_AVAILABLE
         self.session_key = secrets.token_hex(32)
         self.creation_time = time.time()
         self.last_activity = self.creation_time
         self.activity_count = 0
         self.status = "INITIALIZED"
-        # Generate a trusted setup parameter t for KZG_Deg1 commitment
+        # Generate a trusted setup parameter t for the SRS
         self.t = secure_random(128)
         print(f"[INFO] {'GPU' if self.use_gpu else 'CPU'} mode for session {session_id} with trusted setup parameter t = {self.t}")
 
@@ -393,8 +431,8 @@ class ProverSession:
     def commit(self) -> Tuple[Tuple[Any, Any], np.ndarray, float, Dict]:
         try:
             self._update_activity()
-            # Use KZG_Deg1 to commit to a degree-1 polynomial f(x)= a0 + a1*x.
-            commit_val, poly_metadata = KZG_Deg1.commit(self.t)
+            # Commit to a polynomial of degree poly_degree using KZGPoly.
+            commit_val, poly_coeffs = KZGPoly.commit(self.poly_degree, self.t)
             base_arr = np.full(self.n, ComplexTransformations.teichmuller_lift(17, self.n), dtype=np.complex128)
             metadata = {
                 "session_id": self.session_id,
@@ -404,7 +442,9 @@ class ProverSession:
                 "commitment_value": str(commit_val),
                 "metadata_version": "2.0",
                 "secure_nonce": secrets.token_hex(16),
-                "poly_metadata": poly_metadata
+                "poly_coeffs": poly_coeffs,
+                "poly_degree": self.poly_degree,
+                "t": self.t
             }
             bound_arr = ComplexTransformations.apply_binding(base_arr, metadata)
             seed_hash = hashlib.sha256(f"{self.session_id}:{self.session_key}:{self.creation_time}".encode('utf-8')).digest()
@@ -428,8 +468,7 @@ class ProverSession:
             self._update_activity()
             if self.status != "COMMITTED":
                 raise ValueError(f"Invalid session state: {self.status}. Expected: COMMITTED")
-            # Open the commitment at challenge alpha.
-            evaluation, proof = KZG_Deg1.open(metadata["poly_metadata"], alpha)
+            evaluation, proof = KZGPoly.open(metadata["poly_coeffs"], alpha, self.t)
             challenge_binding = hmac_sha256(
                 f"{alpha}:{self.session_id}".encode('utf-8'),
                 f"{self.session_key}".encode('utf-8')
@@ -458,14 +497,15 @@ class MultiProverAggregator:
         except Exception as e:
             raise RuntimeError("Failed to initialize MultiProverAggregator") from e
 
-    def new_session(self, sid: str, n: int = 128, chunk_size: int = 64) -> ProverSession:
+    def new_session(self, sid: str, n: int = 128, chunk_size: int = 64, poly_degree: int = 3) -> ProverSession:
         if sid in self.sessions:
             raise ValueError(f"Session ID '{sid}' already exists")
-        session = ProverSession(self, sid, n, chunk_size)
+        session = ProverSession(self, sid, n, chunk_size, poly_degree)
         self.sessions[sid] = session
         self.log.record("SESSION_CREATE", sid, {
             "n": n,
             "chunk_size": chunk_size,
+            "poly_degree": poly_degree,
             "creation_time": session.creation_time
         })
         return session
@@ -492,8 +532,7 @@ class MultiProverAggregator:
         if sid not in self.sessions:
             raise ValueError(f"Unknown session ID: {sid}")
         try:
-            poly_metadata = metadata.get("poly_metadata", {})
-            ok_kzg = KZG_Deg1.verify(commit_val, evaluation, proof, poly_metadata, alpha)
+            ok_kzg = KZGPoly.verify(commit_val, evaluation, proof, alpha, metadata["t"])
             undone = ComplexTransformations.apply_flow_inverse(final_arr, flow_t)
             binding_ok, similarity = ComplexTransformations.verify_binding(undone, metadata)
             mean_magnitude = float(np.mean(np.abs(undone)))
@@ -572,11 +611,11 @@ def run_demonstration():
         aggregator = MultiProverAggregator()
 
         print("=== Prover-Alpha: Commitment Phase ===")
-        session_a = aggregator.new_session("prover-alpha", 128, 64)
+        session_a = aggregator.new_session("prover-alpha", 128, 64, poly_degree=5)
         commit_val_a, array_a, flow_a, metadata_a = session_a.commit()
 
         print("\n=== Prover-Beta: Commitment Phase ===")
-        session_b = aggregator.new_session("prover-beta", 128, 64)
+        session_b = aggregator.new_session("prover-beta", 128, 64, poly_degree=5)
         commit_val_b, array_b, flow_b, metadata_b = session_b.commit()
 
         print("\n=== Aggregator: Challenge Generation ===")
