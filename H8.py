@@ -9,7 +9,7 @@ import numpy as np
 from dataclasses import dataclass
 
 # --------------------------------------------------
-# GPU Detection (if available)
+# GPU Detection
 # --------------------------------------------------
 try:
     import cupy as cp
@@ -25,44 +25,43 @@ except ImportError:
 # Import BN128 Parameters and Operations from py_ecc.bn128
 # --------------------------------------------------
 from py_ecc.bn128.bn128_curve import (
-    field_modulus,  # Prime modulus of the base field
-    b as curve_b,   # Curve coefficient (FQ(3))
-    G1,             # Generator for G1 (affine coordinates)
-    G2,             # Generator for G2
+    field_modulus,     # Prime modulus of the base field
+    b as curve_b,      # Curve coefficient (typically FQ(3))
+    G1,                # Generator for G1 (affine coordinates)
+    G2,                # Generator for G2
     multiply as ec_multiply,  # Scalar multiplication function
-    curve_order     # Order of the subgroup (prime order)
+    curve_order        # Order of the subgroup (prime order)
 )
-from py_ecc.bn128 import bn128_pairing  # Pairing implementation
+from py_ecc.bn128 import bn128_pairing
+from py_ecc.bn128.bn128_curve import add, neg  # For group addition and negation
 
 # --------------------------------------------------
-# BN128 Class Definition (Wrapper for Parameters)
+# BN128 Class Definition (Aligned with Library)
 # --------------------------------------------------
 class BN128:
-    p = field_modulus
-    b = curve_b
-    G1_gen: Tuple[Any, Any] = G1
-    G2_gen: Tuple[Any, Any] = G2
+    p = field_modulus       # Base field prime
+    b = curve_b             # Curve coefficient
+    G1_gen: Tuple[Any, Any] = G1   # G1 generator
+    G2_gen: Tuple[Any, Any] = G2   # G2 generator
 
 # --------------------------------------------------
-# Global Constants and Secure Random Generator
-# All scalars are reduced modulo curve_order.
+# Global Constants and Secure Random Number Generation
 # --------------------------------------------------
 CONSTANTS = {
     'S_VAL': int.from_bytes(hashlib.sha256(b'S_VAL_SEED').digest()[:4], 'big') % curve_order,
     'H_VAL': int.from_bytes(hashlib.sha256(b'H_VAL_SEED').digest()[:4], 'big') % curve_order,
-    # F_POLY_VAL is not used in the polynomial scheme below.
     'F_POLY_VAL': int.from_bytes(hashlib.sha256(b'F_POLY_VAL_SEED').digest()[:4], 'big') % curve_order
 }
 
 def secure_random(bits: int = 256) -> int:
-    """Generate a cryptographically secure random scalar in Z_curve_order."""
+    """Generate a cryptographically secure random number in Z_curve_order."""
     try:
         return int.from_bytes(secrets.token_bytes(bits // 8 + (1 if bits % 8 else 0)), 'big') % curve_order
     except Exception as e:
         raise RuntimeError("Failed to generate secure random number") from e
 
 # --------------------------------------------------
-# Enhanced JSON Encoder for numpy arrays, complex numbers, etc.
+# Enhanced JSON Encoder
 # --------------------------------------------------
 class EnhancedJSONEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -82,10 +81,9 @@ class EnhancedJSONEncoder(json.JSONEncoder):
             return f"[ENCODING_ERROR: {type(obj).__name__}]"
 
 # --------------------------------------------------
-# Elliptic Curve Operations
+# Elliptic Curve Operations (G1 and G2)
 # --------------------------------------------------
 def ec_mul_g1(point: Tuple[Any, Any], scalar: int) -> Tuple[Any, Any]:
-    """Perform scalar multiplication on a G1 point."""
     if point is None:
         raise ValueError("Invalid G1 point: None")
     try:
@@ -94,7 +92,6 @@ def ec_mul_g1(point: Tuple[Any, Any], scalar: int) -> Tuple[Any, Any]:
         raise RuntimeError("G1 scalar multiplication failed") from e
 
 def ec_mul_g2(point: Tuple[Any, Any], scalar: int) -> Tuple[Any, Any]:
-    """Perform scalar multiplication on a G2 point."""
     if point is None:
         raise ValueError("Invalid G2 point: None")
     try:
@@ -103,7 +100,6 @@ def ec_mul_g2(point: Tuple[Any, Any], scalar: int) -> Tuple[Any, Any]:
         raise RuntimeError("G2 scalar multiplication failed") from e
 
 def pairing_full(g1: Tuple[Any, Any], g2: Tuple[Any, Any]) -> int:
-    """Compute a pairing and return a hashed integer modulo BN128.p."""
     try:
         pairing_value = bn128_pairing.pairing(g2, g1)
         pairing_str = str(pairing_value)
@@ -112,18 +108,15 @@ def pairing_full(g1: Tuple[Any, Any], g2: Tuple[Any, Any]) -> int:
         raise RuntimeError("Pairing computation failed") from e
 
 # --------------------------------------------------
-# KZG Commitment Scheme (Degree-1 Polynomial)
+# Simplified KZG Commitment Scheme for Degree-1 Polynomial
 # --------------------------------------------------
-# This simplified scheme commits to a degree-1 polynomial:
-#    f(x) = a0 + a1 * x   (mod curve_order)
-# A trusted setup parameter t is used.
 class KZG_Deg1:
     @staticmethod
     def commit(t: int) -> Tuple[Tuple[Any, Any], Dict]:
         """
-        Generate a random degree-1 polynomial f(x) = a0 + a1*x,
-        and compute the commitment C = g^(f(t)) in G1.
-        Returns the commitment and metadata (a0, a1, and t).
+        Commit to a degree-1 polynomial f(x) = a0 + a1*x.
+        Evaluate f(t) using the trusted setup parameter t.
+        Returns commitment: C = g^(f(t)) and metadata containing a0, a1, and t.
         """
         try:
             a0 = secure_random(128)
@@ -138,8 +131,8 @@ class KZG_Deg1:
     @staticmethod
     def open(metadata: Dict, alpha: int) -> Tuple[int, Tuple[Any, Any]]:
         """
-        Given polynomial coefficients from metadata and a challenge alpha,
-        compute f(alpha) = a0 + a1*alpha (mod curve_order) and produce the proof π = g^(a1) in G1.
+        Open the commitment at challenge alpha.
+        Compute f(alpha) = a0 + a1*alpha mod curve_order and output proof = g^(a1).
         """
         try:
             a0 = metadata["a0"]
@@ -151,18 +144,16 @@ class KZG_Deg1:
             raise RuntimeError("KZG opening failed") from e
 
     @staticmethod
-    def verify(commitment: Tuple[Any, Any], evaluation: int, proof: Tuple[Any, Any],
-               metadata: Dict, alpha: int) -> bool:
+    def verify(commitment: Tuple[Any, Any], evaluation: int,
+               proof: Tuple[Any, Any], metadata: Dict, alpha: int) -> bool:
         """
-        Verify the commitment by checking:
-            e(C - g^(f(alpha)), g) == e(π, g^(t - alpha))
-        where C is the commitment, f(alpha) = evaluation, and π is the proof.
+        Verify the commitment using the pairing check:
+        Verify that e(C - g^(f(alpha)), g2) equals e(proof, g2^(t - alpha)).
         """
         try:
             t = metadata["t"]
             g_falpha = ec_mul_g1(BN128.G1_gen, evaluation)
-            # Compute group subtraction as addition with the negative.
-            C_div = add(commitment, neg(g_falpha))
+            C_div = add(commitment, neg(g_falpha))  # Group subtraction: C - g^(f(alpha))
             exponent = (t - alpha) % curve_order
             h_factor = ec_mul_g2(BN128.G2_gen, exponent)
             left = pairing_full(C_div, BN128.G2_gen)
@@ -275,9 +266,12 @@ class ComplexTransformations:
             print("Error in binding verification:", e)
             return False, 0.0
 
+# --------------------------------------------------
+# HMAC-SHA256 Implementation
+# --------------------------------------------------
 def hmac_sha256(key: bytes, message: bytes) -> bytes:
     try:
-        block_size = 64
+        block_size = 64  # SHA-256 block size
         if len(key) > block_size:
             key = hashlib.sha256(key).digest()
         key = key.ljust(block_size, b'\x00')
@@ -290,7 +284,7 @@ def hmac_sha256(key: bytes, message: bytes) -> bytes:
         raise RuntimeError("HMAC-SHA256 computation failed") from e
 
 # --------------------------------------------------
-# Audit Logging Framework
+# Audit Logging Classes
 # --------------------------------------------------
 @dataclass
 class AuditEntry:
@@ -373,7 +367,7 @@ class AuditLog:
             raise RuntimeError("Audit log integrity verification failed") from e
 
 # --------------------------------------------------
-# Prover Session and Multi-Prover Aggregator Classes
+# Prover Session and MultiProver Aggregator Classes
 # --------------------------------------------------
 class ProverSession:
     def __init__(self, aggregator: "MultiProverAggregator", session_id: str, n: int = 128, chunk_size: int = 64):
@@ -388,7 +382,7 @@ class ProverSession:
         self.last_activity = self.creation_time
         self.activity_count = 0
         self.status = "INITIALIZED"
-        # Generate a trusted setup parameter t for the KZG commitment (degree-1 polynomial)
+        # Generate a trusted setup parameter t for KZG_Deg1 commitment
         self.t = secure_random(128)
         print(f"[INFO] {'GPU' if self.use_gpu else 'CPU'} mode for session {session_id} with trusted setup parameter t = {self.t}")
 
@@ -399,7 +393,7 @@ class ProverSession:
     def commit(self) -> Tuple[Tuple[Any, Any], np.ndarray, float, Dict]:
         try:
             self._update_activity()
-            # Commit to a degree-1 polynomial using KZG_Deg1
+            # Use KZG_Deg1 to commit to a degree-1 polynomial f(x)= a0 + a1*x.
             commit_val, poly_metadata = KZG_Deg1.commit(self.t)
             base_arr = np.full(self.n, ComplexTransformations.teichmuller_lift(17, self.n), dtype=np.complex128)
             metadata = {
@@ -434,7 +428,7 @@ class ProverSession:
             self._update_activity()
             if self.status != "COMMITTED":
                 raise ValueError(f"Invalid session state: {self.status}. Expected: COMMITTED")
-            # Open the commitment at challenge alpha using KZG_Deg1
+            # Open the commitment at challenge alpha.
             evaluation, proof = KZG_Deg1.open(metadata["poly_metadata"], alpha)
             challenge_binding = hmac_sha256(
                 f"{alpha}:{self.session_id}".encode('utf-8'),
@@ -570,7 +564,7 @@ class SecurityError(Exception):
     pass
 
 # --------------------------------------------------
-# Demonstration Runner
+# Demonstration Function
 # --------------------------------------------------
 def run_demonstration():
     try:
@@ -631,3 +625,4 @@ def run_demonstration():
 
 if __name__ == "__main__":
     run_demonstration()
+
