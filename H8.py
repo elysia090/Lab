@@ -4,13 +4,13 @@ import json
 import hashlib
 import secrets
 import os
-from typing import List, Dict, Tuple, Any, Optional, Union
+from typing import List, Dict, Tuple, Any, Optional
 import numpy as np
 from dataclasses import dataclass
 
-# --------------------------------------------------
-# GPU Detection (if available)
-# --------------------------------------------------
+# ====================================================
+# 1. GPU Detection
+# ====================================================
 try:
     import cupy as cp
     from pycuda import driver as cuda
@@ -21,32 +21,32 @@ except ImportError:
     GPU_AVAILABLE = False
     print("[INFO] Using CPU-only mode")
 
-# --------------------------------------------------
-# Import BN128 Parameters and Operations from py_ecc.bn128
-# --------------------------------------------------
+# ====================================================
+# 2. Import BN128 Parameters and Group Operations
+# ====================================================
 from py_ecc.bn128.bn128_curve import (
-    field_modulus,     # Prime modulus of the base field
-    b as curve_b,      # Curve coefficient (FQ(3))
-    G1,                # Generator for G1 (affine coordinates)
-    G2,                # Generator for G2
+    field_modulus,  # Base field prime
+    b as curve_b,   # Curve coefficient (FQ(3))
+    G1,             # Generator for G1
+    G2,             # Generator for G2
     multiply as ec_multiply,  # Scalar multiplication
-    curve_order        # Order of the subgroup (prime order)
+    curve_order     # Order of the subgroup (prime order)
 )
 from py_ecc.bn128 import bn128_pairing
-from py_ecc.bn128.bn128_curve import add, neg  # Group operations
+from py_ecc.bn128.bn128_curve import add, neg  # Group addition and negation
 
-# --------------------------------------------------
-# BN128 Class (Aligned with Library)
-# --------------------------------------------------
+# ====================================================
+# 3. BN128 Wrapper Class
+# ====================================================
 class BN128:
     p = field_modulus
     b = curve_b
     G1_gen: Tuple[Any, Any] = G1
     G2_gen: Tuple[Any, Any] = G2
 
-# --------------------------------------------------
-# Global Constants and Secure Random Generation
-# --------------------------------------------------
+# ====================================================
+# 4. Global Constants and Secure Random Generator
+# ====================================================
 CONSTANTS = {
     'S_VAL': int.from_bytes(hashlib.sha256(b'S_VAL_SEED').digest()[:4], 'big') % curve_order,
     'H_VAL': int.from_bytes(hashlib.sha256(b'H_VAL_SEED').digest()[:4], 'big') % curve_order,
@@ -54,15 +54,15 @@ CONSTANTS = {
 }
 
 def secure_random(bits: int = 256) -> int:
-    """Generate a cryptographically secure random number in Z_curve_order."""
+    """Return a secure random integer in Z_curve_order."""
     try:
         return int.from_bytes(secrets.token_bytes(bits // 8 + (1 if bits % 8 else 0)), 'big') % curve_order
     except Exception as e:
-        raise RuntimeError("Failed to generate secure random number") from e
+        raise RuntimeError("Secure random generation failed") from e
 
-# --------------------------------------------------
-# Enhanced JSON Encoder
-# --------------------------------------------------
+# ====================================================
+# 5. Enhanced JSON Encoder
+# ====================================================
 class EnhancedJSONEncoder(json.JSONEncoder):
     def default(self, obj):
         try:
@@ -80,9 +80,9 @@ class EnhancedJSONEncoder(json.JSONEncoder):
         except Exception:
             return f"[ENCODING_ERROR: {type(obj).__name__}]"
 
-# --------------------------------------------------
-# Elliptic Curve Operations for G1 and G2
-# --------------------------------------------------
+# ====================================================
+# 6. Group Operations: G1 and G2 Multiplication and Pairing
+# ====================================================
 def ec_mul_g1(point: Tuple[Any, Any], scalar: int) -> Tuple[Any, Any]:
     if point is None:
         raise ValueError("Invalid G1 point: None")
@@ -107,11 +107,11 @@ def pairing_full(g1: Tuple[Any, Any], g2: Tuple[Any, Any]) -> int:
     except Exception as e:
         raise RuntimeError("Pairing computation failed") from e
 
-# --------------------------------------------------
-# Polynomial Helper Functions
-# --------------------------------------------------
+# ====================================================
+# 7. Polynomial Helper Functions
+# ====================================================
 def poly_eval(coeffs: List[int], x: int) -> int:
-    """Evaluate polynomial f(x) = a0 + a1*x + ... + ad*x^d modulo curve_order."""
+    """Evaluate f(x) = a0 + a1*x + ... + ad*x^d mod curve_order."""
     result = 0
     power = 1
     for coeff in coeffs:
@@ -121,33 +121,26 @@ def poly_eval(coeffs: List[int], x: int) -> int:
 
 def poly_division(coeffs: List[int], c: int) -> List[int]:
     """
-    Perform synthetic division of polynomial f(x) by (x - c).
-    Coeffs are in increasing order: [a0, a1, ..., ad].
-    Returns quotient coefficients q such that f(x) - f(c) = (x - c)*q(x).
+    Synthetic division of f(x) - f(c) by (x - c).
+    Coefficients are in increasing order. Returns quotient coefficients.
     """
     d = len(coeffs) - 1
-    # Reverse to get highest degree first.
     rev = coeffs[::-1]
-    q = [rev[0]]  # q[0] is the leading coefficient of the quotient.
+    q = [rev[0]]
     for i in range(1, d + 1):
-        # q[i] = rev[i] + c * q[i-1] mod curve_order.
         q.append((rev[i] + c * q[i - 1]) % curve_order)
-    # The last element is the remainder f(c). Discard it.
-    quotient = q[:-1]
-    # Reverse back to ascending order.
-    return quotient[::-1]
+    return q[:-1][::-1]  # Discard remainder and reverse back
 
-# --------------------------------------------------
-# Generalized KZG Polynomial Commitment (Arbitrary Degree)
-# --------------------------------------------------
+# ====================================================
+# 8. Generalized KZG Polynomial Commitment (Arbitrary Degree)
+# ====================================================
 class KZGPoly:
     @staticmethod
     def commit(degree: int, t: int) -> Tuple[Tuple[Any, Any], List[int]]:
         """
-        Generate a random polynomial f(x) = a0 + a1*x + ... + ad*x^d (degree d)
-        with coefficients in Z_curve_order. Compute the commitment:
-          C = g^{f(t)} = g^{a0 + a1*t + ... + ad*t^d}
-        Returns the commitment (a G1 point) and the list of coefficients.
+        Generate random polynomial f(x)=a0+...+ad*x^d (degree d) in Z_curve_order.
+        Commitment: C = g^(f(t)).
+        Returns the commitment (a G1 point) and polynomial coefficients.
         """
         try:
             coeffs = [secure_random(128) for _ in range(degree + 1)]
@@ -161,14 +154,11 @@ class KZGPoly:
     def open(coeffs: List[int], alpha: int, t: int) -> Tuple[int, Tuple[Any, Any]]:
         """
         Open the commitment at challenge alpha.
-        Compute evaluation f(alpha) and compute the witness (proof) as
-          π = g^{q(t)},
-        where q(x) is the quotient polynomial of (f(x)-f(alpha))/(x-α).
+        Compute f(alpha) and the witness proof π = g^(q(t)), where
+        q(x) = (f(x) - f(alpha))/(x - α) is the quotient polynomial.
         """
         try:
             evaluation = poly_eval(coeffs, alpha)
-            # Compute quotient polynomial q(x) = (f(x)-f(alpha))/(x - alpha)
-            # This division is exact because f(alpha) is the evaluation.
             q_coeffs = poly_division(coeffs, alpha)
             q_t = poly_eval(q_coeffs, t)
             proof = ec_mul_g1(BN128.G1_gen, q_t)
@@ -177,20 +167,16 @@ class KZGPoly:
             raise RuntimeError("KZG polynomial opening failed") from e
 
     @staticmethod
-    def verify(commitment: Tuple[Any, Any], evaluation: int, proof: Tuple[Any, Any],
-               alpha: int, t: int) -> bool:
+    def verify(commitment: Tuple[Any, Any], evaluation: int,
+               proof: Tuple[Any, Any], alpha: int, t: int) -> bool:
         """
-        Verify the KZG opening using the pairing check.
-        Check whether:
-          e(C / g^{f(alpha)}, h) == e(π, h^{t - α})
-        where division is implemented as group subtraction.
+        Verify opening by checking:
+          e(C / g^(f(alpha)), h) == e(π, h^(t - α))
+        using group subtraction and pairing functions.
         """
         try:
-            # Compute g^{f(alpha)}
             g_falpha = ec_mul_g1(BN128.G1_gen, evaluation)
-            # Compute C_div = commitment * inv(g^{f(alpha)}) = commitment - g^{f(alpha)}
             C_div = add(commitment, neg(g_falpha))
-            # Compute h^{(t - alpha)} in G2
             exponent = (t - alpha) % curve_order
             h_factor = ec_mul_g2(BN128.G2_gen, exponent)
             left = pairing_full(C_div, BN128.G2_gen)
@@ -203,9 +189,9 @@ class KZGPoly:
             print("Error in KZG polynomial verification:", e)
             return False
 
-# --------------------------------------------------
-# Complex Transformations for Binding (Unchanged)
-# --------------------------------------------------
+# ====================================================
+# 9. Complex Transformations for Binding
+# ====================================================
 class ComplexTransformations:
     @staticmethod
     def teichmuller_lift(val: int, n: int) -> complex:
@@ -251,7 +237,7 @@ class ComplexTransformations:
             if len(binding) == target_size:
                 return binding
             if len(binding) < 2:
-                return np.full(target_size, binding[0] if len(binding) > 0 else complex(1, 0))
+                return np.full(target_size, binding[0] if binding.size > 0 else complex(1, 0))
             indices = np.linspace(0, len(binding) - 1, target_size)
             binding_resized = np.zeros(target_size, dtype=np.complex128)
             idx_floor = np.floor(indices).astype(int)
@@ -269,13 +255,13 @@ class ComplexTransformations:
     def apply_binding(base_arr: np.ndarray, metadata: Dict, strength: float = 0.3) -> np.ndarray:
         try:
             binding = ComplexTransformations.derive_binding(metadata)
-            if len(binding) != len(base_arr):
-                binding = ComplexTransformations.resize_binding(binding, len(base_arr))
-            binding_norm = np.linalg.norm(binding)
-            binding_normalized = binding / binding_norm if binding_norm > 1e-12 else binding
+            if binding.size != base_arr.size:
+                binding = ComplexTransformations.resize_binding(binding, base_arr.size)
+            norm = np.linalg.norm(binding)
+            binding_norm = binding / norm if norm > 1e-12 else binding
             noise_factor = 1e-10
             noise = np.random.normal(0, noise_factor, base_arr.shape) + 1j * np.random.normal(0, noise_factor, base_arr.shape)
-            return base_arr + strength * binding_normalized + noise
+            return base_arr + strength * binding_norm + noise
         except Exception as e:
             raise RuntimeError("Applying binding failed") from e
 
@@ -283,29 +269,27 @@ class ComplexTransformations:
     def verify_binding(bound_arr: np.ndarray, metadata: Dict, strength: float = 0.3, threshold: float = 0.15) -> Tuple[bool, float]:
         try:
             n = metadata["n"]
-            base_value = ComplexTransformations.teichmuller_lift(17, n)
-            base_arr = np.full(n, base_value, dtype=np.complex128)
-            extracted_binding = (bound_arr - base_arr) / strength
-            expected_binding = ComplexTransformations.derive_binding(metadata)
-            if len(expected_binding) != len(extracted_binding):
-                expected_binding = ComplexTransformations.resize_binding(expected_binding, len(extracted_binding))
-            norm_expected = np.linalg.norm(expected_binding)
-            norm_extracted = np.linalg.norm(extracted_binding)
+            base_val = ComplexTransformations.teichmuller_lift(17, n)
+            base_arr = np.full(n, base_val, dtype=np.complex128)
+            extracted = (bound_arr - base_arr) / strength
+            expected = ComplexTransformations.derive_binding(metadata)
+            if expected.size != extracted.size:
+                expected = ComplexTransformations.resize_binding(expected, extracted.size)
+            norm_expected = np.linalg.norm(expected)
+            norm_extracted = np.linalg.norm(extracted)
             if norm_expected > 1e-12:
-                expected_binding = expected_binding / norm_expected
+                expected /= norm_expected
             if norm_extracted > 1e-12:
-                extracted_binding = extracted_binding / norm_extracted
-            similarity = float(np.abs(np.vdot(extracted_binding, expected_binding)))
-            dummy_work = np.vdot(extracted_binding, np.random.normal(0, 1, extracted_binding.shape) +
-                                 1j * np.random.normal(0, 1, extracted_binding.shape))
+                extracted /= norm_extracted
+            similarity = float(np.abs(np.vdot(extracted, expected)))
             return similarity >= threshold, similarity
         except Exception as e:
             print("Error in binding verification:", e)
             return False, 0.0
 
-# --------------------------------------------------
-# HMAC-SHA256 Implementation
-# --------------------------------------------------
+# ====================================================
+# 10. HMAC-SHA256 Utility
+# ====================================================
 def hmac_sha256(key: bytes, message: bytes) -> bytes:
     try:
         block_size = 64
@@ -314,15 +298,14 @@ def hmac_sha256(key: bytes, message: bytes) -> bytes:
         key = key.ljust(block_size, b'\x00')
         o_key_pad = bytes(x ^ 0x5c for x in key)
         i_key_pad = bytes(x ^ 0x36 for x in key)
-        inner_hash = hashlib.sha256(i_key_pad + message).digest()
-        outer_hash = hashlib.sha256(o_key_pad + inner_hash).digest()
-        return outer_hash
+        inner = hashlib.sha256(i_key_pad + message).digest()
+        return hashlib.sha256(o_key_pad + inner).digest()
     except Exception as e:
         raise RuntimeError("HMAC-SHA256 computation failed") from e
 
-# --------------------------------------------------
-# Audit Logging Classes
-# --------------------------------------------------
+# ====================================================
+# 11. Audit Logging
+# ====================================================
 @dataclass
 class AuditEntry:
     timestamp: float
@@ -355,8 +338,7 @@ class AuditEntry:
     
     def validate_hash(self) -> bool:
         chain_data = f"{self.timestamp}|{self.session_id}|{self.op_type}|{self.payload_hash}|{self.prev_hash}".encode("utf-8")
-        computed_hash = hashlib.sha256(chain_data).hexdigest()
-        return computed_hash == self.chain_hash
+        return hashlib.sha256(chain_data).hexdigest() == self.chain_hash
 
 class AuditLog:
     def __init__(self):
@@ -365,13 +347,7 @@ class AuditLog:
 
     def record(self, op_type: str, session_id: str, payload: Any) -> AuditEntry:
         try:
-            entry = AuditEntry(
-                timestamp=time.time(), 
-                session_id=session_id, 
-                op_type=op_type, 
-                payload=payload,
-                prev_hash=self.last_hash
-            )
+            entry = AuditEntry(time.time(), session_id, op_type, payload, self.last_hash)
             self.entries.append(entry)
             self.last_hash = entry.chain_hash
             return entry
@@ -379,33 +355,33 @@ class AuditLog:
             raise RuntimeError("Failed to record audit log entry") from e
 
     def show_log(self) -> None:
-        for i, e in enumerate(self.entries):
-            print(f"[{i}] T={e.timestamp:.4f}, Sess={e.session_id}, Op={e.op_type}, "
-                  f"Hash={e.payload_hash[:16]}..., Preview={e.payload_preview}")
+        for i, entry in enumerate(self.entries):
+            print(f"[{i}] T={entry.timestamp:.4f}, Sess={entry.session_id}, Op={entry.op_type}, "
+                  f"Hash={entry.payload_hash[:16]}..., Preview={entry.payload_preview}")
 
-    def dump_json(self, fn: str) -> None:
+    def dump_json(self, filename: str) -> None:
         try:
-            with open(fn, "w") as f:
-                json.dump([e.to_dict() for e in self.entries], f, indent=2, cls=EnhancedJSONEncoder)
+            with open(filename, "w") as f:
+                json.dump([entry.to_dict() for entry in self.entries], f, indent=2, cls=EnhancedJSONEncoder)
         except Exception as e:
             raise RuntimeError("Failed to dump audit log to file") from e
-    
+
     def verify_integrity(self) -> Tuple[bool, Optional[int]]:
         try:
             if not self.entries:
                 return True, None
-            expected_hash = hashlib.sha256(b"GENESIS").hexdigest()
+            expected = hashlib.sha256(b"GENESIS").hexdigest()
             for i, entry in enumerate(self.entries):
-                if entry.prev_hash != expected_hash or not entry.validate_hash():
+                if entry.prev_hash != expected or not entry.validate_hash():
                     return False, i
-                expected_hash = entry.chain_hash
+                expected = entry.chain_hash
             return True, None
         except Exception as e:
             raise RuntimeError("Audit log integrity verification failed") from e
 
-# --------------------------------------------------
-# Prover Session and MultiProver Aggregator Classes (Generalized)
-# --------------------------------------------------
+# ====================================================
+# 12. Prover Session and Aggregator (Generalized)
+# ====================================================
 class ProverSession:
     def __init__(self, aggregator: "MultiProverAggregator", session_id: str, n: int = 128, chunk_size: int = 64, poly_degree: int = 3):
         self.agg = aggregator
@@ -420,7 +396,7 @@ class ProverSession:
         self.last_activity = self.creation_time
         self.activity_count = 0
         self.status = "INITIALIZED"
-        # Generate a trusted setup parameter t for the SRS
+        # Generate trusted setup parameter t for the SRS.
         self.t = secure_random(128)
         print(f"[INFO] {'GPU' if self.use_gpu else 'CPU'} mode for session {session_id} with trusted setup parameter t = {self.t}")
 
@@ -431,8 +407,8 @@ class ProverSession:
     def commit(self) -> Tuple[Tuple[Any, Any], np.ndarray, float, Dict]:
         try:
             self._update_activity()
-            # Commit to a polynomial of degree poly_degree using KZGPoly.
-            commit_val, poly_coeffs = KZGPoly.commit(self.poly_degree, self.t)
+            # Commit to polynomial f(x)=a0+...+ad*x^d using KZGPoly
+            commit_val, coeffs = KZGPoly.commit(self.poly_degree, self.t)
             base_arr = np.full(self.n, ComplexTransformations.teichmuller_lift(17, self.n), dtype=np.complex128)
             metadata = {
                 "session_id": self.session_id,
@@ -442,14 +418,13 @@ class ProverSession:
                 "commitment_value": str(commit_val),
                 "metadata_version": "2.0",
                 "secure_nonce": secrets.token_hex(16),
-                "poly_coeffs": poly_coeffs,
+                "poly_coeffs": coeffs,
                 "poly_degree": self.poly_degree,
                 "t": self.t
             }
             bound_arr = ComplexTransformations.apply_binding(base_arr, metadata)
             seed_hash = hashlib.sha256(f"{self.session_id}:{self.session_key}:{self.creation_time}".encode('utf-8')).digest()
-            flow_bytes = seed_hash[:4]
-            flow_t = float(int.from_bytes(flow_bytes, 'big')) / 9999999.0
+            flow_t = float(int.from_bytes(seed_hash[:4], 'big')) / 9999999.0
             final_arr = ComplexTransformations.apply_flow(bound_arr, flow_t)
             self.log.record("COMMIT", self.session_id, {
                 "commit_val": str(commit_val),
@@ -459,7 +434,7 @@ class ProverSession:
                 "activity_count": self.activity_count
             })
             self.status = "COMMITTED"
-            return (commit_val, final_arr, flow_t, metadata)
+            return commit_val, final_arr, flow_t, metadata
         except Exception as e:
             raise RuntimeError("Commit phase in ProverSession failed") from e
 
@@ -481,7 +456,7 @@ class ProverSession:
                 "activity_count": self.activity_count
             })
             self.status = "RESPONDED"
-            return (evaluation, proof)
+            return evaluation, proof
         except Exception as e:
             raise RuntimeError("Response phase in ProverSession failed") from e
 
@@ -569,7 +544,7 @@ class MultiProverAggregator:
             log_ok, tamper_idx = self.log.verify_integrity()
             if not log_ok:
                 raise Exception(f"Audit log integrity check failed at index {tamper_idx}")
-            payload = "|".join(e.chain_hash for e in self.log.entries)
+            payload = "|".join(entry.chain_hash for entry in self.log.entries)
             payload += f"|{self.creation_time}|{time.time()}"
             hv = hashlib.sha256(payload.encode("utf-8")).hexdigest()
             sig = pow(int(hv, 16), priv_key, BN128.p)
@@ -602,9 +577,9 @@ class SecurityError(Exception):
     """Raised for security-related issues."""
     pass
 
-# --------------------------------------------------
-# Demonstration Function
-# --------------------------------------------------
+# ====================================================
+# 13. Demonstration Function
+# ====================================================
 def run_demonstration():
     try:
         print("=== Starting Enhanced Cryptographic Protocol Demonstration ===\n")
