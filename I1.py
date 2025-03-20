@@ -4,40 +4,32 @@ import math
 def generate_twiddle_constants(N, inverse=False):
     """
     Generate a list of twiddle factors for each FFT stage.
-    For stage s (s = 1 .. log2(N)), for j in 0 .. (2^(s-1) - 1):
+    For stage s (1..log2(N)), for j in range(0, 2^(s-1)):
         w = exp( (inverse? +1 : -1) * 2*pi*i * j / (2^s) )
-    All stage twiddle factors are concatenated into one list.
+    All stage factors are concatenated into one list.
     """
     stages = int(math.log2(N))
     twiddles = []
     for s in range(1, stages+1):
-        m = 1 << s         # m = 2^s
-        half_m = m >> 1    # m/2
+        m = 1 << s          # m = 2^s
+        half_m = m >> 1     # m/2
         for j in range(half_m):
             theta = 2.0 * math.pi * j / m
             if inverse:
-                # Inverse FFT uses + sign in the exponent.
+                # Inverse FFT uses a + sign in the exponent.
                 r = math.cos(theta)
                 i = math.sin(theta)
             else:
-                # Forward FFT uses - sign in the exponent.
+                # Forward FFT uses a - sign in the exponent.
                 r = math.cos(theta)
                 i = -math.sin(theta)
             twiddles.append((r, i))
     return twiddles
 
-# Define FFT size (N=1024) and total twiddle count (1023).
-N = 1024
-NUM_TWIDDLES = (1 << int(math.log2(N))) - 1  # 1023
-
-# Precompute constant twiddle factors for both forward and inverse transforms.
-twiddles_forward = generate_twiddle_constants(N, inverse=False)
-twiddles_inverse = generate_twiddle_constants(N, inverse=True)
-
 def format_constant_array(twiddles, name):
     """
     Format the list of twiddles into a C++ initializer for a constant memory array.
-    Each element is a cuDoubleComplex with two fields: .x (real) and .y (imaginary).
+    Each element is a cuDoubleComplex with .x (real) and .y (imaginary) fields.
     """
     lines = []
     for (r, i) in twiddles:
@@ -45,10 +37,16 @@ def format_constant_array(twiddles, name):
     joined = ",\n    ".join(lines)
     return f"__constant__ cuDoubleComplex {name}[{len(twiddles)}] = {{\n    {joined}\n}};"
 
+# FFT size
+N = 1024
+
+# Precompute twiddle factors for forward and inverse FFT
+twiddles_forward = generate_twiddle_constants(N, inverse=False)
+twiddles_inverse = generate_twiddle_constants(N, inverse=True)
 const_forward_str = format_constant_array(twiddles_forward, "const_twiddles_forward")
 const_inverse_str = format_constant_array(twiddles_inverse, "const_twiddles_inverse")
 
-# CUDA kernel code with integrated bit reversal for lower computational load.
+# CUDA kernel code with integrated bit reversal
 kernel_code = r'''
 #include <cuComplex.h>
 #include <math.h>
@@ -72,27 +70,25 @@ __global__ void fft_shared(const cuDoubleComplex * __restrict__ in,
         temp >>= 1;
     }
     
-    // Integrated Bit Reversal:
-    // Compute the bit-reversed index and load the input directly into shared memory.
+    // Integrated Bit Reversal: load input using bit-reversed index.
     unsigned int rev = __brev(tid) >> (32 - stages);
     if (tid < N)
         s_data[rev] = in[tid];
     __syncthreads();
 
-    // Main FFT loop (the stage loop is unrolled for performance).
+    // Main FFT loop with unrolled stage loop.
 #pragma unroll
     for (int s = 1; s <= stages; s++) {
         int m = 1 << s;         // Sub-FFT size: m = 2^s.
         int half_m = m >> 1;      // Half the sub-FFT size.
-        // Compute offset into the twiddle factor table:
-        // For stage s, offset = 2^(s-1) - 1.
+        // Offset into the twiddle factor table: for stage s, offset = 2^(s-1) - 1.
         int offset = (1 << (s - 1)) - 1;
         int j = tid % m;        // Position within the sub-FFT block.
         int base = tid - j;     // Base index of the current sub-FFT block.
         if (j < half_m) {
             cuDoubleComplex u = s_data[base + j];
             cuDoubleComplex v = s_data[base + j + half_m];
-            // Fetch the precomputed twiddle factor from constant memory.
+            // Fetch the precomputed twiddle factor.
             cuDoubleComplex w;
             if (inverse)
                 w = const_twiddles_inverse[offset + j];
@@ -100,7 +96,7 @@ __global__ void fft_shared(const cuDoubleComplex * __restrict__ in,
                 w = const_twiddles_forward[offset + j];
             
             cuDoubleComplex t_val;
-            // Butterfly computation using fused multiply-add for efficiency.
+            // Butterfly computation using fused multiply-add.
             t_val.x = fma(v.x, w.x, -v.y * w.y);
             t_val.y = fma(v.x, w.y,  v.y * w.x);
             
@@ -112,7 +108,7 @@ __global__ void fft_shared(const cuDoubleComplex * __restrict__ in,
         __syncthreads();
     }
 
-    // For inverse FFT, scale the results by 1/N.
+    // Scale the inverse FFT result by 1/N.
     if (inverse && tid < N) {
         double scale = 1.0 / N;
         s_data[tid].x *= scale;
@@ -126,26 +122,25 @@ __global__ void fft_shared(const cuDoubleComplex * __restrict__ in,
 }
 '''
 
-# Compile the kernel using CuPy's RawModule with NVCC and fast math optimizations.
+# Compile the CUDA kernel using CuPy's RawModule with fast math optimizations.
 module = cp.RawModule(code=kernel_code, options=("-use_fast_math",), backend="nvcc")
 fft_shared = module.get_function("fft_shared")
 
 class HPDFT_CuPy_ConstantFFT:
     """
     Optimized FFT using precomputed constant twiddle factors and integrated bit reversal.
-    This implementation is specialized for N = 1024 and reduces computational load by merging the bit
-    reversal step with input data loading.
+    This implementation is specialized for a fixed FFT size of 1024.
     """
     def __init__(self):
-        self.N = 1024  # Fixed FFT size.
+        self.N = 1024
         self.fft_shared = fft_shared
 
     def transform(self, x, inverse=False):
         """
-        Compute the FFT (or inverse FFT) using the constant-memory kernel.
+        Compute the FFT or inverse FFT using the constant-memory kernel.
         
         Args:
-            x: Input CuPy array of type cp.complex128 with length N (must be 1024).
+            x: Input CuPy array of type cp.complex128 with length 1024.
             inverse: If True, compute the inverse FFT.
         
         Returns:
@@ -153,17 +148,16 @@ class HPDFT_CuPy_ConstantFFT:
         """
         if not isinstance(x, cp.ndarray):
             x = cp.asarray(x)
-        N = int(x.size)
-        if N != self.N:
-            raise ValueError(f"This kernel is specialized for N = {self.N}")
+        if x.size != self.N:
+            raise ValueError(f"Input size must be {self.N}.")
         result = cp.empty_like(x)
-        # Shared memory size: we need space for N elements; twiddle factors are stored in constant memory.
+        # Allocate shared memory for N complex numbers.
         shared_mem_size = x.nbytes
 
         self.fft_shared(
-            (1,),
-            (N,),
-            (x.data.ptr, result.data.ptr, cp.int32(N), cp.int32(1 if inverse else 0)),
+            (1,),              # Single block launch.
+            (self.N,),         # N threads.
+            (x.data.ptr, result.data.ptr, cp.int32(self.N), cp.int32(1 if inverse else 0)),
             shared_mem=shared_mem_size
         )
         return result
@@ -175,7 +169,7 @@ if __name__ == "__main__":
     # Generate a random complex input array on the GPU.
     x = cp.random.random(1024, dtype=cp.float64) + 1j * cp.random.random(1024, dtype=cp.float64)
     
-    # Time the forward FFT using CuPy events.
+    # Time the forward FFT using CuPy CUDA events.
     start = cp.cuda.Event()
     end = cp.cuda.Event()
     start.record()
