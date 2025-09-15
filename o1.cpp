@@ -1,10 +1,8 @@
-// glk_core_v1_3_2.cpp
-// "GrayLUT Core" v1.3.2 — Competitive Programming tuned
-// Build: g++ -O3 -pipe -s -o glk_core_v1_3_2 glk_core_v1_3_2.cpp
-// Notes: set NV/NE/NP as powers of two when possible (fast &-mask path).
+// "GrayLUT Core" v1.3.3 — hyper-tuned (safe key layout + cache mix)
+// Build: g++ -O3 -pipe -flto -march=native -mtune=native -DNDEBUG -o glk_core_v1_3_3 glk_core_v1_3_3.cpp
 
 #ifndef KEY_BITS
-#define KEY_BITS 18
+#define KEY_BITS 20  // ← デフォを20に。TENANT_BITS=2を活かす（18ならTENANT_BITS=0に）
 #endif
 #ifndef TENANT_BITS
 #define TENANT_BITS 2
@@ -137,38 +135,54 @@ struct Bank{
 // ---- Quantizer
 struct Quantizer{
   Quant qt;
+
+  // bit layout safety
+  static constexpr uint32_t U=3, K=3, DT=3, S=3, M=4, C=2;
+  static constexpr uint32_t LOW = U+K+DT+S+M+C; // 18
+  static_assert(LOW <= (uint32_t)KEY_BITS, "LOW fields overflow KEY_BITS");
+  static_assert(LOW + TENANT_BITS <= (uint32_t)KEY_BITS, "TENANT bits overflow KEY_BITS");
+
   inline Key key(const Delta& d) const {
-    const uint32_t t  = (uint32_t(d.tenant) & ((1u<<TENANT_BITS)-1)) << (KEY_BITS - TENANT_BITS);
-    const uint32_t u  = qt.q_load[d.load_u] & 7u;
-    const uint32_t k  = qt.q_kappa[d.kappa] & 7u;
-    const uint32_t dt = qt.q_dt[d.delta_tau] & 7u;
-    const uint32_t s  = qt.q_slack[d.slack] & 7u;
-    const uint32_t m  = d.motif & 15u;
-    const uint32_t c  = d.cong_bin & 3u;
-    const uint32_t low= (u<<18)|(k<<15)|(dt<<12)|(s<<9)|(m<<5)|(c<<3);
-    return Key{ (t|low) & KEY_MASK };
+    uint32_t pos = 0;
+
+    const uint32_t c  = (uint32_t(d.cong_bin) & ((1u<<C)-1))                 << pos; pos+=C;
+    const uint32_t m  = (uint32_t(d.motif)    & ((1u<<M)-1))                 << pos; pos+=M;
+    const uint32_t s  = (uint32_t(qt.q_slack[d.slack])     & ((1u<<S)-1))    << pos; pos+=S;
+    const uint32_t dt = (uint32_t(qt.q_dt[d.delta_tau])    & ((1u<<DT)-1))   << pos; pos+=DT;
+    const uint32_t k  = (uint32_t(qt.q_kappa[d.kappa])     & ((1u<<K)-1))    << pos; pos+=K;
+    const uint32_t u  = (uint32_t(qt.q_load[d.load_u])     & ((1u<<U)-1))    << pos; pos+=U;
+
+    uint32_t low = u|k|dt|s|m|c;
+
+    uint32_t t = 0;
+    if constexpr (TENANT_BITS>0){
+      const uint32_t TPOS = KEY_BITS - TENANT_BITS;
+      t = (uint32_t(d.tenant) & ((1u<<TENANT_BITS)-1)) << TPOS;
+    }
+    return Key{ (t | low) & KEY_MASK };
   }
 };
 
 // ---- ConstAdd table
-static constexpr int8_t DELTA[32]={
-  -16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1,
-    0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15
-};
+static constexpr int8_t DELTA[32]={ -16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 };
 static inline int32_t cadd(uint16_t c){ return DELTA[c & 31u]; }
 
-// ---- HotCache (direct-mapped 1K)
+// ---- HotCache (direct-mapped 1K) with better mixing
 #if HOTCACHE_ON
+static inline uint32_t rotl32(uint32_t x, unsigned r){ return (x<<r) | (x>>(32-r)); }
 struct HotCache{
   static constexpr size_t S=1024, M=S-1;
   Entry  e[S];
-  uint32_t tag[S]{};
+  uint32_t tag[S]{}; // kind-mix ^ key
   inline size_t idx(uint8_t kind, Key k) const {
-    // simple hash: kind-mix + key
-    return ( (uint32_t(kind)*0x9e3779b9u) ^ k.v ) & M;
+    // mix: multiplicative + rotate; low bitsも撹拌
+    uint32_t h = (k.v * 0x9E3779B1u) ^ rotl32(uint32_t(kind)*0x85ebca6bu, 11);
+    h ^= (h>>16);
+    return h & M;
   }
   inline const Entry& get(const Bank& b, uint8_t kind, Key k){
-    size_t i=idx(kind,k); uint32_t tg=(uint32_t(kind)<<24) ^ k.v;
+    const uint32_t tg = rotl32(k.v, 7) ^ (uint32_t(kind)*0x9E3779B1u);
+    size_t i = idx(kind,k);
     if(LIKELY(tag[i]==tg)) return e[i];
     const Entry& ref=b.get(kind,k);
     e[i]=ref; tag[i]=tg; return e[i];
@@ -197,9 +211,11 @@ struct Core{
   inline uint64_t tag_make(Key k, const Entry& e) const {
 #if WITNESS_ON
     uint8_t hdr[15]; e.hdr(hdr);
-    uint8_t buf[19]; buf[0]=uint8_t(k.v); buf[1]=uint8_t(k.v>>8); buf[2]=uint8_t(k.v>>16); buf[3]=uint8_t(k.v>>24);
-    memcpy(buf+4,hdr,15);
-    uint64_t h=fnv1a(buf,sizeof buf);
+    uint8_t kbuf[4] = { uint8_t(k.v), uint8_t(k.v>>8), uint8_t(k.v>>16), uint8_t(k.v>>24) };
+    // incremental FNV: kbuf → hdr
+    uint64_t h=1469598103934665603ull;
+    for(int i=0;i<4;i++){ h^=kbuf[i]; h*=1099511628211ull; }
+    for(int i=0;i<15;i++){ h^=hdr[i];  h*=1099511628211ull; }
     h^=k0; h+=(h<<7)^k1; return h;
 #else
     (void)k; (void)e; return 0;
@@ -219,7 +235,7 @@ struct Core{
       case EffToggle:{
         st.coh_bits ^= uint32_t(t & 0xFFFF'FFFFull);
       }break;
-      case EffConstAdd:{
+      case EffConstAdd:{ // ← hot path
         const int32_t dv = cadd(e.coeff());
         const size_t  wi = st.iw(uint32_t(t & 0xFFFFull));
         // w
@@ -245,7 +261,6 @@ struct Core{
     }
   }
 
-  // single Δ
   inline void step(const Delta& d){
     ++m_total;
     const Key k = key(d);
@@ -255,7 +270,7 @@ struct Core{
     const Entry& e = bank.get(d.kind, k);
 #endif
 
-    // Gate order: budget → mono → witness (cheap→高コスト)
+    // Gate order: budget → mono → witness
     bool ok_b = bud.use(e.eps_cost); if(UNLIKELY(!ok_b)) ++m_bud;
     bool ok_m = ((st.flags & e.mono_code) == e.mono_code); if(UNLIKELY(!ok_m)) ++m_mono;
 
@@ -269,7 +284,7 @@ struct Core{
     else { apply(safe_default(), d); ++m_fallback; }
   }
 
-  // batch with prefetch of next row (LUT & likely state rows)
+  // batch with prefetch of next row (LUT)
   inline void run_batch(const vector<Delta>& ds){
 #if PREFETCH_ON
     for(size_t i=0;i<ds.size();++i){
@@ -287,9 +302,8 @@ struct Core{
   }
 };
 
-// ---- Demo main (replace per task)
+// ---- Demo main (unchanged except KEY_BITS default)
 int main(){
-  // Set powers of two to enable &-mask path
   const int NV=4096, NE=8192, NP=2048;
   Core c(NV,NE,NP);
 
@@ -304,7 +318,8 @@ int main(){
   int Q=10000; vector<Delta> ds(Q, d);
   c.run_batch(ds);
 
-  cout << c.st.w[0] << '\n'; // stable output for OJ
+  cout << c.st.w[0] << '\n';
   return 0;
 }
+
 
