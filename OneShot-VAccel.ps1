@@ -5,7 +5,7 @@
   - Removes try/catch/finally to avoid stray "finally{" prompts after pastes.
   - Uses `trap` + explicit `$Cleanup` for deterministic teardown on both success/error.
   - Keeps all hardening from 1.4.3 (PS5.1-safe, WSL guards, NDJSON guarded I/O, exit hints).
-
+　- use this as a pipeline ♥
  Quick knobs (optional before paste):
    $ReuseMin=0.25; $DurationSec=10; $Gate='strict'; $EnableWsl=$false; $Output='human'
 ================================================================================ #>
