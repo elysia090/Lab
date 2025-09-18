@@ -1,12 +1,20 @@
-<# vAccel One-Shot — v1.4.1c (paste-safe, product-grade)
-   - ASCII only. Works on Windows PowerShell 5.1 and PowerShell 7+.
-   - Paste-and-run: no param() block; defaults applied if variables are unset.
-   - Deterministic UInt64-safe RNG (xoroshiro128+).
-   - Robust system snapshot (no nulls).
-   - Optional WSL integration (status detection + streaming counters).
-   - NDJSON report writer (append-only, retry-friendly).
-   - Built-in self tests: set $RunTests=$true (optional).
-#>
+<# ================================================================================
+ vAccel One-Shot — v1.4.1e (paste-safe, product-grade)
+ - ASCII only. Works on Windows PowerShell 5.1 and PowerShell 7+.
+ - Paste-and-run: no param() block; defaults applied only if variables are UNSET.
+ - Deterministic UInt64-safe RNG (xoroshiro128+).
+ - Robust system snapshot (no nulls; uptime via 3-level fallback).
+ - Optional WSL integration (availability by exit code; -e/--exec fallback; async IO).
+ - NDJSON report writer (append-only, retry-friendly; guaranteed close).
+ - Built-in self tests: set $RunTests=$true (optional).
+ - Zero background jobs on the hot path; O(1)/tick contract checks.
+
+ Design notes for 1.4.1e:
+ - Fixed: TickCount64 availability (PS5.1) via Get-UptimeHoursSafe().
+ - Fixed: FileStream lifetime (leaveOpen=false) to avoid rare file locks.
+ - Hardened: WSL detection by exit code and exec fallback; resilient start/stop.
+ - Kept: Human-friendly and machine-friendly outputs without breaking behavior.
+================================================================================ #>
 
 # ============================ Runtime Defaults (applied only if UNSET) ===========
 if(-not (Test-Path variable:Profiles))          { $Profiles = 'AUTOHOOK-GLOBAL,LIMIT-ORDER,SUPRA-HIEND,RT-BALANCED,FABRIC,MEMZERO' }
@@ -41,7 +49,7 @@ $ErrorActionPreference = 'Stop'
 [bool]$IsPS7 = $PSVersionTable.PSVersion.Major -ge 7
 
 $Config = @{
-  Version       = '1.4.1c'
+  Version       = '1.4.1e'
   TickMs        = 500
   JsonDepth     = 12
   BarrierMax    = 3
@@ -59,7 +67,19 @@ function Write-Info ([string]$m){ Write-Host "[INFO] $m" -ForegroundColor Cyan }
 function Write-Warn ([string]$m){ Write-Host "[WARN] $m" -ForegroundColor Yellow }
 function Write-Err  ([string]$m){ Write-Host "[ERR ] $m" -ForegroundColor Red }
 
-# ============================ UInt64 Helpers (safe across PS5.1/7) ================
+# Uptime (PS5.1-safe) with robust fallbacks
+function Get-UptimeHoursSafe {
+  try{
+    $os = Get-CimInstance -Class Win32_OperatingSystem -ErrorAction Stop
+    return [math]::Round((New-TimeSpan -Start $os.LastBootUpTime -End (Get-Date)).TotalHours, 2)
+  }catch{
+    try{ return [math]::Round(([double][int64]([Environment]::TickCount64))/3600000.0,2) }catch{
+      return [math]::Round(([double][int]([Environment]::TickCount))/3600000.0,2)
+    }
+  }
+}
+
+# ============================ UInt64 Helpers (PS5.1/7) ============================
 function Convert-HexToUInt64([string]$hex) { [Convert]::ToUInt64($hex, 16) }
 $U64_MAX = [UInt64]::MaxValue
 $MASK32  = Convert-HexToUInt64 'FFFFFFFF'
@@ -115,8 +135,12 @@ function Ensure-ReportFile([string]$Path){
   if(-not (Test-Path -LiteralPath $Path)) { New-Item -ItemType File -Path $Path -Force | Out-Null }
 }
 function Open-ReportWriter([string]$Path){
-  $fs = New-Object System.IO.FileStream($Path,[IO.FileMode]::Append,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite,4096,[IO.FileOptions]::SequentialScan)
-  $sw = New-Object System.IO.StreamWriter($fs,$Utf8NoBom,4096,$true); $sw.AutoFlush=$true; $sw
+  $fs = New-Object System.IO.FileStream(
+    $Path,[IO.FileMode]::Append,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite,4096,[IO.FileOptions]::SequentialScan
+  )
+  # leaveOpen=false so Dispose() also closes FileStream
+  $sw = New-Object System.IO.StreamWriter($fs,$Utf8NoBom,4096,$false)
+  $sw.AutoFlush=$true; $sw
 }
 function Close-ReportWriter($sw){ try{ if($sw){ $sw.Flush(); $sw.Dispose() } }catch{} }
 function Write-NdjsonLine($sw,[string]$Kind,[hashtable]$Fields){
@@ -131,7 +155,7 @@ function Get-SystemSnapshot {
   $osName='Windows_NT'; $osVer=[Environment]::OSVersion.Version.ToString()
   $cpuName='unknown'; [int]$logicalCpu=[Environment]::ProcessorCount
   [double]$memGB=0.0; $gpuName='unknown'
-  $uptimeHrs = [math]::Round(([double][Environment]::TickCount64)/3600000.0,2)
+  $uptimeHrs = Get-UptimeHoursSafe
 
   try{
     $os  = Get-CimInstance -Class Win32_OperatingSystem -ErrorAction Stop
@@ -193,7 +217,7 @@ function Test-Contract($Plan){
     }
   }
   $bar = $Plan.contract.barrierLayers
-  $q   = [math]::Max(0.85,[math]::Round(1.15,2)) # fixed illustrative q/q*
+  $q   = [math]::Max(0.85,[math]::Round(1.15,2)) # illustrative fixed q/q*
   $hop = $Plan.contract.hopP95
   [pscustomobject]@{
     passOK=$pass
@@ -227,8 +251,17 @@ function Test-WslAvailable {
     $p=New-Object System.Diagnostics.Process; $p.StartInfo=$psi
     if(-not $p.Start()){ return $false }
     $p.WaitForExit()
-    $out=$p.StandardOutput.ReadToEnd() + $p.StandardError.ReadToEnd()
-    return ($out -match 'Version|Default Distro')
+    if($p.ExitCode -eq 0){ return $true }
+
+    # Fallback: just execute a no-op in the default distro
+    $psi2=New-Object System.Diagnostics.ProcessStartInfo
+    $psi2.FileName='wsl.exe'; $psi2.Arguments='-e bash -lc "true"'
+    $psi2.UseShellExecute=$false; $psi2.RedirectStandardOutput=$true
+    $psi2.RedirectStandardError=$true; $psi2.CreateNoWindow=$true
+    $p2=New-Object System.Diagnostics.Process; $p2.StartInfo=$psi2
+    if(-not $p2.Start()){ return $false }
+    $p2.WaitForExit()
+    return ($p2.ExitCode -eq 0)
   }catch{ return $false }
 }
 function Start-WslProcess([string]$Cmd){
@@ -238,6 +271,13 @@ function Start-WslProcess([string]$Cmd){
     $psi.UseShellExecute=$false; $psi.RedirectStandardOutput=$true
     $psi.RedirectStandardError=$true; $psi.CreateNoWindow=$true
     $p=New-Object System.Diagnostics.Process; $p.StartInfo=$psi
+    $ok=$p.Start()
+    if(-not $ok){
+      $psi.Arguments='--exec ' + $Cmd
+      $p=New-Object System.Diagnostics.Process; $p.StartInfo=$psi
+      $ok=$p.Start()
+      if(-not $ok){ throw 'wsl.exe failed to start' }
+    }
     $p.add_OutputDataReceived({ param($s,$e)
       if($null -ne $e.Data){
         $script:Wsl.linesOut++; $script:Wsl.bytesOut += [Text.Encoding]::UTF8.GetByteCount($e.Data) + 1
@@ -250,7 +290,6 @@ function Start-WslProcess([string]$Cmd){
         $script:Wsl.lastBeat = Get-UtcNowMs
       }
     })
-    if(-not $p.Start()){ throw 'wsl.exe failed to start' }
     $p.BeginOutputReadLine(); $p.BeginErrorReadLine()
     $script:Wsl.proc=$p; $script:Wsl.started=$true; $script:Wsl.ok=$true; $true
   }catch{ $script:Wsl.ok=$false; $false }
@@ -388,15 +427,11 @@ function Invoke-AllTests {
 # ============================ MAIN (paste-and-run) ================================
 $writer=$null
 try{
-  if($RunTests){
-    $ok = Invoke-AllTests
-    return
-  }
+  Write-Info ("vAccel One-Shot v{0} start | profiles: {1}; duration: {2}s; gate: {3}" -f $Config.Version,$Profiles,$DurationSec,$Gate)
+  if($RunTests){ $ok = Invoke-AllTests; return }
 
   Ensure-ReportFile $ReportPath
   $writer=Open-ReportWriter $ReportPath
-
-  Write-Info ("vAccel One-Shot v{0} start | profiles: {1}; duration: {2}s; gate: {3}" -f $Config.Version,$Profiles,$DurationSec,$Gate)
 
   $sys=Get-SystemSnapshot
   if($Explain){ Write-Info ("System: " + (Convert-ToStableJson $sys)) }
@@ -450,5 +485,6 @@ finally{
   if($writer){ Close-ReportWriter $writer }
   if($EnableWsl -and $script:Wsl.enabled){ Stop-WslProcess }
 }
+
 
 
