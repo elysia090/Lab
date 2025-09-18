@@ -1,14 +1,9 @@
 & {
   # ============================================================================
-  # vAccel One-Shot — v1.3.8b (inline, ASCII-only, PS 5.1+/7, O(1)/tick, WSL)
-  # Notes:
-  #   - PowerShell function calls: no trailing "()", use (Func) in expressions.
-  #   - All loops are bounded; per-tick work is constant (O(1)).
-  #   - ASCII-only output. No Unicode line art.
-  #   - WSL path is optional and polled event-style (no blocking waits).
-  # Usage:
-  #   paste whole block into a PowerShell console and press Enter.
-  #   adjust parameters below if you want different behavior.
+  # vAccel One-Shot — v1.3.8c (hotfix-2)
+  # - Fix: Deterministic RNG changed to xoroshiro128+ (no wide multiply, no overflow).
+  # - PS rule: call functions w/o "()", use (Func) only for precedence in expressions.
+  # - ASCII-only, O(1) per tick, WSL optional, PS 5.1+/7 compatible.
   # ============================================================================
 
   # ----------------------- Parameters ----------------------------------------
@@ -73,18 +68,37 @@
   function LogErr ([string]$m){ Write-Host "[ERR ] $m" -ForegroundColor Red }
   # ---------------------------------------------------------------------------
 
-  # ----------------------- RNG (XorShift64*) ---------------------------------
-  if ($Deterministic -and $Seed -gt 0) { $global:VSeed = [uint64]$Seed } else { $global:VSeed = [uint64](NowMs) }
-  function U01 {
-    $s = $global:VSeed
-    $s = $s -bxor ($s -shl 12)
-    $s = $s -bxor ($s -shr 25)
-    $s = $s -bxor ($s -shl 27)
-    $global:VSeed = $s
-    $u = ($s * 2685821657736338717) -band 0xFFFFFFFFFFFFFFFF
-    [double]($u % 1000000) / 999999.0
+  # ----------------------- RNG: xoroshiro128+ (no overflow) -------------------
+  # State
+  if ($Deterministic -and $Seed -gt 0) {
+    $script:S0 = [uint64]$Seed
+    $script:S1 = [uint64]($Seed -bxor 0x9E3779B97F4A7C15)
+  } else {
+    # seed from time
+    $t = [uint64](NowMs)
+    $script:S0 = $t -bxor 0x9E3779B97F4A7C15
+    $script:S1 = ($t -shl 13) -bxor 0xBF58476D1CE4E5B9
   }
-  function RandRange([double]$a,[double]$b) { $a + (((U01)) * ($b - $a)) }
+
+  function Rol64([uint64]$x,[int]$k) {
+    (($x -shl $k) -bor ($x -shr (64 - $k))) -band 0xFFFFFFFFFFFFFFFF
+  }
+  function U64 {
+    $s0 = $script:S0
+    $s1 = $script:S1
+    $res = ($s0 + $s1) -band 0xFFFFFFFFFFFFFFFF
+    $s1 = $s1 -bxor $s0
+    $script:S0 = (Rol64 $s0 55) -bxor $s1 -bxor ($s1 -shl 14)
+    $script:S1 = Rol64 $s1 36
+    $res
+  }
+  function U01 {
+    # take top 53 bits -> [0,1)
+    $r = (U64)
+    $mantissa = ($r -shr 11) -band 0x1FFFFFFFFFFFFF
+    [double]$mantissa / [double]0x1FFFFFFFFFFFFF
+  }
+  function RandRange([double]$a,[double]$b) { $a + ((U01) * ($b - $a)) }
   # ---------------------------------------------------------------------------
 
   # ----------------------- Report I/O ----------------------------------------
@@ -170,8 +184,8 @@
     }
   }
   function Test-Safety {
-    # Functions in expressions must be wrapped: (U01)
-    $sig = Rnd (Clamp (0.996 + ((((U01)) * 0.002) - 0.001)) 0 1) 6
+    # functions as expressions -> wrap in ( )
+    $sig = Rnd (Clamp (0.996 + (((U01) * 0.002) - 0.001)) 0 1) 6
     [pscustomobject]@{ signatureScore=$sig; safetyOK=($sig -ge $Cfg.SigMin) }
   }
   # ---------------------------------------------------------------------------
@@ -417,4 +431,5 @@
     if($script:Wsl.enabled){ Stop-Wsl }
   }
 }
+
 
