@@ -1,6 +1,7 @@
-<# vAccel One-Shot — v1.3.0-r4
-Fixes for PS5.1: no '??', parenthesized nested calls, and zero-arg functions invoked via $(Func).
-Tested on: Windows PowerShell 5.1 / PowerShell 7.x
+<# vAccel One-Shot — v1.3.0-r5 (ASCII-safe)
+- Remove all box drawing / wide glyphs (ASCII only)
+- PS5.1 compatibility: no '??', zero-arg calls use $(Func)
+- Closed all braces in switch/try/catch
 #>
 
 [CmdletBinding()]
@@ -54,7 +55,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PS7 = $PSVersionTable.PSVersion.Major -ge 7
 
-# ── Utils ───────────────────────────────────────────────────────────────
+# Utils
 function Write-Info($m){ Write-Host "[INFO] $m" -ForegroundColor Cyan }
 function Write-Warn($m){ Write-Host "[WARN] $m" -ForegroundColor Yellow }
 function Write-ErrX($m){ Write-Host "[ERR ] $m" -ForegroundColor Red }
@@ -82,7 +83,7 @@ function New-ULID(){
   "{0}-{1}" -f ($(NowMs)), $r
 }
 
-# ── Probes (PS5互換: '??'不使用) ────────────────────────────────────────
+# Probes (no '??')
 function Probe-System {
   try{
     $os  = Get-CimInstance -Class Win32_OperatingSystem -ErrorAction Stop
@@ -108,7 +109,7 @@ function Probe-System {
   }
 }
 
-# ── Contracts / constants ───────────────────────────────────────────────
+# Contracts / constants
 $PassBudget = @{
   xmap=1; xzip=1; xsoftmax=1; xscan=1;
   xreduce=2; xsegment_reduce=2; xjoin=2; xtopk=2;
@@ -119,7 +120,7 @@ $BarrierMax = 3; $QoverQStarMax = 1.2; $SignatureMin = 0.995
 Assert-True ($RTSppMin -le $RTSppMax) "RTSppMin ($RTSppMin) must be <= RTSppMax ($RTSppMax)"
 Assert-True ($RTResolutionScaleMin -le $RTResolutionScaleMax) "RTResolutionScaleMin must be <= RTResolutionScaleMax"
 
-# ── Profiles → flags ────────────────────────────────────────────────────
+# Profiles -> flags
 $ProfilesArr = ($Profiles -split ',') | ForEach-Object { $_.Trim() }
 $PF = [pscustomobject]@{
   LIMIT_ORDER = ($ProfilesArr -contains 'LIMIT-ORDER')
@@ -129,7 +130,7 @@ $PF = [pscustomobject]@{
   MEMZERO     = ($ProfilesArr -contains 'MEMZERO')
 }
 
-# ── Report I/O ──────────────────────────────────────────────────────────
+# Report I/O
 function Ensure-Report([string]$Path){
   $dir = Split-Path -Parent $Path
   if(-not (Test-Path -LiteralPath $dir)){ New-Item -ItemType Directory -Path $dir -Force | Out-Null }
@@ -149,7 +150,7 @@ function Append-JSONL([string]$Path,[object]$Obj){
   }
 }
 
-# ── Plan builder ────────────────────────────────────────────────────────
+# Plan builder
 function Build-Plan([double]$PrecisionGlobalEps){
   $nodes = [System.Collections.Generic.List[object]]::new()
   $edges = [System.Collections.Generic.List[object]]::new()
@@ -213,7 +214,7 @@ function Build-Plan([double]$PrecisionGlobalEps){
   }
 }
 
-# ── Validators ──────────────────────────────────────────────────────────
+# Validators
 function Validate-Contract($Plan){
   $okPass=$true
   foreach($n in $Plan.nodes){
@@ -245,7 +246,7 @@ function Validate-Safety(){
   [pscustomobject]@{ signatureScore=$sig; protectedSkipped=$Denylist.Count; safetyOK=($sig -ge $SignatureMin) }
 }
 
-# ── Observation ─────────────────────────────────────────────────────────
+# Observation
 function Observe-Run($Plan){
   $runId = New-ULID
   Append-JSONL $ReportPath ([pscustomobject]@{
@@ -317,7 +318,7 @@ function Observe-Run($Plan){
   }
 }
 
-# ── Scorecard + exit ────────────────────────────────────────────────────
+# Scorecard + exit
 function Build-Scorecard($Contract,$Safety,$Obs){
   $sloOK = ($Obs.latP95 -le $BudgetLatencyMs) -and ($Obs.mpcViol -eq 0)
   $memOK = $true; if($Gate -eq 'memcomp'){ $memOK = ($Obs.compressedRatio -le 0.05) }
@@ -348,14 +349,14 @@ function Decide-ExitCode($Score){
   if($ok){ 0 } elseif($Gate -in @('strict','memcomp')){ 90 } else { 10 }
 }
 
-# ── MAIN ────────────────────────────────────────────────────────────────
+# MAIN
 try{
   Ensure-Report $ReportPath
-  Write-Info "vAccel One-Shot — start (profiles: $($ProfilesArr -join ', '); duration: ${DurationSec}s; gate: $Gate)"
+  Write-Info ("vAccel One-Shot start | profiles: {0}; duration: {1}s; gate: {2}" -f ($ProfilesArr -join ', '), $DurationSec, $Gate)
   $sys = Probe-System; if($Why){ Write-Info ("System: " + (To-JsonStable $sys)) }
 
   $plan = Build-Plan -PrecisionGlobalEps $PrecisionGlobalEps
-  if($Why){ Write-Info "Plan planId=$($plan.planId) nodes=$($plan.nodes.Count) edges=$($plan.edges.Count)" }
+  if($Why){ Write-Info ("Plan planId={0} nodes={1} edges={2}" -f $plan.planId, $plan.nodes.Count, $plan.edges.Count) }
 
   $contract = Validate-Contract $plan
   $safety   = Validate-Safety
@@ -370,39 +371,36 @@ try{
   $exit  = Decide-ExitCode $score
   Append-JSONL $ReportPath ([pscustomobject]@{ kind='summary'; timeMs=$(NowMs); runId=$plan.planId; exitCode=$exit; scorecard=$score })
 
-  $summary = [pscustomobject]@{
-    runId=$plan.planId; exitCode=$exit; scorecard=$score
-    nextAction = $( if($exit -eq 0){ "Proceed (gate: $Gate)" } elseif($exit -eq 90){ "Rollback or relax gate" } else { "Partial OK: review scorecard" } )
-  }
-
   switch($Out){
-    'json'   { $summary | To-JsonStable | Write-Output }
-    'ndjson' { $summary | To-JsonStable | Write-Output }
-    'plain'  { "{0} {1}" -f $summary.runId, $summary.exitCode | Write-Output }
-    'tsv'    { "runId`texitCode`tnextAction"; "{0}`t{1}`t{2}" -f $summary.runId,$summary.exitCode,$summary.nextAction | Write-Output }
+    'json'   { $score | To-JsonStable | Write-Output }
+    'ndjson' { $score | To-JsonStable | Write-Output }
+    'plain'  { "{0} {1}" -f $plan.planId, $exit | Write-Output }
+    'tsv'    { "runId`texitCode`tnextAction"; "{0}`t{1}`t{2}" -f $plan.planId,$exit,($( if($exit -eq 0){ "Proceed (gate: $Gate)" } elseif($exit -eq 90){ "Rollback or relax gate" } else { "Partial OK: review scorecard" } )) | Write-Output }
     default  {
       $okColor = $(if($exit -eq 0){'Green'} elseif($exit -eq 90){ 'Red' } else { 'Yellow' })
-      $pstr = Safe-Substr (($ProfilesArr -join ', '), 28)
+      $pstr = Safe-Substr (($ProfilesArr -join ', '), 48)
       Write-Host ""
-      Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor DarkGray
-      Write-Host ("║ vAccel One-Shot — runId {0} " -f $summary.runId).PadRight(58) + "║" -ForegroundColor DarkGray
-      Write-Host "╠══════════════════════════════════════════════════════════╣" -ForegroundColor DarkGray
-      Write-Host ("║ ExitCode : {0,-4}  Gate: {1,-8}  Profiles: {2,-28}║" -f $exit,$Gate,$pstr) -ForegroundColor $okColor
-      Write-Host ("║ Contract : {0,-5}  Safety: {1,-5}  SLO: {2,-5}  Reuse: {3,-5} ║" -f ($score.contractOK),($score.safetyOK),($score.sloOK),($score.reuseOK)) -ForegroundColor Gray
-      if($Gate -eq 'memcomp'){ Write-Host ("║ MemComp  : {0,-5}  ratio={1,-5} (≤0.05)                    ║" -f ($score.memOK),($score.measured.compressedBytesRatio)) -ForegroundColor Gray }
-      Write-Host ("║ latP95={0}ms  q/q*={1}  barriers={2}  hops={3}           ║" -f $score.measured.latencyP95Ms,$score.measured.qOverQStar,$score.measured.barrierLayers,$score.measured.hopP95) -ForegroundColor Gray
-      if($score.measured.frameP95Ms -gt 0){ Write-Host ("║ frameP95={0}ms (RT)                                        ║" -f $score.measured.frameP95Ms) -ForegroundColor Gray }
-      Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor DarkGray
+      Write-Host ("vAccel One-Shot runId={0}" -f $plan.planId) -ForegroundColor DarkGray
+      Write-Host ("ExitCode: {0}  Gate: {1}  Profiles: {2}" -f $exit,$Gate,$pstr) -ForegroundColor $okColor
+      Write-Host ("Contract:{0}  Safety:{1}  SLO:{2}  Reuse:{3}" -f ($score.contractOK),($score.safetyOK),($score.sloOK),($score.reuseOK)) -ForegroundColor Gray
+      if($Gate -eq 'memcomp'){
+        Write-Host ("MemComp : {0}  ratio={1} (<=0.05)" -f ($score.memOK),($score.measured.compressedBytesRatio)) -ForegroundColor Gray
+      }
+      Write-Host ("latP95={0}ms  q/q*={1}  barriers={2}  hops={3}" -f $score.measured.latencyP95Ms,$score.measured.qOverQStar,$score.measured.barrierLayers,$score.measured.hopP95) -ForegroundColor Gray
+      if($score.measured.frameP95Ms -gt 0){
+        Write-Host ("frameP95={0}ms (RT)" -f $score.measured.frameP95Ms) -ForegroundColor Gray
+      }
       Write-Host ("Report: {0}" -f $ReportPath) -ForegroundColor DarkGray
       if($Why){
-        Write-Host "`nWHY:" -ForegroundColor Cyan
-        if(-not $score.contractOK){ Write-Warn "Contract gate failed (Π/Barrier/Q*/H). Consider LIMIT-ORDER + SUPRA-HIEND + MEMZERO." }
+        Write-Host ""
+        if(-not $score.contractOK){ Write-Warn "Contract gate failed (Pi/Barrier/Q*/H). Consider LIMIT-ORDER + SUPRA-HIEND + MEMZERO." }
         if(-not $score.safetyOK){  Write-Warn "SignatureScore below threshold; protected processes skipped." }
         if(-not $score.sloOK){     Write-Warn "SLO breach (latency/thermal). Reduce parallel width/SPP/ResolutionScale." }
         if(($Gate -eq 'memcomp') -and (-not $score.memOK)){ Write-Warn "MemZero gate failed. Increase HotSet/CID-dedupe; keep compute-compressed." }
       }
     }
   }
+
   if(-not $DryRun){ exit $exit }
 }
 catch{
