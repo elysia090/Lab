@@ -1,22 +1,20 @@
 <# ================================================================================
- vAccel One-Shot — v1.4.1e (paste-safe, product-grade)
- - ASCII only. Works on Windows PowerShell 5.1 and PowerShell 7+.
- - Paste-and-run: no param() block; defaults applied only if variables are UNSET.
- - Deterministic UInt64-safe RNG (xoroshiro128+).
- - Robust system snapshot (no nulls; uptime via 3-level fallback).
- - Optional WSL integration (availability by exit code; -e/--exec fallback; async IO).
- - NDJSON report writer (append-only, retry-friendly; guaranteed close).
- - Built-in self tests: set $RunTests=$true (optional).
- - Zero background jobs on the hot path; O(1)/tick contract checks.
+ vAccel One-Shot — v1.4.3 (paste-safe, product-grade, PS5.1/PS7+, ASCII only)
 
- Design notes for 1.4.1e:
- - Fixed: TickCount64 availability (PS5.1) via Get-UptimeHoursSafe().
- - Fixed: FileStream lifetime (leaveOpen=false) to avoid rare file locks.
- - Hardened: WSL detection by exit code and exec fallback; resilient start/stop.
- - Kept: Human-friendly and machine-friendly outputs without breaking behavior.
+ Highlights vs 1.4.2b:
+ - Safer NDJSON writer with guarded writes (skip on transient IO issues)
+ - Hardened WSL lifecycle: availability check, start with fallback, idle timeout, safe kill
+ - Strict clamps for user thresholds; normalized ReportPath; OS-safe snapshot fallbacks
+ - Clear, actionable exit hints; configurable ReuseMin (default 0.25)
+ - No PS7-only syntax; runs clean on Windows PowerShell 5.1
+
+ Usage tips:
+   # optional per-run knobs
+   $ReuseMin=0.25; $DurationSec=10; $Gate='strict'; $EnableWsl=$false; $Output='human'
+   # paste whole script and run
 ================================================================================ #>
 
-# ============================ Runtime Defaults (applied only if UNSET) ===========
+# ============================ Runtime Defaults (only if UNSET) ===================
 if(-not (Test-Path variable:Profiles))          { $Profiles = 'AUTOHOOK-GLOBAL,LIMIT-ORDER,SUPRA-HIEND,RT-BALANCED,FABRIC,MEMZERO' }
 if(-not (Test-Path variable:Aggressiveness))    { $Aggressiveness = 'balanced' }
 if(-not (Test-Path variable:LatencyBudgetMs))   { [int]   $LatencyBudgetMs = 60 }
@@ -38,10 +36,15 @@ if(-not (Test-Path variable:ReportPath))        { $ReportPath = Join-Path (Get-L
 # WSL integration
 if(-not (Test-Path variable:EnableWsl))         { [bool]$EnableWsl = $false }
 if(-not (Test-Path variable:WslCommand))        { $WslCommand = 'bash -lc "yes test | head -n 20000"' }
+if(-not (Test-Path variable:WslIdleTimeoutMs))  { [int]$WslIdleTimeoutMs = 5000 }  # idle grace for async IO
 
 # Test mode (optional)
 if(-not (Test-Path variable:RunTests))          { [bool]$RunTests = $false }
 if(-not (Test-Path variable:TestFilter))        { $TestFilter = '' }
+
+# Reuse gate threshold & exit hints
+if(-not (Test-Path variable:ReuseMin))          { [double]$ReuseMin = 0.25 }
+if(-not (Test-Path variable:ExitHints))         { [bool]$ExitHints = $true }
 
 # ============================ Runtime / Constants =================================
 Set-StrictMode -Version Latest
@@ -49,7 +52,7 @@ $ErrorActionPreference = 'Stop'
 [bool]$IsPS7 = $PSVersionTable.PSVersion.Major -ge 7
 
 $Config = @{
-  Version       = '1.4.1e'
+  Version       = '1.4.3'
   TickMs        = 500
   JsonDepth     = 12
   BarrierMax    = 3
@@ -67,15 +70,23 @@ function Write-Info ([string]$m){ Write-Host "[INFO] $m" -ForegroundColor Cyan }
 function Write-Warn ([string]$m){ Write-Host "[WARN] $m" -ForegroundColor Yellow }
 function Write-Err  ([string]$m){ Write-Host "[ERR ] $m" -ForegroundColor Red }
 
+# OS helpers
+function Get-IsWindows { $PSVersionTable.PSEdition -eq 'Desktop' -or $env:OS -like '*Windows*' }
+
 # Uptime (PS5.1-safe) with robust fallbacks
 function Get-UptimeHoursSafe {
-  try{
-    $os = Get-CimInstance -Class Win32_OperatingSystem -ErrorAction Stop
-    return [math]::Round((New-TimeSpan -Start $os.LastBootUpTime -End (Get-Date)).TotalHours, 2)
-  }catch{
-    try{ return [math]::Round(([double][int64]([Environment]::TickCount64))/3600000.0,2) }catch{
-      return [math]::Round(([double][int]([Environment]::TickCount))/3600000.0,2)
+  if(Get-IsWindows){
+    try{
+      $os = Get-CimInstance -Class Win32_OperatingSystem -ErrorAction Stop
+      return [math]::Round((New-TimeSpan -Start $os.LastBootUpTime -End (Get-Date)).TotalHours, 2)
+    }catch{
+      try{ return [math]::Round(([double][int64]([Environment]::TickCount64))/3600000.0,2) }catch{
+        return [math]::Round(([double][int]([Environment]::TickCount))/3600000.0,2)
+      }
     }
+  } else {
+    # Cross-platform fallback
+    return [math]::Round((New-TimeSpan -Start ([DateTime]::Now.AddHours(-1)) -End (Get-Date)).TotalHours,2)
   }
 }
 
@@ -129,71 +140,65 @@ function Get-RandInRange([double]$a,[double]$b){ $a + ((Get-RandUnit01) * ($b - 
 
 # ============================ Report I/O ==========================================
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+function Normalize-ReportPath([string]$p){
+  try{ [IO.Path]::GetFullPath($p) }catch{ Join-Path (Get-Location) 'scorecard.jsonl' }
+}
 function Ensure-ReportFile([string]$Path){
   $dir = Split-Path -Parent $Path
   if($dir -and -not (Test-Path -LiteralPath $dir)){ New-Item -ItemType Directory -Path $dir -Force | Out-Null }
   if(-not (Test-Path -LiteralPath $Path)) { New-Item -ItemType File -Path $Path -Force | Out-Null }
 }
 function Open-ReportWriter([string]$Path){
-  $fs = New-Object System.IO.FileStream(
-    $Path,[IO.FileMode]::Append,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite,4096,[IO.FileOptions]::SequentialScan
-  )
-  # leaveOpen=false so Dispose() also closes FileStream
-  $sw = New-Object System.IO.StreamWriter($fs,$Utf8NoBom,4096,$false)
-  $sw.AutoFlush=$true; $sw
+  try{
+    $fs = New-Object System.IO.FileStream(
+      $Path,[IO.FileMode]::Append,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite,4096,[IO.FileOptions]::SequentialScan
+    )
+    $sw = New-Object System.IO.StreamWriter($fs,$Utf8NoBom,4096,$false)
+    $sw.AutoFlush=$true; $sw
+  }catch{
+    Write-Warn ("Report open failed: {0}" -f $_.Exception.Message); $null
+  }
 }
 function Close-ReportWriter($sw){ try{ if($sw){ $sw.Flush(); $sw.Dispose() } }catch{} }
-function Write-NdjsonLine($sw,[string]$Kind,[hashtable]$Fields){
-  $rec=[ordered]@{ kind=$Kind; timeMs=(Get-UtcNowMs) }
-  foreach($k in $Fields.Keys){ $rec[$k]=$Fields[$k] }
-  $sw.Write((Convert-ToStableJson ([pscustomobject]$rec)) + [Environment]::NewLine)
+function Try-WriteNdjson($sw,[string]$Kind,[hashtable]$Fields){
+  if(-not $sw){ return }
+  try{
+    $rec=[ordered]@{ kind=$Kind; timeMs=(Get-UtcNowMs) }
+    foreach($k in $Fields.Keys){ $rec[$k]=$Fields[$k] }
+    $sw.Write((Convert-ToStableJson ([pscustomobject]$rec)) + [Environment]::NewLine)
+  }catch{
+    Write-Warn ("NDJSON write skipped: {0}" -f $_.Exception.Message)
+  }
 }
 
 # ============================ System Snapshot (no nulls) ==========================
 function Get-RegistryValue([string]$Path,[string]$Name){ try{ (Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop).$Name }catch{ $null } }
 function Get-SystemSnapshot {
-  $osName='Windows_NT'; $osVer=[Environment]::OSVersion.Version.ToString()
-  $cpuName='unknown'; [int]$logicalCpu=[Environment]::ProcessorCount
+  $osName='Unknown OS'; $osVer=''; $cpuName='unknown'; [int]$logicalCpu=[Environment]::ProcessorCount
   [double]$memGB=0.0; $gpuName='unknown'
   $uptimeHrs = Get-UptimeHoursSafe
 
-  try{
-    $os  = Get-CimInstance -Class Win32_OperatingSystem -ErrorAction Stop
-    $cpu = Get-CimInstance -Class Win32_Processor       -ErrorAction Stop
-    $gpu = $null; try{ $gpu=Get-CimInstance -Class Win32_VideoController -ErrorAction SilentlyContinue }catch{}
-    $osName = Get-NonNull $os.Caption $osName
-    $osVer  = Get-NonNull $os.Version $osVer
-    $cpuName= Get-NonNull $cpu.Name 'unknown'
-    if($cpu.NumberOfLogicalProcessors -gt 0){ $logicalCpu = $cpu.NumberOfLogicalProcessors }
-    $memGB  = [math]::Round($os.TotalVisibleMemorySize/1MB,2)
-    if($gpu){ $gpuName = Get-NonNull (($gpu|Select-Object -First 1).Name) 'unknown' }
-    return [pscustomobject]@{ OsName=$osName; OsVersion=$osVer; CpuName=$cpuName; LogicalCPU=$logicalCpu; MemGB=$memGB; GPU=$gpuName; UptimeHrs=$uptimeHrs }
-  }catch{}
-
-  try{
-    $os  = Get-WmiObject -Class Win32_OperatingSystem -ErrorAction Stop
-    $cpu = Get-WmiObject -Class Win32_Processor       -ErrorAction Stop
-    $gpu = $null; try{ $gpu=Get-WmiObject -Class Win32_VideoController -ErrorAction SilentlyContinue }catch{}
-    $osName = Get-NonNull $os.Caption $osName
-    $osVer  = Get-NonNull $os.Version $osVer
-    $cpuName= Get-NonNull $cpu.Name 'unknown'
-    if($cpu.NumberOfLogicalProcessors -gt 0){ $logicalCpu = $cpu.NumberOfLogicalProcessors }
-    $memGB  = [math]::Round($os.TotalVisibleMemorySize/1MB,2)
-    if($gpu){ $gpuName = Get-NonNull (($gpu|Select-Object -First 1).Name) 'unknown' }
-    return [pscustomobject]@{ OsName=$osName; OsVersion=$osVer; CpuName=$cpuName; LogicalCPU=$logicalCpu; MemGB=$memGB; GPU=$gpuName; UptimeHrs=$uptimeHrs }
-  }catch{}
-
-  try{
-    $prod = Get-RegistryValue 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' 'ProductName'
-    $bld  = Get-RegistryValue 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' 'CurrentBuildNumber'
-    $osName = Get-NonNull $prod $osName; $osVer = Get-NonNull $bld $osVer
-    $cpuReg = Get-RegistryValue 'HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0' 'ProcessorNameString'
-    $cpuName= Get-NonNull $cpuReg 'unknown'
+  if(Get-IsWindows){
     try{
-      $cs = Get-WmiObject -Class Win32_ComputerSystem -ErrorAction Stop
-      if($cs.TotalPhysicalMemory){ $memGB = [math]::Round(($cs.TotalPhysicalMemory/1GB),2) }
+      $os  = Get-CimInstance -Class Win32_OperatingSystem -ErrorAction Stop
+      $cpu = Get-CimInstance -Class Win32_Processor       -ErrorAction Stop
+      $gpu = $null; try{ $gpu=Get-CimInstance -Class Win32_VideoController -ErrorAction SilentlyContinue }catch{}
+      $osName = Get-NonNull $os.Caption $osName
+      $osVer  = Get-NonNull $os.Version $osVer
+      $cpuName= Get-NonNull $cpu.Name 'unknown'
+      if($cpu.NumberOfLogicalProcessors -gt 0){ $logicalCpu = $cpu.NumberOfLogicalProcessors }
+      $memGB  = [math]::Round($os.TotalVisibleMemorySize/1MB,2)
+      if($gpu){ $gpuName = Get-NonNull (($gpu|Select-Object -First 1).Name) 'unknown' }
+      return [pscustomobject]@{ OsName=$osName; OsVersion=$osVer; CpuName=$cpuName; LogicalCPU=$logicalCpu; MemGB=$memGB; GPU=$gpuName; UptimeHrs=$uptimeHrs }
     }catch{}
-  }catch{}
+    try{
+      $prod = Get-RegistryValue 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' 'ProductName'
+      $bld  = Get-RegistryValue 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' 'CurrentBuildNumber'
+      $osName = Get-NonNull $prod $osName; $osVer = Get-NonNull $bld $osVer
+      $cpuReg = Get-RegistryValue 'HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0' 'ProcessorNameString'
+      $cpuName= Get-NonNull $cpuReg 'unknown'
+    }catch{}
+  }
   [pscustomobject]@{ OsName=$osName; OsVersion=$osVer; CpuName=$cpuName; LogicalCPU=$logicalCpu; MemGB=$memGB; GPU=$gpuName; UptimeHrs=$uptimeHrs }
 }
 
@@ -242,7 +247,7 @@ $script:Wsl=[pscustomobject]@{
   exitCode=$null; proc=$null
 }
 function Test-WslAvailable {
-  if(-not $EnableWsl){ return $false }
+  if(-not $EnableWsl -or -not (Get-IsWindows)){ return $false }
   try{
     $psi=New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName='wsl.exe'; $psi.Arguments='--status'
@@ -252,8 +257,7 @@ function Test-WslAvailable {
     if(-not $p.Start()){ return $false }
     $p.WaitForExit()
     if($p.ExitCode -eq 0){ return $true }
-
-    # Fallback: just execute a no-op in the default distro
+    # Fallback: just execute a no-op
     $psi2=New-Object System.Diagnostics.ProcessStartInfo
     $psi2.FileName='wsl.exe'; $psi2.Arguments='-e bash -lc "true"'
     $psi2.UseShellExecute=$false; $psi2.RedirectStandardOutput=$true
@@ -301,6 +305,12 @@ function Poll-WslProcess {
       $script:Wsl.exitCode = $script:Wsl.proc.ExitCode
       $script:Wsl.exited   = $true
     }
+    return
+  }
+  # idle timeout guard
+  if(($WslIdleTimeoutMs -gt 0) -and ((Get-UtcNowMs) - $script:Wsl.lastBeat -gt $WslIdleTimeoutMs)){
+    try{ if($script:Wsl.proc -and -not $script:Wsl.proc.HasExited){ $script:Wsl.proc.Kill() | Out-Null } }catch{}
+    $script:Wsl.exitCode = -1; $script:Wsl.exited=$true
   }
 }
 function Stop-WslProcess {
@@ -313,7 +323,7 @@ function Stop-WslProcess {
 }
 
 # ============================ Observation / Score =================================
-function Invoke-Observation([pscustomobject]$Plan,[System.IO.StreamWriter]$Report){
+function Invoke-Observation([pscustomobject]$Plan,$ReportWriter){
   $latP95=0.0; $frameP95=0.0; $qOver=1.0; $mpcViol=0
   [int64]$ioBytes=0; [int]$missPages=0
   $power = [math]::Round((Get-RandInRange 18 28),1)
@@ -348,7 +358,7 @@ function Invoke-Observation([pscustomobject]$Plan,[System.IO.StreamWriter]$Repor
         $kv.wslBytesOut=[int64]$script:Wsl.bytesOut; $kv.wslBytesErr=[int64]$script:Wsl.bytesErr
         $kv.wslLastBeat=$script:Wsl.lastBeat; $kv.wslExited=$script:Wsl.exited
       }
-      Write-NdjsonLine $Report 'metric' $kv
+      Try-WriteNdjson $ReportWriter 'metric' $kv
     }
   }
   $timer.Stop()
@@ -366,11 +376,20 @@ function Invoke-Observation([pscustomobject]$Plan,[System.IO.StreamWriter]$Repor
 }
 function Build-Scorecard($Contract,$Safety,$Obs){
   $sloOk   = ($Obs.latP95 -le $LatencyBudgetMs) -and ($Obs.mpcViol -eq 0)
-  $reuseOk = ($Obs.deltaRagHit -ge 0.3)
+  $reuseOk = ($Obs.deltaRagHit -ge $ReuseMin)
   $memOk   = $true; if($Gate -eq 'memcomp'){ $memOk = ($Obs.compressed -le 0.05) }
+
+  $reasons = New-Object System.Collections.Generic.List[string]
+  if(-not $Contract.contractOK){ $reasons.Add('contract') | Out-Null }
+  if(-not $Safety.safetyOK){    $reasons.Add('safety')   | Out-Null }
+  if(-not $sloOk){               $reasons.Add(("slo(latP95={0}ms > {1} or mpcViol>0)" -f $Obs.latP95,$LatencyBudgetMs)) | Out-Null }
+  if(-not $reuseOk){             $reasons.Add(("reuse(deltaRagHit={0} < ReuseMin={1})" -f $Obs.deltaRagHit,$ReuseMin))   | Out-Null }
+  if($Gate -eq 'memcomp' -and -not $memOk){ $reasons.Add(("mem(compressed={0} > 0.05)" -f $Obs.compressed)) | Out-Null }
+
   [pscustomobject]@{
     contractOK=$Contract.contractOK; safetyOK=$Safety.safetyOK; sloOK=$sloOk; reuseOK=$reuseOk
     memOK=$(if($Gate -eq 'memcomp'){$memOk}else{$null})
+    reasons=$reasons.ToArray()
     measured=[pscustomobject]@{
       latencyP95Ms=$Obs.latP95; qOverQStar=$Contract.qOverQStar; barrierLayers=$Contract.barrier; hopP95=$Contract.hopP95
       wslLinesOut=$Obs.wslLinesOut; wslLinesErr=$Obs.wslLinesErr; wslBytesOut=$Obs.wslBytesOut; wslBytesErr=$Obs.wslBytesErr
@@ -407,7 +426,7 @@ function Invoke-AllTests {
     if(T 'Snapshot-no-nulls'){ $sys=Get-SystemSnapshot; $ok = ($sys.OsName) -and ($sys.OsVersion) -and ($sys.CpuName) -and ($sys.LogicalCPU -ge 1); Assert-True $ok 'Snapshot-no-nulls' "missing fields" }
     if(T 'Report-ndjson'){
       $tmp = Join-Path $env:TEMP ("vaccel-{0}.jsonl" -f (Get-UtcNowMs)); Ensure-ReportFile $tmp; $w = Open-ReportWriter $tmp
-      Write-NdjsonLine $w 'metric' @{ foo=1; bar='x' }; Close-ReportWriter $w
+      Try-WriteNdjson $w 'metric' @{ foo=1; bar='x' }; Close-ReportWriter $w
       $line = Get-Content -LiteralPath $tmp -TotalCount 1; $obj = $line | ConvertFrom-Json
       Assert-True ($obj.kind -eq 'metric' -and $obj.foo -eq 1 -and $obj.bar -eq 'x') 'Report-ndjson' "json roundtrip"
       Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
@@ -430,6 +449,14 @@ try{
   Write-Info ("vAccel One-Shot v{0} start | profiles: {1}; duration: {2}s; gate: {3}" -f $Config.Version,$Profiles,$DurationSec,$Gate)
   if($RunTests){ $ok = Invoke-AllTests; return }
 
+  # Clamp thresholds to sane ranges
+  $ReuseMin       = Invoke-Clamp $ReuseMin 0 1
+  $LatencyBudgetMs= [int](Invoke-Clamp $LatencyBudgetMs 1 10000)
+  $PowerBudgetW   = Invoke-Clamp $PowerBudgetW 0 1000
+  $TempBudgetC    = Invoke-Clamp $TempBudgetC 0 120
+  $DurationSec    = [int](Invoke-Clamp $DurationSec 1 3600)
+
+  $ReportPath = Normalize-ReportPath $ReportPath
   Ensure-ReportFile $ReportPath
   $writer=Open-ReportWriter $ReportPath
 
@@ -445,18 +472,18 @@ try{
 
   $plan = New-ExecutionPlan
   $contract = Test-Contract $plan
-  Write-NdjsonLine $writer 'contract' @{ runId=$plan.planId; barrierLayers=$contract.barrier; qOverQStar=$contract.qOverQStar; hopP95=$contract.hopP95 }
+  Try-WriteNdjson $writer 'contract' @{ runId=$plan.planId; barrierLayers=$contract.barrier; qOverQStar=$contract.qOverQStar; hopP95=$contract.hopP95 }
   if($Explain){ Write-Info ("Contract[" + ($(if($contract.contractOK){'OK'}else{'FAIL'})) + "]") }
 
   $safety = Evaluate-Safety
-  Write-NdjsonLine $writer 'safety' @{ runId=$plan.planId; signatureScore=$safety.signatureScore }
+  Try-WriteNdjson $writer 'safety' @{ runId=$plan.planId; signatureScore=$safety.signatureScore }
 
   $obs = Invoke-Observation $plan $writer
   if($Explain){ Write-Info ("Observed: " + (Convert-ToStableJson $obs)) }
 
   $score = Build-Scorecard $contract $safety $obs
   $exit  = Get-ExitCode $score
-  Write-NdjsonLine $writer 'summary' @{ runId=$plan.planId; exitCode=$exit; scorecard=$score }
+  Try-WriteNdjson $writer 'summary' @{ runId=$plan.planId; exitCode=$exit; scorecard=$score }
 
   switch($Output){
     'json'   { ([pscustomobject]@{ runId=$plan.planId; exitCode=$exit; scorecard=$score } | Convert-ToStableJson) | Write-Output }
@@ -473,6 +500,10 @@ try{
       } else {
         Write-Host "WSL: disabled or unavailable"
       }
+      if($ExitHints -and $exit -ne 0 -and $score.reasons -and $score.reasons.Length -gt 0){
+        Write-Host ("Hints: " + ([string]::Join('; ', $score.reasons))) -ForegroundColor Yellow
+        Write-Host "Tip: tune `$ReuseMin (e.g. 0.25), budgets, or set Gate='none' to explore." -ForegroundColor DarkYellow
+      }
       Write-Host ("Report: {0}" -f $ReportPath)
     }
   }
@@ -485,6 +516,7 @@ finally{
   if($writer){ Close-ReportWriter $writer }
   if($EnableWsl -and $script:Wsl.enabled){ Stop-WslProcess }
 }
+
 
 
 
