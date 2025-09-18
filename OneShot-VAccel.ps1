@@ -1,9 +1,10 @@
 & {
   # ============================================================================
-  # vAccel One-Shot — v1.3.8c (hotfix-2)
-  # - Fix: Deterministic RNG changed to xoroshiro128+ (no wide multiply, no overflow).
-  # - PS rule: call functions w/o "()", use (Func) only for precedence in expressions.
-  # - ASCII-only, O(1) per tick, WSL optional, PS 5.1+/7 compatible.
+  # vAccel One-Shot — v1.3.8d (no-WSL)
+  # - WSL integration removed entirely.
+  # - Deterministic RNG: xoroshiro128+ (no wide multiply, no overflow).
+  # - ASCII-only, O(1) per tick, PS 5.1+/7 compatible.
+  # Usage: paste whole block and press Enter.
   # ============================================================================
 
   # ----------------------- Parameters ----------------------------------------
@@ -33,11 +34,6 @@
   # Report path
   [string] $ReportPath         = (Join-Path (Get-Location) 'scorecard.jsonl')
 
-  # WSL integration
-  [bool]   $EnableWsl          = $true
-  [string] $WslCommand         = 'bash -lc "yes test | head -n 20000"'
-  # ---------------------------------------------------------------------------
-
   # ----------------------- Runtime / Constants --------------------------------
   Set-StrictMode -Version Latest
   $ErrorActionPreference = 'Stop'
@@ -49,7 +45,6 @@
     QOverQStarMax = 1.2
     SigMin        = 0.995
   }
-  # ---------------------------------------------------------------------------
 
   # ----------------------- Utilities -----------------------------------------
   function NowMs { [int64]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) }
@@ -66,20 +61,16 @@
   function LogInfo([string]$m){ Write-Host "[INFO] $m" -ForegroundColor Cyan }
   function LogWarn([string]$m){ Write-Host "[WARN] $m" -ForegroundColor Yellow }
   function LogErr ([string]$m){ Write-Host "[ERR ] $m" -ForegroundColor Red }
-  # ---------------------------------------------------------------------------
 
-  # ----------------------- RNG: xoroshiro128+ (no overflow) -------------------
-  # State
+  # ----------------------- RNG: xoroshiro128+ ---------------------------------
   if ($Deterministic -and $Seed -gt 0) {
     $script:S0 = [uint64]$Seed
     $script:S1 = [uint64]($Seed -bxor 0x9E3779B97F4A7C15)
   } else {
-    # seed from time
     $t = [uint64](NowMs)
     $script:S0 = $t -bxor 0x9E3779B97F4A7C15
     $script:S1 = ($t -shl 13) -bxor 0xBF58476D1CE4E5B9
   }
-
   function Rol64([uint64]$x,[int]$k) {
     (($x -shl $k) -bor ($x -shr (64 - $k))) -band 0xFFFFFFFFFFFFFFFF
   }
@@ -93,13 +84,12 @@
     $res
   }
   function U01 {
-    # take top 53 bits -> [0,1)
+    # top 53 bits -> [0,1)
     $r = (U64)
     $mantissa = ($r -shr 11) -band 0x1FFFFFFFFFFFFF
     [double]$mantissa / [double]0x1FFFFFFFFFFFFF
   }
   function RandRange([double]$a,[double]$b) { $a + ((U01) * ($b - $a)) }
-  # ---------------------------------------------------------------------------
 
   # ----------------------- Report I/O ----------------------------------------
   $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -120,7 +110,6 @@
     foreach($k in $Fields.Keys){ $rec[$k]=$Fields[$k] }
     $sw.Write((JsonStable ([pscustomobject]$rec)) + [Environment]::NewLine)
   }
-  # ---------------------------------------------------------------------------
 
   # ----------------------- System Probe (O(1)) --------------------------------
   function Get-SystemInfo {
@@ -146,7 +135,6 @@
       }
     }
   }
-  # ---------------------------------------------------------------------------
 
   # ----------------------- Fixed Plan & Contract (O(1)) ----------------------
   $PassBudget = @{
@@ -188,75 +176,6 @@
     $sig = Rnd (Clamp (0.996 + (((U01) * 0.002) - 0.001)) 0 1) 6
     [pscustomobject]@{ signatureScore=$sig; safetyOK=($sig -ge $Cfg.SigMin) }
   }
-  # ---------------------------------------------------------------------------
-
-  # ----------------------- WSL Integration (event-style) ---------------------
-  $script:Wsl=[pscustomobject]@{
-    enabled=$false; started=$false; exited=$false; ok=$false
-    linesOut=0; linesErr=0; bytesOut=[int64]0; bytesErr=[int64]0; lastBeat=[int64]0
-    exitCode=$null; proc=$null
-  }
-  function Test-WslAvailable {
-    if(-not $EnableWsl){ return $false }
-    try{
-      $p=Start-Process -FilePath 'wsl.exe' -ArgumentList @('--status') -WindowStyle Hidden -NoNewWindow -PassThru -Wait -ErrorAction Stop
-      return ($p.ExitCode -in 0,1)
-    }catch{ return $false }
-  }
-  function Start-WslJob([string]$Cmd){
-    try{
-      $psi=New-Object System.Diagnostics.ProcessStartInfo
-      $psi.FileName='wsl.exe'
-      $psi.Arguments='-e ' + $Cmd
-      $psi.UseShellExecute=$false
-      $psi.RedirectStandardOutput=$true
-      $psi.RedirectStandardError=$true
-      $psi.CreateNoWindow=$true
-
-      $p=New-Object System.Diagnostics.Process
-      $p.StartInfo=$psi
-
-      $p.add_OutputDataReceived({ param($s,$e)
-        if($null -ne $e.Data){
-          $script:Wsl.linesOut++
-          $script:Wsl.bytesOut += [Text.Encoding]::UTF8.GetByteCount($e.Data) + 1
-          $script:Wsl.lastBeat = NowMs
-        }
-      })
-      $p.add_ErrorDataReceived({ param($s,$e)
-        if($null -ne $e.Data){
-          $script:Wsl.linesErr++
-          $script:Wsl.bytesErr += [Text.Encoding]::UTF8.GetByteCount($e.Data) + 1
-          $script:Wsl.lastBeat = NowMs
-        }
-      })
-
-      if(-not $p.Start()){ throw 'wsl.exe failed to start' }
-      $p.BeginOutputReadLine(); $p.BeginErrorReadLine()
-      $script:Wsl.proc    = $p
-      $script:Wsl.started = $true
-      $script:Wsl.ok      = $true
-      $true
-    }catch{ $script:Wsl.ok=$false; $false }
-  }
-  function Poll-Wsl {
-    if(-not $script:Wsl.started){ return }
-    if($script:Wsl.proc -and $script:Wsl.proc.HasExited){
-      if(-not $script:Wsl.exited){
-        $script:Wsl.exitCode = $script:Wsl.proc.ExitCode
-        $script:Wsl.exited   = $true
-      }
-    }
-  }
-  function Stop-Wsl {
-    try{
-      if($script:Wsl.proc){
-        if(-not $script:Wsl.proc.HasExited){ $script:Wsl.proc.Kill() | Out-Null }
-        $script:Wsl.proc.Dispose()
-      }
-    }catch{}
-  }
-  # ---------------------------------------------------------------------------
 
   # ----------------------- Observe / Score (O(1)/tick) -----------------------
   function Observe-Run([pscustomobject]$Plan,[System.IO.StreamWriter]$Report){
@@ -283,10 +202,8 @@
       if($power -gt $PowerBudgetW){ $mpcViol++; $power = Rnd ($power - 3) 1 }
       if($compRatio -gt 0.02){ $compRatio = Rnd ([math]::Max(0.02, $compRatio - 0.01)) 2 }
 
-      if($script:Wsl.enabled){ Poll-Wsl }
-
       if(($tick % $LogEveryTicks) -eq 0){
-        $kv=@{
+        Write-JsonLine $Report 'metric' @{
           runId=$Plan.planId
           latAvgMs=(Rnd ($latP95*0.8) 1)
           latP95Ms=$latP95
@@ -296,15 +213,6 @@
           tempC=$temp
           qOverQStar=$qOver
         }
-        if($script:Wsl.enabled){
-          $kv.wslLinesOut=$script:Wsl.linesOut
-          $kv.wslLinesErr=$script:Wsl.linesErr
-          $kv.wslBytesOut=[int64]$script:Wsl.bytesOut
-          $kv.wslBytesErr=[int64]$script:Wsl.bytesErr
-          $kv.wslLastBeat=$script:Wsl.lastBeat
-          $kv.wslExited=$script:Wsl.exited
-        }
-        Write-JsonLine $Report 'metric' $kv
       }
     }
     $timer.Stop()
@@ -318,12 +226,6 @@
       ioBytes=[int64]$ioBytes
       compressed=$compRatio
       deltaRagHit=(Rnd $deltaHit 2)
-      wslLinesOut=$(if($script:Wsl.enabled){$script:Wsl.linesOut}else{0})
-      wslLinesErr=$(if($script:Wsl.enabled){$script:Wsl.linesErr}else{0})
-      wslBytesOut=[int64]$(if($script:Wsl.enabled){$script:Wsl.bytesOut}else{0})
-      wslBytesErr=[int64]$(if($script:Wsl.enabled){$script:Wsl.bytesErr}else{0})
-      wslExitCode=$(if($script:Wsl.enabled){$script:Wsl.exitCode}else{$null})
-      wslExited=$(if($script:Wsl.enabled){$script:Wsl.exited}else{$false})
     }
   }
 
@@ -344,12 +246,6 @@
         qOverQStar=$C.qOverQStar
         barrierLayers=$C.barrier
         hopP95=$C.hopP95
-        wslLinesOut=$O.wslLinesOut
-        wslLinesErr=$O.wslLinesErr
-        wslBytesOut=$O.wslBytesOut
-        wslBytesErr=$O.wslBytesErr
-        wslExitCode=$O.wslExitCode
-        wslExited=$O.wslExited
       }
     }
   }
@@ -359,7 +255,6 @@
     if($Gate -eq 'memcomp'){ $ok = $ok -and $S.memOK }
     if($ok){ 0 } elseif($Gate -eq 'strict' -or $Gate -eq 'memcomp'){ 90 } else { 10 }
   }
-  # ---------------------------------------------------------------------------
 
   # ----------------------- MAIN ----------------------------------------------
   $writer=$null
@@ -371,18 +266,6 @@
 
     $sys=Get-SystemInfo
     if($Explain){ LogInfo ("System: " + (JsonStable $sys)) }
-
-    $script:Wsl.enabled = Test-WslAvailable
-    if($script:Wsl.enabled){
-      if(Start-WslJob $WslCommand){
-        LogInfo ("WSL started: " + $WslCommand)
-      } else {
-        LogWarn "WSL start failed; continuing without WSL"
-        $script:Wsl.enabled=$false
-      }
-    } else {
-      LogInfo "WSL not available or disabled"
-    }
 
     $plan=New-Plan
     $C=Test-Contract $plan
@@ -409,11 +292,6 @@
         Write-Host ("vAccel One-Shot  runId={0}" -f $plan.planId)
         Write-Host ("ExitCode={0}  Gate={1}" -f $Exit,$Gate)
         Write-Host ("latP95={0}ms  q/q*={1}  barriers={2}  hops={3}" -f $Score.measured.latencyP95Ms,$Score.measured.qOverQStar,$Score.measured.barrierLayers,$Score.measured.hopP95)
-        if($script:Wsl.enabled){
-          Write-Host ("WSL: linesOut={0}  linesErr={1}  bytesOut={2}  bytesErr={3}  exited={4}  exitCode={5}" -f $Score.measured.wslLinesOut,$Score.measured.wslLinesErr,$Score.measured.wslBytesOut,$Score.measured.wslBytesErr,$Score.measured.wslExited,$Score.measured.wslExitCode)
-        } else {
-          Write-Host "WSL: disabled or unavailable"
-        }
         Write-Host ("Report: {0}" -f $ReportPath)
       }
     }
@@ -428,8 +306,5 @@
     exit 40
   }finally{
     if($writer){ Close-Report $writer }
-    if($script:Wsl.enabled){ Stop-Wsl }
   }
 }
-
-
