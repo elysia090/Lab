@@ -1,5 +1,5 @@
-<# vAccel One-Shot — v1.3.0-r3
-Fixes: (1) must-run-as-a-file, (2) parenthesized nested calls, (3) no '??' operator.
+<# vAccel One-Shot — v1.3.0-r4
+Fixes for PS5.1: no '??', parenthesized nested calls, and zero-arg functions invoked via $(Func).
 Tested on: Windows PowerShell 5.1 / PowerShell 7.x
 #>
 
@@ -76,10 +76,10 @@ function PRand01(){
   $global:__seed = (6364136223846793005 * $global:__seed + 1442695040888963407) -band 0xFFFFFFFFFFFFFFFF
   [double]($global:__seed % 1000000) / 999999.0
 }
-function PRandRange($a,$b){ $a + (PRand01() * ($b-$a)) }
+function PRandRange($a,$b){ $a + ($(PRand01) * ($b-$a)) }
 function New-ULID(){
   $r = -join (1..16 | ForEach-Object { '{0:x2}' -f ([byte](PRandRange 0 255)) })
-  "{0}-{1}" -f (NowMs()), $r
+  "{0}-{1}" -f ($(NowMs)), $r
 }
 
 # ── Probes (PS5互換: '??'不使用) ────────────────────────────────────────
@@ -204,7 +204,7 @@ function Build-Plan([double]$PrecisionGlobalEps){
   }
   foreach($e in $edges){ $placement.hops[$e.id] = [math]::Min($FabricHopMax,1) }
   [pscustomobject]@{
-    planId=New-ULID; createdAtMs=NowMs()
+    planId=New-ULID; createdAtMs=$(NowMs)
     contract=[pscustomobject]@{
       passBudget=$PassBudget; barrierMax=$BarrierMax; commsMaxQoverQStar=$QoverQStarMax
       fabric=[pscustomobject]@{ hopMax=$FabricHopMax }
@@ -241,7 +241,7 @@ function Validate-Contract($Plan){
   }
 }
 function Validate-Safety(){
-  $sig = [math]::Round([math]::Min(1.0,[math]::Max(0.0,(0.996 + ((PRand01()*0.002) - 0.001)))),6)
+  $sig = [math]::Round([math]::Min(1.0,[math]::Max(0.0,(0.996 + (($(PRand01)*0.002) - 0.001)))),6)
   [pscustomobject]@{ signatureScore=$sig; protectedSkipped=$Denylist.Count; safetyOK=($sig -ge $SignatureMin) }
 }
 
@@ -249,7 +249,7 @@ function Validate-Safety(){
 function Observe-Run($Plan){
   $runId = New-ULID
   Append-JSONL $ReportPath ([pscustomobject]@{
-    kind='plan'; timeMs=NowMs(); runId=$runId; plan=$Plan; robin=@{ gMs=$BudgetLatencyMs }; urn=@{ tau=0.5; eta=0.1; gamma=1.0 }
+    kind='plan'; timeMs=$(NowMs); runId=$runId; plan=$Plan; robin=@{ gMs=$BudgetLatencyMs }; urn=@{ tau=0.5; eta=0.1; gamma=1.0 }
   })
 
   $latP95=0.0; $frameP95=0.0; $qOverQStar=1.0; $mpcViol=0
@@ -281,13 +281,13 @@ function Observe-Run($Plan){
     if($powerW -gt $BudgetPowerW){ $mpcViol++; $powerW = [math]::Round(($powerW - 3),1) }
 
     Append-JSONL $ReportPath ([pscustomobject]@{
-      kind='metric'; timeMs=NowMs(); runId=$runId
+      kind='metric'; timeMs=$(NowMs); runId=$runId
       latAvgMs=[math]::Round($latP95*0.8,1); latP95Ms=$latP95; ioBytes=[int64]$ioBytes
       missPages=$missPages; powerW=$powerW; tempC=$tempC; qOverQStar=$qOverQStar
     })
     if($PF.RT_BALANCED){
       Append-JSONL $ReportPath ([pscustomobject]@{
-        kind='rt_metric'; timeMs=NowMs(); runId=$runId
+        kind='rt_metric'; timeMs=$(NowMs); runId=$runId
         frameAvgMs=[math]::Round($frameP95*0.85,1); frameP95Ms=$frameP95
         asBuildMs=[math]::Round((PRandRange 0.4 2.5),2); raygenMs=[math]::Round((PRandRange 2.0 7.0),2)
         denoiseMs=[math]::Round((PRandRange 0.6 2.0),2); upscaleMs=[math]::Round((PRandRange 0.2 1.0),2)
@@ -301,7 +301,7 @@ function Observe-Run($Plan){
     $psoHit        = [math]::Min(0.9, $psoHit + 0.05)
     $reservoirHit  = [math]::Min(0.9, $reservoirHit + 0.05)
     Append-JSONL $ReportPath ([pscustomobject]@{
-      kind='reuse'; timeMs=NowMs(); runId=$runId
+      kind='reuse'; timeMs=$(NowMs); runId=$runId
       deltaRagHit=[math]::Round($deltaRagHit,2); asReuse=[math]::Round($asReuse,2)
       psoCacheHit=[math]::Round($psoHit,2); reservoirHit=[math]::Round($reservoirHit,2)
     })
@@ -359,8 +359,8 @@ try{
 
   $contract = Validate-Contract $plan
   $safety   = Validate-Safety
-  Append-JSONL $ReportPath ([pscustomobject]@{ kind='contract'; timeMs=NowMs(); runId=$plan.planId; barrierLayers=$contract.barrierLayers; passesMap=$PassBudget; fabricHopsP95=$contract.hopP95 })
-  Append-JSONL $ReportPath ([pscustomobject]@{ kind='safety';   timeMs=NowMs(); runId=$plan.planId; signatureScore=$safety.signatureScore; protectedSkipped=$safety.protectedSkipped })
+  Append-JSONL $ReportPath ([pscustomobject]@{ kind='contract'; timeMs=$(NowMs); runId=$plan.planId; barrierLayers=$contract.barrierLayers; passesMap=$PassBudget; fabricHopsP95=$contract.hopP95 })
+  Append-JSONL $ReportPath ([pscustomobject]@{ kind='safety';   timeMs=$(NowMs); runId=$plan.planId; signatureScore=$safety.signatureScore; protectedSkipped=$safety.protectedSkipped })
   if($Why){ Write-Info ("Contract[" + ($(if($contract.contractOK){'OK'}else{'FAIL'})) + "]: " + (To-JsonStable $contract)) }
 
   $obs   = Observe-Run $plan
@@ -368,7 +368,7 @@ try{
 
   $score = Build-Scorecard $contract $safety $obs
   $exit  = Decide-ExitCode $score
-  Append-JSONL $ReportPath ([pscustomobject]@{ kind='summary'; timeMs=NowMs(); runId=$plan.planId; exitCode=$exit; scorecard=$score })
+  Append-JSONL $ReportPath ([pscustomobject]@{ kind='summary'; timeMs=$(NowMs); runId=$plan.planId; exitCode=$exit; scorecard=$score })
 
   $summary = [pscustomobject]@{
     runId=$plan.planId; exitCode=$exit; scorecard=$score
@@ -381,7 +381,7 @@ try{
     'plain'  { "{0} {1}" -f $summary.runId, $summary.exitCode | Write-Output }
     'tsv'    { "runId`texitCode`tnextAction"; "{0}`t{1}`t{2}" -f $summary.runId,$summary.exitCode,$summary.nextAction | Write-Output }
     default  {
-      $okColor = $(if($exit -eq 0){'Green'} elseif($exit -eq 90){'Red'} else {'Yellow'})
+      $okColor = $(if($exit -eq 0){'Green'} elseif($exit -eq 90){ 'Red' } else { 'Yellow' })
       $pstr = Safe-Substr (($ProfilesArr -join ', '), 28)
       Write-Host ""
       Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor DarkGray
