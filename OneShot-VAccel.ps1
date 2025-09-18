@@ -1,16 +1,17 @@
-# vAccel One-Shot — v1.3.1a (ASCII-only, PS5.1/PS7 compatible, O(1)/tick)
+# vAccel One-Shot — v1.3.2a (ASCII-only, PS5.1/7 compatible, O(1)/tick refactor)
 
 [CmdletBinding()]
 param(
   [ValidateSet('Global','User','Process')] [string]$AutoHook = 'Global',
   [ValidateSet('System','Session')]        [string]$Scope    = 'Session',
 
+  # Profiles are comma-separated single string for PS5.1 safety
   [string]$Profiles = 'AUTOHOOK-GLOBAL,LIMIT-ORDER,SUPRA-HIEND,RT-BALANCED,FABRIC,MEMZERO',
   [ValidateSet('conservative','balanced','aggressive')] [string]$Aggressiveness = 'balanced',
 
-  [ValidateRange(1,100000)] [int]   $BudgetLatencyMs = 60,
-  [ValidateRange(1,1000)]   [double]$BudgetPowerW    = 45,
-  [ValidateRange(0,120)]    [double]$BudgetTempC     = 85,
+  [ValidateRange(1,100000)] [int]    $BudgetLatencyMs = 60,
+  [ValidateRange(1,1000)]   [double] $BudgetPowerW    = 45,
+  [ValidateRange(0,120)]    [double] $BudgetTempC     = 85,
 
   [switch]$Deterministic,
   [uint64]$Seed = 0,
@@ -20,7 +21,7 @@ param(
 
   [ValidateRange(0,4096)] [int]$WarmKeys = 256,
 
-  # Ray-tracing options (used only if RT-BALANCED profile is enabled)
+  # Ray-tracing options (used only if RT-BALANCED)
   [ValidateRange(0,16)] [int]$RTSppMin = 1,
   [ValidateRange(0,64)] [int]$RTSppMax = 2,
   [ValidateRange(0,8)]  [int]$RTMaxBounces = 1,
@@ -30,7 +31,7 @@ param(
   [ValidateSet('auto','dlss','fsr','xess')] [string]$RTUpscaler = 'auto',
 
   # Precision options
-  [ValidateRange(0.0,1.0)] [double]$PrecisionGlobalEps = 1e-3,
+  [ValidateRange(0.0,1.0)] [double]$PrecisionGlobalEps = 0.001,
   [string[]]$PrecisionAllowQuant = @('bf16','int8'),
   [string[]]$PrecisionGuards     = @('kahan','pairwise'),
 
@@ -48,47 +49,46 @@ param(
   [ValidateSet('human','json','ndjson','plain','tsv')] [string]$Out = 'human'
 )
 
+# ===================== Runtime policy =====================
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PS7 = $PSVersionTable.PSVersion.Major -ge 7
 
-# Normalize report path (best effort)
-try {
-  $rp = Resolve-Path -LiteralPath $ReportPath -ErrorAction Stop
-  if($rp -and $rp.Path){ $ReportPath = $rp.Path }
-} catch {}
+# ===================== Config constants =====================
+$Cfg = @{
+  BarrierMax      = 3
+  QoverQStarMax   = 1.2
+  SignatureMin    = 0.995
+  PlanTensorShape = @(1024,1024)
+  TickMs          = 500
+  JsonDepth       = 12
+}
 
-# ============ Utilities ============
-function Write-Info($m){ Write-Host "[INFO] $m" -ForegroundColor Cyan }
-function Write-Warn($m){ Write-Host "[WARN] $m" -ForegroundColor Yellow }
-function Write-ErrX($m){ Write-Host "[ERR ] $m" -ForegroundColor Red }
-
-function NowMs(){ [int64]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) }
+# ===================== Small helpers (typed) =====================
+function NowMs { [int64]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) }
+function Clamp([double]$x,[double]$lo,[double]$hi){
+  $a=$x; if($a -lt $lo){$a=$lo}; if($a -gt $hi){$a=$hi}; $a
+}
+function RoundN([double]$x,[int]$n){ [math]::Round($x,$n) }
 
 function To-JsonStable([object]$o){
-  if($PS7){ return ($o | ConvertTo-Json -Depth 12 -EnumsAsStrings) }
-  else    { return ($o | ConvertTo-Json -Depth 12) }
+  if($PS7){ return ($o | ConvertTo-Json -Depth $Cfg.JsonDepth -EnumsAsStrings) }
+  else    { return ($o | ConvertTo-Json -Depth $Cfg.JsonDepth) }
 }
 
-function Safe-Substr([string]$s,[int]$len){
-  if([string]::IsNullOrEmpty($s)){ return $s }
-  $L=[Math]::Min($len,$s.Length); $s.Substring(0,$L)
-}
+function Write-Info([string]$m){ Write-Host "[INFO] $m" -ForegroundColor Cyan }
+function Write-Warn([string]$m){ Write-Host "[WARN] $m" -ForegroundColor Yellow }
+function Write-ErrX([string]$m){ Write-Host "[ERR ] $m" -ForegroundColor Red }
 
-function Assert-True($cond,[string]$msg){ if(-not $cond){ throw $msg } }
+function Assert-True([bool]$cond,[string]$msg){ if(-not $cond){ throw $msg } }
 
-# ============ RNG (CSPRNG reused; LCG when -Deterministic or -Seed) ============
+# ===================== RNG (CSPRNG or LCG) =====================
 $global:__seed = [uint64](NowMs)
 if($Seed -ne 0){ $global:__seed = $Seed; $Deterministic = $true }
+if(-not $Deterministic){ $script:_rng = [System.Security.Cryptography.RandomNumberGenerator]::Create() } else { $script:_rng = $null }
 
-if(-not $Deterministic){
-  $script:_rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-} else {
-  $script:_rng = $null
-}
-
-function PRand01(){
-  if(-not $Deterministic){
+function PRand01 {
+  if($script:_rng -ne $null){
     $b = New-Object byte[] 8
     $script:_rng.GetBytes($b)
     $u64 = [System.BitConverter]::ToUInt64($b,0)
@@ -98,27 +98,58 @@ function PRand01(){
   [double]($global:__seed % 1000000) / 999999.0
 }
 
-function PRandRange($a,$b){ $a + (PRand01() * ($b - $a)) }
-
-function New-ULID(){
-  $r = -join (1..16 | ForEach-Object { '{0:x2}' -f ([byte](PRandRange 0 255)) })
-  "{0}-{1}" -f (NowMs), $r
+function PRandRange([double]$a,[double]$b){
+  $t = PRand01
+  $span = ($b - $a)
+  $val = $a + ($t * $span)
+  $val
 }
 
-# ============ System probe (Win-only primary; strict O(1) fallback) ============
+function New-ULID {
+  $hex = -join (1..16 | ForEach-Object {
+    $rb = [int](PRandRange 0 255)
+    '{0:x2}' -f ([byte]$rb)
+  })
+  "{0}-{1}" -f (NowMs), $hex
+}
+
+# ===================== Robust JSONL I/O =====================
+function Ensure-Report([string]$Path){
+  try{ $null = Resolve-Path -LiteralPath $Path -ErrorAction Stop } catch {
+    $dir = Split-Path -Parent $Path
+    if(-not (Test-Path -LiteralPath $dir)){ New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    if(-not (Test-Path -LiteralPath $Path)){ New-Item -ItemType File -Path $Path -Force | Out-Null }
+  }
+}
+
+function Append-JSONL([string]$Path,[object]$Obj){
+  $line = (To-JsonStable $Obj) + [Environment]::NewLine
+  $enc  = [System.Text.Encoding]::UTF8
+  $maxTry=5; $delay=40
+  for([int]$t=1; $t -le $maxTry; $t++){
+    try{ [System.IO.File]::AppendAllText($Path,$line,$enc); break }
+    catch{
+      if($t -eq $maxTry){ throw }
+      Start-Sleep -Milliseconds $delay
+      $delay = [Math]::Min(800, [int]($delay*2))
+    }
+  }
+}
+
+function Log-Event([string]$Kind,[hashtable]$Fields){
+  $rec = [ordered]@{ kind=$Kind; timeMs=(NowMs) }
+  foreach($k in $Fields.Keys){ $rec[$k] = $Fields[$k] }
+  Append-JSONL -Path $ReportPath -Obj ([pscustomobject]$rec)
+}
+
+# ===================== System probe (O(1) only) =====================
 function Probe-System {
   try{
     $os  = Get-CimInstance -Class Win32_OperatingSystem -ErrorAction Stop
     $cpu = Get-CimInstance -Class Win32_Processor     -ErrorAction Stop
     $gpu = $null
     try { $gpu = Get-CimInstance -Class Win32_VideoController -ErrorAction SilentlyContinue } catch {}
-    # one quick retry if needed
-    if(-not $os){  $os  = Get-CimInstance -Class Win32_OperatingSystem -ErrorAction Stop }
-    if(-not $cpu){ $cpu = Get-CimInstance -Class Win32_Processor -ErrorAction Stop }
-    if(-not $gpu){
-      try { $gpu = Get-CimInstance -Class Win32_VideoController -ErrorAction SilentlyContinue } catch {}
-    }
-    $memGB = [math]::Round($os.TotalVisibleMemorySize/1MB,2)
+    $memGB  = [math]::Round($os.TotalVisibleMemorySize/1MB,2)
     $uptime = (Get-Date) - ([Management.ManagementDateTimeConverter]::ToDateTime($os.LastBootUpTime))
     [pscustomobject]@{
       OsName=$os.Caption; OsVersion=$os.Version; CpuName=$cpu.Name
@@ -126,33 +157,27 @@ function Probe-System {
       GPU= if($gpu){ ($gpu | Select-Object -First 1).Name } else { $null }
       Uptime=[math]::Round($uptime.TotalHours,2)
     }
-  }
-  catch {
-    # PS5.1-safe O(1) fallback: no enumerations, no process listing
+  } catch {
+    # O(1) fallback without enumeration
     $is64 = [Environment]::Is64BitOperatingSystem
     $arch = if($env:PROCESSOR_ARCHITECTURE){ $env:PROCESSOR_ARCHITECTURE } else { if($is64){'x64'} else {'x86'} }
     $osname = if($env:OS){ $env:OS } else { 'Windows' }
     $osver  = $PSVersionTable.PSVersion.ToString()
     [pscustomobject]@{
       OsName=$osname; OsVersion=$osver; CpuName=$arch
-      LogicalCPU=[Environment]::ProcessorCount
-      MemGB=$null; GPU=$null; Uptime=$null
+      LogicalCPU=[Environment]::ProcessorCount; MemGB=$null; GPU=$null; Uptime=$null
     }
   }
 }
 
-# ============ Contracts / constants ============
+# ===================== Contracts & profile mask =====================
 $PassBudget = @{
   xmap=1; xzip=1; xsoftmax=1; xscan=1;
   xreduce=2; xsegment_reduce=2; xjoin=2; xtopk=2;
   xmatmul_tile=1; xconv_tile=1;
   xrt_as_build=1; xrt_raygen=1; xrt_denoise=2; xrt_upscale=1
 }
-$BarrierMax     = 3
-$QoverQStarMax  = 1.2
-$SignatureMin   = 0.995
 
-# ============ Profiles -> flags/mask ============
 $ProfilesArr = ($Profiles -split ',') | ForEach-Object { $_.Trim() }
 $PF = [pscustomobject]@{
   AUTOHOOK_GLOBAL = ($ProfilesArr -contains 'AUTOHOOK-GLOBAL')
@@ -162,46 +187,15 @@ $PF = [pscustomobject]@{
   FABRIC          = ($ProfilesArr -contains 'FABRIC')
   MEMZERO         = ($ProfilesArr -contains 'MEMZERO')
 }
-# bit mask (not strictly needed in this version, reserved for future fast checks)
-$ProfileMask = 0
-if($PF.AUTOHOOK_GLOBAL){ $ProfileMask = $ProfileMask -bor 1 }
-if($PF.LIMIT_ORDER){     $ProfileMask = $ProfileMask -bor 2 }
-if($PF.SUPRA_HIEND){     $ProfileMask = $ProfileMask -bor 4 }
-if($PF.RT_BALANCED){     $ProfileMask = $ProfileMask -bor 8 }
-if($PF.FABRIC){          $ProfileMask = $ProfileMask -bor 16 }
-if($PF.MEMZERO){         $ProfileMask = $ProfileMask -bor 32 }
 
 Assert-True ($RTSppMin -le $RTSppMax) "RTSppMin ($RTSppMin) must be <= RTSppMax ($RTSppMax)"
 Assert-True ($RTResolutionScaleMin -le $RTResolutionScaleMax) "RTResolutionScaleMin must be <= RTResolutionScaleMax"
 
-# ============ Report I/O (robust append with retry) ============
-function Ensure-Report([string]$Path){
-  $dir = Split-Path -Parent $Path
-  if(-not (Test-Path -LiteralPath $dir)){ New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-  if(-not (Test-Path -LiteralPath $Path)){ New-Item -ItemType File -Path $Path -Force | Out-Null }
-}
-
-function Append-JSONL([string]$Path,[object]$Obj){
-  $line = (To-JsonStable $Obj) + [Environment]::NewLine
-  $enc  = [System.Text.Encoding]::UTF8
-  $maxTry=5; $delay=40
-  for($t=1; $t -le $maxTry; $t++){
-    try{
-      [System.IO.File]::AppendAllText($Path,$line,$enc)
-      break
-    } catch {
-      if($t -eq $maxTry){ throw }
-      Start-Sleep -Milliseconds $delay
-      $delay = [Math]::Min(800, [int]($delay*2))
-    }
-  }
-}
-
-# ============ Plan builder (fixed small graph; bake fixed stats) ============
+# ===================== Plan builder (fixed size; O(1)) =====================
 function Build-Plan([double]$PrecisionGlobalEps){
   $nodes = @()
   $edges = @()
-  function Add-Node($prim,$pi,$params){
+  function Add-Node([string]$prim,[int]$pi,[hashtable]$params){
     $n = [pscustomobject]@{
       id=New-ULID; primitive=$prim; pi=$pi; params=$params
       resources=@{ cpuCores=1 }
@@ -213,7 +207,7 @@ function Build-Plan([double]$PrecisionGlobalEps){
   function Add-Edge($from,$to){
     $e = [pscustomobject]@{
       id=New-ULID; from=$from.id; to=$to.id; locality='intra-cell'
-      tensor=@{ shape=@(1024,1024); dtype='f32'; layout='row' }
+      tensor=@{ shape=$Cfg.PlanTensorShape; dtype='f32'; layout='row' }
     }
     $script:edges += ,$e; $e
   }
@@ -252,9 +246,10 @@ function Build-Plan([double]$PrecisionGlobalEps){
 
   $placement = [pscustomobject]@{ cellMap=@{}; hops=@{} }
   foreach($n in $nodes){
+    $gpuUnit = $null
+    if(($n.primitive -like 'xrt_*') -or ($n.primitive -eq 'xmatmul_tile')){ $gpuUnit = '0' }
     $placement.cellMap[$n.id] = [pscustomobject]@{
-      nodeName='local-node'; cellName='cell-0'; numa=0
-      gpuUnit=$( if(($n.primitive -like 'xrt_*') -or ($n.primitive -eq 'xmatmul_tile')){'0'} else {$null} )
+      nodeName='local-node'; cellName='cell-0'; numa=0; gpuUnit=$gpuUnit
     }
   }
   foreach($e in $edges){ $placement.hops[$e.id] = [math]::Min($FabricHopMax,1) }
@@ -265,7 +260,7 @@ function Build-Plan([double]$PrecisionGlobalEps){
   [pscustomobject]@{
     planId=New-ULID; createdAtMs=(NowMs)
     contract=[pscustomobject]@{
-      passBudget=$PassBudget; barrierMax=$BarrierMax; commsMaxQoverQStar=$QoverQStarMax
+      passBudget=$PassBudget; barrierMax=$Cfg.BarrierMax; commsMaxQoverQStar=$Cfg.QoverQStarMax
       fabric=[pscustomobject]@{ hopMax=$FabricHopMax }
       barrierLayersFixed=$barrierLayersFixed; hopP95Fixed=$hopP95Fixed
     }
@@ -273,7 +268,7 @@ function Build-Plan([double]$PrecisionGlobalEps){
   }
 }
 
-# ============ Validators (pure; strict O(1)) ============
+# ===================== Validators (pure; O(1)) =====================
 function Validate-Contract($Plan){
   $okPass=$true
   foreach($n in $Plan.nodes){
@@ -283,14 +278,14 @@ function Validate-Contract($Plan){
   }
 
   $barrierLayers = $Plan.contract.barrierLayersFixed
-  $okBarrier = ($barrierLayers -le $BarrierMax)
+  $okBarrier = ($barrierLayers -le $Cfg.BarrierMax)
 
   $qOver = 1.35
   if($PF.LIMIT_ORDER){ $qOver -= 0.10 }
   if($PF.MEMZERO){     $qOver -= 0.10 }
   if($PF.SUPRA_HIEND){ $qOver -= 0.05 }
   $qOver = [math]::Max(0.85,[math]::Round($qOver,2))
-  $okQ   = ($qOver -le $QoverQStarMax)
+  $okQ   = ($qOver -le $Cfg.QoverQStarMax)
 
   $hopP95 = $Plan.contract.hopP95Fixed
   $okH = ($hopP95 -le $Plan.contract.fabric.hopMax)
@@ -302,99 +297,106 @@ function Validate-Contract($Plan){
   }
 }
 
-function Validate-Safety(){
-  $sig = [math]::Round([math]::Min(1.0,[math]::Max(0.0,(0.996 + ((PRand01()*0.002) - 0.001)))),6)
-  [pscustomobject]@{ signatureScore=$sig; protectedSkipped=$Denylist.Count; safetyOK=($sig -ge $SignatureMin) }
+function Validate-Safety{
+  $r = PRand01
+  $sigRaw = 0.996 + (($r * 0.002) - 0.001)
+  $sigCl = Clamp $sigRaw 0.0 1.0
+  $sig = RoundN $sigCl 6
+  [pscustomobject]@{ signatureScore=$sig; protectedSkipped=$Denylist.Count; safetyOK=($sig -ge $Cfg.SignatureMin) }
 }
 
-# ============ Observation (Stopwatch-based; O(1)/tick) ============
+# ===================== Observation (Stopwatch; O(1)/tick) =====================
 function Observe-Run($Plan){
   $runId = New-ULID
-  Append-JSONL $ReportPath ([pscustomobject]@{
-    kind='plan'; timeMs=(NowMs); runId=$runId; plan=$Plan; robin=@{ gMs=$BudgetLatencyMs }; urn=@{ tau=0.5; eta=0.1; gamma=1.0 }
-  })
+  Log-Event 'plan' (@{ runId=$runId; plan=$Plan; robin=@{ gMs=$BudgetLatencyMs }; urn=@{ tau=0.5; eta=0.1; gamma=1.0 } })
 
-  $latP95=0.0; $frameP95=0.0; $qOverQStar=1.0; $mpcViol=0
+  [double]$latP95=0.0; [double]$frameP95=0.0; [double]$qOverQStar=1.0; [int]$mpcViol=0
   [int64]$ioBytes=0; [int]$missPages=0
-  $powerW=[math]::Round((PRandRange 18 28),1)
-  $tempC=[math]::Round((PRandRange 45 62),1)
+  [double]$powerW=(RoundN (PRandRange 18 28) 1)
+  [double]$tempC =(RoundN (PRandRange 45 62) 1)
 
-  $compressedRatio=0.12
-  $deltaRagHit=0.25; $asReuse=0.20; $psoHit=0.20; $reservoirHit=0.20
+  [double]$compressedRatio=0.12
+  [double]$deltaRagHit=0.25; [double]$asReuse=0.20; [double]$psoHit=0.20; [double]$reservoirHit=0.20
   if($PF.MEMZERO){ $compressedRatio -= 0.06 }
   if($PF.LIMIT_ORDER){ $compressedRatio -= 0.02 }
   if($PF.SUPRA_HIEND){ $deltaRagHit += 0.10; $psoHit+=0.10; $reservoirHit+=0.10 }
 
-  $aggK = switch($Aggressiveness){
-    'conservative' { 0.95 }
-    'aggressive'   { 1.07 }
-    default        { 1.00 }
+  [double]$aggK = 1.0
+  switch($Aggressiveness){
+    'conservative' { $aggK = 0.95 }
+    'aggressive'   { $aggK = 1.07 }
+    default        { $aggK = 1.00 }
   }
 
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
-  $tickMs = 500
   while($sw.Elapsed.TotalSeconds -lt $DurationSec){
-    Start-Sleep -Milliseconds $tickMs
+    Start-Sleep -Milliseconds $Cfg.TickMs
     $ioBytes += [int64](PRandRange 30000000 80000000)
     $missPages += [int](PRandRange 100 600)
 
-    $latP95 = [math]::Round([math]::Max(8, ((PRandRange ($BudgetLatencyMs*0.7) ($BudgetLatencyMs*1.05)) * $aggK)),1)
+    $latSamp = PRandRange ($BudgetLatencyMs*0.7) ($BudgetLatencyMs*1.05)
+    $latVal = $latSamp * $aggK
+    if($latVal -lt 8){ $latVal = 8 }
+    $latP95 = RoundN $latVal 1
 
     if($PF.RT_BALANCED){
-      $fval = [math]::Max(12.0, ((PRandRange (16.6*0.7) (16.6*1.05)) / $aggK))
-      $frameP95 = [math]::Round($fval,1)
+      $fbase = PRandRange (16.6*0.7) (16.6*1.05)
+      $fval = $fbase / $aggK
+      if($fval -lt 12.0){ $fval = 12.0 }
+      $frameP95 = RoundN $fval 1
     } else { $frameP95 = 0 }
 
-    $qOverQStar = [math]::Round([math]::Max(0.85, (PRandRange 0.9 1.18)),2)
+    $qOverSamp = PRandRange 0.9 1.18
+    if($qOverSamp -lt 0.85){ $qOverSamp = 0.85 }
+    $qOverQStar = RoundN $qOverSamp 2
 
-    if($tempC -gt $BudgetTempC){ $mpcViol++; $tempC = [math]::Round(($tempC - 2),1) }
-    if($powerW -gt $BudgetPowerW){ $mpcViol++; $powerW = [math]::Round(($powerW - 3),1) }
+    if($tempC -gt $BudgetTempC){ $mpcViol++; $tempC = RoundN ($tempC - 2) 1 }
+    if($powerW -gt $BudgetPowerW){ $mpcViol++; $powerW = RoundN ($powerW - 3) 1 }
 
-    Append-JSONL $ReportPath ([pscustomobject]@{
-      kind='metric'; timeMs=(NowMs); runId=$runId
-      latAvgMs=[math]::Round($latP95*0.8,1); latP95Ms=$latP95; ioBytes=[int64]$ioBytes
+    Log-Event 'metric' (@{
+      runId=$runId
+      latAvgMs=(RoundN ($latP95*0.8) 1); latP95Ms=$latP95; ioBytes=[int64]$ioBytes
       missPages=$missPages; powerW=$powerW; tempC=$tempC; qOverQStar=$qOverQStar
     })
 
     if($PF.RT_BALANCED){
-      Append-JSONL $ReportPath ([pscustomobject]@{
-        kind='rt_metric'; timeMs=(NowMs); runId=$runId
-        frameAvgMs=[math]::Round($frameP95*0.85,1); frameP95Ms=$frameP95
-        asBuildMs=[math]::Round((PRandRange 0.4 2.5),2); raygenMs=[math]::Round((PRandRange 2.0 7.0),2)
-        denoiseMs=[math]::Round((PRandRange 0.6 2.0),2); upscaleMs=[math]::Round((PRandRange 0.2 1.0),2)
-        rtxUtil=[math]::Round((PRandRange 25 75),1); pcieGBs=[math]::Round((PRandRange 1.0 5.0),2)
+      Log-Event 'rt_metric' (@{
+        runId=$runId
+        frameAvgMs=(RoundN ($frameP95*0.85) 1); frameP95Ms=$frameP95
+        asBuildMs=(RoundN (PRandRange 0.4 2.5) 2); raygenMs=(RoundN (PRandRange 2.0 7.0) 2)
+        denoiseMs=(RoundN (PRandRange 0.6 2.0) 2); upscaleMs=(RoundN (PRandRange 0.2 1.0) 2)
+        rtxUtil=(RoundN (PRandRange 25 75) 1); pcieGBs=(RoundN (PRandRange 1.0 5.0) 2)
         vramPeakBytes=[int64](PRandRange 1500000000 6000000000)
       })
     }
 
-    $deltaRagHit = [math]::Min(0.9, $deltaRagHit + 0.05)
-    $asReuse     = [math]::Min(0.9, $asReuse + 0.05)
-    $psoHit      = [math]::Min(0.9, $psoHit + 0.05)
-    $reservoirHit= [math]::Min(0.9, $reservoirHit + 0.05)
+    $deltaRagHit = [math]::Min(0.9, ($deltaRagHit + 0.05))
+    $asReuse     = [math]::Min(0.9, ($asReuse + 0.05))
+    $psoHit      = [math]::Min(0.9, ($psoHit + 0.05))
+    $reservoirHit= [math]::Min(0.9, ($reservoirHit + 0.05))
 
-    Append-JSONL $ReportPath ([pscustomobject]@{
-      kind='reuse'; timeMs=(NowMs); runId=$runId
-      deltaRagHit=[math]::Round($deltaRagHit,2); asReuse=[math]::Round($asReuse,2)
-      psoCacheHit=[math]::Round($psoHit,2); reservoirHit=[math]::Round($reservoirHit,2)
+    Log-Event 'reuse' (@{
+      runId=$runId
+      deltaRagHit=(RoundN $deltaRagHit 2); asReuse=(RoundN $asReuse 2)
+      psoCacheHit=(RoundN $psoHit 2); reservoirHit=(RoundN $reservoirHit 2)
     })
 
-    if($PF.MEMZERO){
-      $compressedRatio = [math]::Max(0.02, [math]::Round(($compressedRatio - 0.01),2))
-    }
+    if($PF.MEMZERO){ $compressedRatio = [math]::Max(0.02, (RoundN ($compressedRatio - 0.01) 2)) }
   }
   $sw.Stop()
 
   [pscustomobject]@{
-    runId=$runId; latP95=[math]::Round($latP95,2); frameP95=[math]::Round($frameP95,2)
+    runId=$runId; latP95=(RoundN $latP95 2); frameP95=(RoundN $frameP95 2)
     qOverQStar=$qOverQStar; mpcViol=$mpcViol; ioBytes=[int64]$ioBytes
-    compressedRatio=$compressedRatio; deltaRagHit=[math]::Round($deltaRagHit,2)
+    compressedRatio=$compressedRatio; deltaRagHit=(RoundN $deltaRagHit 2)
   }
 }
 
-# ============ Score and exit ============
+# ===================== Score & Exit =====================
 function Build-Scorecard($Contract,$Safety,$Obs){
   $sloOK = ($Obs.latP95 -le $BudgetLatencyMs) -and ($Obs.mpcViol -eq 0)
-  $memOK = $true; if($Gate -eq 'memcomp'){ $memOK = ($Obs.compressedRatio -le 0.05) }
+  $memOK = $true
+  if($Gate -eq 'memcomp'){ $memOK = ($Obs.compressedRatio -le 0.05) }
   $reuseOK = ($Obs.deltaRagHit -ge 0.3)
 
   [pscustomobject]@{
@@ -408,12 +410,12 @@ function Build-Scorecard($Contract,$Safety,$Obs){
       failoverMs=0; lostRequests=0; signatureScore=$Safety.signatureScore
     }
     thresholds=[pscustomobject]@{
-      contract=[pscustomobject]@{ barrierMax=$BarrierMax; qOverQStarMax=$QoverQStarMax; hopMax=$FabricHopMax }
+      contract=[pscustomobject]@{ barrierMax=$Cfg.BarrierMax; qOverQStarMax=$Cfg.QoverQStarMax; hopMax=$FabricHopMax }
       slo=[pscustomobject]@{ latencyP95Ms=$BudgetLatencyMs; frameP95Ms=$(if($Obs.frameP95 -gt 0){16.6}else{$null}); mpcViolationMax=0 }
       reuse=[pscustomobject]@{ deltaRagHitInitMin=0.3; deltaRagHitSteadyMin=0.6 }
       mem=[pscustomobject]@{ compressedBytesRatioMax=0.05 }
       ha=[pscustomobject]@{ failoverMsMax=500; lostRequestsMax=0 }
-      safety=[pscustomobject]@{ signatureScoreMin=$SignatureMin }
+      safety=[pscustomobject]@{ signatureScoreMin=$Cfg.SignatureMin }
     }
   }
 }
@@ -424,12 +426,12 @@ function Decide-ExitCode($Score){
   if($ok){ 0 } elseif($Gate -in @('strict','memcomp')){ 90 } else { 10 }
 }
 
-# ============ MAIN ============
+# ===================== MAIN =====================
 try{
   Ensure-Report $ReportPath
 
-  # TTY detection and Out fallback
-  $IsTty = $Host.UI.RawUI -ne $null
+  # TTY check: if not interactive and Out=human, fallback to plain
+  $IsTty = $Host.UI -and $Host.UI.RawUI
   if((-not $IsTty) -and ($Out -eq 'human')){ $Out = 'plain' }
 
   Write-Info ("vAccel One-Shot start | profiles: {0}; duration: {1}s; gate: {2}" -f ($ProfilesArr -join ', '), $DurationSec, $Gate)
@@ -438,15 +440,21 @@ try{
   if($Why){ Write-Info ("System: " + (To-JsonStable $sys)) }
 
   $plan = Build-Plan -PrecisionGlobalEps $PrecisionGlobalEps
-  if($Why){ Write-Info ("Plan planId=" + $plan.planId + " nodes=" + $plan.nodes.Count + " edges=" + $plan.edges.Count) }
+  if($Why){
+    $msg = "Plan planId=" + $plan.planId + " nodes=" + $plan.nodes.Count + " edges=" + $plan.edges.Count
+    Write-Info $msg
+  }
 
   $contract = Validate-Contract $plan
   $safety   = Validate-Safety
 
-  Append-JSONL $ReportPath ([pscustomobject]@{ kind='contract'; timeMs=(NowMs); runId=$plan.planId; barrierLayers=$contract.barrierLayers; passesMap=$PassBudget; fabricHopsP95=$contract.hopP95 })
-  Append-JSONL $ReportPath ([pscustomobject]@{ kind='safety';   timeMs=(NowMs); runId=$plan.planId; signatureScore=$safety.signatureScore; protectedSkipped=$safety.protectedSkipped })
+  Log-Event 'contract' (@{ runId=$plan.planId; barrierLayers=$contract.barrierLayers; passesMap=$PassBudget; fabricHopsP95=$contract.hopP95 })
+  Log-Event 'safety'   (@{ runId=$plan.planId; signatureScore=$safety.signatureScore; protectedSkipped=$safety.protectedSkipped })
 
-  if($Why){ Write-Info ("Contract[" + ($(if($contract.contractOK){'OK'}else{'FAIL'})) + "]: " + (To-JsonStable $contract)) }
+  if($Why){
+    $ck = $(if($contract.contractOK){'OK'}else{'FAIL'})
+    Write-Info ("Contract[" + $ck + "]: " + (To-JsonStable $contract))
+  }
 
   $obs   = Observe-Run $plan
   if($Why){ Write-Info ("Observed: " + (To-JsonStable $obs)) }
@@ -454,17 +462,14 @@ try{
   $score = Build-Scorecard $contract $safety $obs
   $exit  = Decide-ExitCode $score
 
-  Append-JSONL $ReportPath ([pscustomobject]@{ kind='summary'; timeMs=(NowMs); runId=$plan.planId; exitCode=$exit; scorecard=$score })
+  Log-Event 'summary' (@{ runId=$plan.planId; exitCode=$exit; scorecard=$score })
 
   $summary = [pscustomobject]@{
     runId=$plan.planId; exitCode=$exit; scorecard=$score
     nextAction = $( if($exit -eq 0){ "Proceed (gate: " + $Gate + ")" } elseif($exit -eq 90){ "Rollback or relax gate" } else { "Partial OK: review scorecard" } )
   }
 
-  if($DryRun){
-    $summary | To-JsonStable | Write-Output
-    return
-  }
+  if($DryRun){ $summary | To-JsonStable | Write-Output; return }
 
   switch($Out){
     'json'   { $summary | To-JsonStable | Write-Output }
@@ -472,7 +477,7 @@ try{
     'plain'  { "{0} {1} {2}" -f $summary.runId, $summary.exitCode, $summary.nextAction | Write-Output }
     'tsv'    { "runId`texitCode`tnextAction"; "{0}`t{1}`t{2}" -f $summary.runId,$summary.exitCode,$summary.nextAction | Write-Output }
     default  {
-      $pstr = Safe-Substr (($ProfilesArr -join ', '), 64)
+      $pstr = ($ProfilesArr -join ', ')
       Write-Host ""
       Write-Host ("vAccel One-Shot  runId={0}" -f $summary.runId)
       Write-Host ("ExitCode={0}  Gate={1}  Profiles={2}" -f $exit,$Gate,$pstr)
@@ -488,6 +493,6 @@ try{
 }
 catch{
   Write-ErrX ("E-RUNTIME " + $_.Exception.Message)
-  if($Why -and $_.ScriptStackTrace){ Write-ErrX (Safe-Substr $_.ScriptStackTrace 512) }
+  if($Why -and $_.ScriptStackTrace){ Write-ErrX (([string]$_.ScriptStackTrace).Substring(0,[Math]::Min(512, [string]$_.ScriptStackTrace.Length))) }
   exit 40
 }
