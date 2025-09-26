@@ -1,155 +1,285 @@
-import numpy as np
-import matplotlib.pyplot as plt
+from dataclasses import dataclass, field
+from typing import Iterable, List, Optional, Sequence, Tuple
+
+import importlib
+import importlib.util
+import math
+import random
+from types import ModuleType
+
+
+@dataclass(frozen=True)
+class MarketModelConfig:
+    initial_price: float
+    volatility_range: Tuple[float, float] = (0.2, 0.8)
+    drift_range: Tuple[float, float] = (0.03, 0.08)
+
 
 class MarketModel:
-    def __init__(self, initial_price, volatility_range=(0.2, 0.8), drift_range=(0.03, 0.08)):
-        self.price = initial_price
-        self.volatility_range = volatility_range
-        self.drift_range = drift_range
+    """Generate synthetic price paths using a simple random walk."""
 
-    def simulate_price(self, num_steps, time_interval):
-        volatility = np.random.uniform(*self.volatility_range)
-        drift = np.random.uniform(*self.drift_range)
-        
-        prices = [self.price]
+    def __init__(self, config: MarketModelConfig, seed: Optional[int] = None) -> None:
+        self.config = config
+        self.rng = random.Random(seed)
+
+    def generate_path(self, num_steps: int, time_interval: float) -> List[float]:
+        """Simulate a single price path."""
+
+        volatility = self.rng.uniform(*self.config.volatility_range)
+        drift = self.rng.uniform(*self.config.drift_range)
+
+        prices = [self.config.initial_price]
         for _ in range(num_steps):
-            shock = np.random.normal(loc=drift * time_interval, scale=volatility * np.sqrt(time_interval))
-            self.price += shock
-            prices.append(self.price)
+            shock = self.rng.gauss(
+                mu=drift * time_interval,
+                sigma=volatility * math.sqrt(time_interval),
+            )
+            prices.append(prices[-1] + shock)
         return prices
 
+
+def compute_rsi(prices: Iterable[float], period: int = 14) -> Optional[float]:
+    """Return the Relative Strength Index for the provided price history."""
+
+    price_list = list(float(price) for price in prices)
+    if len(price_list) <= period:
+        return None
+
+    recent_prices = price_list[-(period + 1) :]
+    deltas = [recent_prices[i + 1] - recent_prices[i] for i in range(period)]
+    gains = [max(delta, 0.0) for delta in deltas]
+    losses = [max(-delta, 0.0) for delta in deltas]
+
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+
+    if math.isclose(avg_gain + avg_loss, 0.0, abs_tol=1e-12):
+        return 50.0
+    if math.isclose(avg_loss, 0.0, abs_tol=1e-12):
+        return 100.0
+
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def compute_ema(prices: Iterable[float], period: int) -> Optional[float]:
+    """Return the most recent exponential moving average."""
+
+    price_list = list(float(price) for price in prices)
+    if len(price_list) < period:
+        return None
+
+    ema_value = price_list[0]
+    alpha = 2.0 / (period + 1.0)
+    for price in price_list[1:]:
+        ema_value = (price - ema_value) * alpha + ema_value
+    return float(ema_value)
+
+
+@dataclass(frozen=True)
+class StrategyConfig:
+    rsi_oversold: float = 30
+    rsi_overbought: float = 70
+    moving_average_period: int = 50
+    rsi_period: int = 14
+    ema_short_period: int = 12
+    ema_long_period: int = 26
+
+
 class TradeStrategy:
-    def __init__(self, rsi_oversold=30, rsi_overbought=70, moving_average_period=50):
-        self.rsi_oversold = rsi_oversold
-        self.rsi_overbought = rsi_overbought
-        self.moving_average_period = moving_average_period
+    """Simple technical indicator based entry strategy."""
 
-    def evaluate_entry_signal(self, prices):
-        if len(prices) < self.moving_average_period:
-            return True, False  # データが不足している場合はエントリーシグナルなし
+    def __init__(self, config: Optional[StrategyConfig] = None) -> None:
+        self.config = config or StrategyConfig()
 
-        # Calculate RSI
-        changes = np.diff(prices)
-        gains = changes[changes >= 0]
-        losses = -changes[changes < 0]
-        avg_gain = np.mean(gains)
-        avg_loss = np.mean(losses)
-        rs = avg_gain / avg_loss if avg_loss != 0 else np.inf
-        rsi = 100 - (100 / (1 + rs))
+    def evaluate_entry_signal(self, prices: Iterable[float]) -> Tuple[bool, bool]:
+        prices = [float(price) for price in prices]
+        required_history = max(
+            self.config.moving_average_period,
+            self.config.rsi_period + 1,
+            self.config.ema_long_period,
+        )
+        if len(prices) < required_history:
+            return False, False
 
-        # Calculate moving average
-        ma = np.mean(prices[-self.moving_average_period:])
+        rsi = compute_rsi(prices, self.config.rsi_period)
+        ema_short = compute_ema(prices, self.config.ema_short_period)
+        ema_long = compute_ema(prices, self.config.ema_long_period)
 
-        # Calculate MACD
-        ema_short = self.calculate_ema(prices, 12)
-        ema_long = self.calculate_ema(prices, 26)
-        macd_line = ema_short - ema_long
+        if rsi is None or ema_short is None or ema_long is None:
+            return False, False
 
-        # Evaluate entry signals
-        entry_long_momentum = rsi < self.rsi_oversold and prices[-1] < ma and macd_line[-1] > 0
-        entry_short_momentum = rsi > self.rsi_overbought and prices[-1] > ma and macd_line[-1] < 0
-        entry_long_mean_reversion = rsi > self.rsi_overbought and prices[-1] < ma and macd_line[-1] > 0
-        entry_short_mean_reversion = rsi < self.rsi_oversold and prices[-1] > ma and macd_line[-1] < 0
+        recent_prices = prices[-self.config.moving_average_period :]
+        moving_average = sum(recent_prices) / len(recent_prices)
+        macd = ema_short - ema_long
+        latest_price = prices[-1]
 
-        return entry_long_momentum, entry_short_momentum, entry_long_mean_reversion, entry_short_mean_reversion
+        enter_long = (
+            rsi <= self.config.rsi_oversold
+            and latest_price < moving_average
+            and macd > 0
+        )
+        enter_short = (
+            rsi >= self.config.rsi_overbought
+            and latest_price > moving_average
+            and macd < 0
+        )
+        return enter_long, enter_short
 
-    def calculate_ema(self, prices, period):
-        ema = np.zeros_like(prices)
-        ema[0] = prices[0]
-        alpha = 2 / (period + 1)
-        for i in range(1, len(prices)):
-            ema[i] = (prices[i] - ema[i - 1]) * alpha + ema[i - 1]
-        return ema
+
+@dataclass
+class Position:
+    size: float
+    entry_price: float
+
+
+@dataclass(frozen=True)
+class PortfolioConfig:
+    initial_balance: float
+    risk_percentage: float = 0.01
+
 
 class Portfolio:
-    def __init__(self, initial_balance, risk_percentage=0.01, stop_loss_multiplier=2.0, volatility_window=14, compound_interest_rate=0.0):
-        self.balance = initial_balance
-        self.equity_curve = [initial_balance]
-        self.trades = []
-        self.risk_percentage = risk_percentage
-        self.stop_loss_multiplier = stop_loss_multiplier
-        self.volatility_window = volatility_window
-        self.compound_interest_rate = compound_interest_rate
+    """Track cash, open position, and equity curve."""
 
-    def execute_trade(self, price, atr):
-        position_size = self.calculate_position_size(price, atr)
-        trade_cost = price * position_size
-        self.balance -= trade_cost
-        self.trades.append((price, position_size))
+    def __init__(self, config: PortfolioConfig) -> None:
+        self.cash = config.initial_balance
+        self.config = config
+        self.position: Optional[Position] = None
+        self.equity_curve = [config.initial_balance]
 
-    def calculate_equity(self, prices):
-        equity = self.balance
-        for trade in self.trades:
-            price, position_size = trade
-            equity += position_size * prices[-1]  # 最後の価格を使用する
+    def calculate_position_size(self, price: float) -> float:
+        risk_capital = self.cash * self.config.risk_percentage
+        if risk_capital <= 0 or price <= 0:
+            return 0.0
+        return risk_capital / price
+
+    def open_position(self, price: float, size: float) -> None:
+        if math.isclose(size, 0.0, abs_tol=1e-12):
+            return
+        self.close_position(price)
+        self.cash -= price * size
+        self.position = Position(size=size, entry_price=price)
+
+    def close_position(self, price: float) -> None:
+        if self.position is None:
+            return
+        self.cash += price * self.position.size
+        self.position = None
+
+    def update_equity(self, price: float) -> float:
+        equity = self.cash
+        if self.position is not None:
+            equity += price * self.position.size
         self.equity_curve.append(equity)
         return equity
 
-    def update_trades(self, current_price, atr):
-        if self.stop_loss_multiplier is not None:
-            stop_loss_level = current_price - (self.stop_loss_multiplier * atr)
-            updated_trades = []
-            for trade in self.trades:
-                price, position_size = trade
-                if price <= stop_loss_level:
-                    # ストップロスレベルに達した場合はトレードをクローズ
-                    self.balance += position_size * price
-                else:
-                    updated_trades.append(trade)
-            self.trades = updated_trades
 
-    def calculate_position_size(self, price, atr):
-        risk_amount = self.balance * self.risk_percentage
-        stop_loss_distance = price - (price - atr)
-        position_size = risk_amount / stop_loss_distance
-        return position_size
+@dataclass(frozen=True)
+class SimulationConfig:
+    num_steps: int
+    time_interval: float
+    market: MarketModelConfig
+    portfolio: PortfolioConfig
+    strategy: StrategyConfig = field(default_factory=StrategyConfig)
+    num_simulations: int = 1
 
-    def apply_compound_interest(self, volatility):
-        if self.compound_interest_rate > 0:
-            # ボラティリティに応じて再投資の割合を調整する
-            dynamic_compound_interest_rate = self.compound_interest_rate * (1 - volatility)
-            interest = self.equity_curve[-1] * dynamic_compound_interest_rate
-            self.balance += interest
-            self.equity_curve[-1] += interest
 
-# シミュレーションパラメータ
-initial_price = 140  # 初期価格
-num_steps = 1464  # シミュレーションのステップ数（1年分、4時間足）
-time_interval = 4 / (24 * 60)  # 時間間隔（4時間足を1/24で割る）
-initial_balance = 10000  # 初期残高
-num_simulations = 10  # シミュレーション回数
+@dataclass
+class SimulationResult:
+    prices: List[float]
+    equity_curve: List[float]
 
-equity_curves = []
 
-# シミュレーションの実行
-for _ in range(num_simulations):
-    market_model = MarketModel(initial_price)
-    strategy = TradeStrategy()
-    portfolio = Portfolio(initial_balance)
+def run_single_simulation(
+    config: SimulationConfig,
+    rng_seed: Optional[int] = None,
+) -> SimulationResult:
+    market_model = MarketModel(config.market, seed=rng_seed)
+    strategy = TradeStrategy(config.strategy)
+    portfolio = Portfolio(config.portfolio)
 
-    for _ in range(num_steps):
-        prices = market_model.simulate_price(1, time_interval)
-        entry_long, entry_short = strategy.evaluate_entry_signal(prices)
-        
-        if entry_long:
-            position_size = 1  # 仮のポジションサイズ
-            portfolio.execute_trade(prices[-1], position_size)
-        elif entry_short:
-            position_size = -1  # 仮のポジションサイズ
-            portfolio.execute_trade(prices[-1], position_size)
-        
-        equity = portfolio.calculate_equity(prices)  # 価格のリストを渡す
-    
-    equity_curves.append(portfolio.equity_curve)
+    prices = market_model.generate_path(config.num_steps, config.time_interval)
+    price_history = [prices[0]]
 
-# エクイティカーブの可視化
-plt.figure(figsize=(10, 6))
-for i, equity_curve in enumerate(equity_curves):
-    plt.plot(equity_curve, label=f'Simulation {i+1}')
+    for price in prices[1:]:
+        price_history.append(price)
+        long_signal, short_signal = strategy.evaluate_entry_signal(price_history)
 
-plt.xlabel('Time Steps')
-plt.ylabel('Equity')
-plt.title('Equity Curves of Multiple Simulations')
-plt.legend()
-plt.grid(True)
-plt.show()
+        if long_signal:
+            position_size = portfolio.calculate_position_size(price)
+            portfolio.open_position(price, position_size)
+        elif short_signal:
+            position_size = -portfolio.calculate_position_size(price)
+            portfolio.open_position(price, position_size)
+
+        portfolio.update_equity(price)
+
+    portfolio.close_position(prices[-1])
+    portfolio.update_equity(prices[-1])
+    return SimulationResult(prices=prices, equity_curve=list(portfolio.equity_curve))
+
+
+def run_multiple_simulations(
+    config: SimulationConfig,
+    seeds: Optional[Sequence[Optional[int]]] = None,
+) -> List[SimulationResult]:
+    if seeds is None:
+        seeds_iter: List[Optional[int]] = list(range(config.num_simulations))
+    else:
+        seeds_iter = list(seeds)
+    if not seeds_iter:
+        seeds_iter = [None]
+
+    results: List[SimulationResult] = []
+    for seed in seeds_iter:
+        results.append(run_single_simulation(config, rng_seed=seed))
+    return results
+
+
+def _resolve_pyplot() -> Optional[ModuleType]:
+    if importlib.util.find_spec("matplotlib") is None:
+        return None
+    return importlib.import_module("matplotlib.pyplot")
+
+
+def plot_equity_curves(equity_curves: Sequence[Sequence[float]]) -> bool:
+    if not equity_curves:
+        return False
+
+    plt = _resolve_pyplot()
+    if plt is None:
+        return False
+
+    plt.figure(figsize=(10, 6))
+    for i, equity_curve in enumerate(equity_curves, start=1):
+        plt.plot(list(equity_curve), label=f"Simulation {i}")
+
+    plt.xlabel("Time Steps")
+    plt.ylabel("Equity")
+    plt.title("Equity Curves of Multiple Simulations")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+    return True
+
+
+def main() -> None:
+    simulation_config = SimulationConfig(
+        num_steps=1464,
+        time_interval=4 / (24 * 60),
+        market=MarketModelConfig(initial_price=140),
+        portfolio=PortfolioConfig(initial_balance=10_000),
+        num_simulations=10,
+    )
+
+    results = run_multiple_simulations(simulation_config)
+    equity_curves = [result.equity_curve for result in results]
+
+    plotted = plot_equity_curves(equity_curves)
+    if not plotted:
+        print("matplotlib is not available; skipped plotting equity curves.")
+
+
+if __name__ == "__main__":
+    main()
