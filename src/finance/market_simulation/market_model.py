@@ -8,6 +8,27 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 
+__all__ = [
+    "SimulationConfig",
+    "CLIOptions",
+    "MarketModel",
+    "compute_rsi",
+    "compute_ema",
+    "TradeStrategy",
+    "Position",
+    "Portfolio",
+    "EquityCurveStatistics",
+    "compute_equity_statistics",
+    "summarise_equity_curves",
+    "format_statistics_table",
+    "run_single_simulation",
+    "simulate_equity_curves",
+    "plot_equity_curves",
+    "save_equity_curves",
+    "parse_arguments",
+    "main",
+]
+
 
 @dataclass(frozen=True)
 class SimulationConfig:
@@ -253,6 +274,144 @@ class Portfolio:
         return float(equity)
 
 
+@dataclass(frozen=True)
+class EquityCurveStatistics:
+    """Summary statistics describing the performance of an equity curve."""
+
+    final_equity: float
+    total_return: float
+    cagr: float
+    volatility: float
+    max_drawdown: float
+    sharpe_ratio: float
+
+
+def compute_equity_statistics(
+    equity_curve: Sequence[float] | np.ndarray,
+    *,
+    periods_per_year: int = 252,
+    risk_free_rate: float = 0.0,
+) -> EquityCurveStatistics:
+    """Return performance metrics for a single equity curve.
+
+    Args:
+        equity_curve: Ordered equity values including the starting balance.
+        periods_per_year: Number of return observations expected per year.
+        risk_free_rate: Annualised risk-free rate expressed as a decimal.
+
+    Returns:
+        ``EquityCurveStatistics`` describing profitability and risk metrics.
+    """
+
+    curve = np.asarray(equity_curve, dtype=float)
+    if curve.ndim != 1:
+        raise ValueError("Equity curve must be one-dimensional")
+    if curve.size < 2:
+        raise ValueError("Equity curve must contain at least two observations")
+    if np.any(curve <= 0):
+        raise ValueError("Equity values must be strictly positive")
+    if periods_per_year <= 0:
+        raise ValueError("periods_per_year must be positive")
+
+    returns = np.diff(curve) / curve[:-1]
+    num_periods = returns.size
+
+    growth = curve[-1] / curve[0]
+    total_return = float(growth - 1.0)
+    cagr = float(growth ** (periods_per_year / num_periods) - 1.0)
+
+    mean_return = float(returns.mean())
+    if num_periods > 1:
+        return_std = float(returns.std(ddof=1))
+    else:
+        return_std = 0.0
+    volatility = float(return_std * np.sqrt(periods_per_year))
+
+    risk_free_per_period = risk_free_rate / periods_per_year
+    excess_return = mean_return - risk_free_per_period
+    if return_std > 0:
+        sharpe_ratio = float(excess_return / return_std * np.sqrt(periods_per_year))
+    else:
+        sharpe_ratio = 0.0
+
+    running_max = np.maximum.accumulate(curve)
+    drawdowns = 1.0 - curve / running_max
+    max_drawdown = float(drawdowns.max())
+
+    return EquityCurveStatistics(
+        final_equity=float(curve[-1]),
+        total_return=total_return,
+        cagr=cagr,
+        volatility=volatility,
+        max_drawdown=max_drawdown,
+        sharpe_ratio=sharpe_ratio,
+    )
+
+
+def summarise_equity_curves(
+    equity_curves: Sequence[Sequence[float] | np.ndarray],
+    *,
+    periods_per_year: int = 252,
+    risk_free_rate: float = 0.0,
+) -> List[EquityCurveStatistics]:
+    """Compute statistics for multiple equity curves."""
+
+    return [
+        compute_equity_statistics(
+            equity_curve,
+            periods_per_year=periods_per_year,
+            risk_free_rate=risk_free_rate,
+        )
+        for equity_curve in equity_curves
+    ]
+
+
+def format_statistics_table(
+    statistics: Sequence[EquityCurveStatistics],
+) -> str:
+    """Return a formatted table summarising backtest statistics."""
+
+    if not statistics:
+        raise ValueError("No statistics provided for formatting")
+
+    headers = [
+        "Simulation",
+        "Final Equity",
+        "Total Return",
+        "CAGR",
+        "Volatility",
+        "Max Drawdown",
+        "Sharpe",
+    ]
+    rows = [
+        [
+            f"Simulation {index}",
+            f"{stat.final_equity:,.2f}",
+            f"{stat.total_return:.2%}",
+            f"{stat.cagr:.2%}",
+            f"{stat.volatility:.2%}",
+            f"{stat.max_drawdown:.2%}",
+            f"{stat.sharpe_ratio:.2f}",
+        ]
+        for index, stat in enumerate(statistics, start=1)
+    ]
+
+    columns = list(zip(headers, *rows))
+    col_widths = [max(len(value) for value in column) for column in columns]
+    alignments = ["<"] + [">"] * (len(headers) - 1)
+
+    def format_row(row: Sequence[str]) -> str:
+        formatted_cells = []
+        for value, width, align in zip(row, col_widths, alignments):
+            formatted_cells.append(value.ljust(width) if align == "<" else value.rjust(width))
+        return " | ".join(formatted_cells)
+
+    separator = " | ".join("-" * width for width in col_widths)
+    lines = [format_row(headers), separator]
+    lines.extend(format_row(row) for row in rows)
+    return "\n".join(lines)
+
+
 def run_single_simulation(
     config: SimulationConfig,
     rng_seed: Optional[int] = None,
@@ -403,6 +562,9 @@ def main() -> None:
 
     if options.output_path is not None:
         save_equity_curves(equity_curves, options.output_path)
+
+    statistics = summarise_equity_curves(equity_curves)
+    print(format_statistics_table(statistics))
 
     if options.show_plot:
         plot_equity_curves(equity_curves)
