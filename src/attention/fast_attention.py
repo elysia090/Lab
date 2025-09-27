@@ -1,29 +1,32 @@
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, List, Dict
-from dataclasses import dataclass
-import math
 
 ##############################################
 # Low-level Helper Functions
 ##############################################
 
 def fma(a: float, b: float, c: float) -> float:
-    """
-    Fused multiply-add: returns a * b + c in a single instruction if available.
-    """
+    """Return ``a * b + c`` using :func:`math.fma` when available."""
+
     try:
         return math.fma(a, b, c)
     except AttributeError:
         return a * b + c
 
 def optimized_sqrt(n: int) -> float:
+    """Return ``sqrt(n)`` with a fast-path for powers of two.
+
+    The utility mirrors :func:`math.sqrt` but avoids floating point work for
+    dimensions that are powers of two – a common case for attention modules.
     """
-    If n is a power of 2, compute sqrt(n) using bit shifts.
-    For n = 2^k, sqrt(n) = 2^(k/2).
-    Otherwise, falls back to math.sqrt.
-    """
+
     if n & (n - 1) == 0:  # power-of-two check
         k = n.bit_length() - 1
         return 2 ** (k / 2)
@@ -35,10 +38,8 @@ def optimized_sqrt(n: int) -> float:
 
 @torch.jit.script
 def select_topk(similarities: torch.Tensor, k_max: int) -> torch.Tensor:
-    """
-    Select the indices of the top-k values along the last dimension.
-    Input shape: [B, L, num_candidates].
-    """
+    """Return indices of the ``k_max`` largest similarities along the last axis."""
+
     _, topk_idx = torch.topk(similarities, k=k_max, dim=-1)
     return topk_idx
 
@@ -63,134 +64,162 @@ class FastAttentionConfig:
     use_rff: bool = True  # Whether to use RFF.
 
 class LowRankLinear(nn.Module):
-    """
-    Low-rank linear layer via factorized weight matrices.
-    """
-    def __init__(self, in_features: int, out_features: int, rank: int):
+    """Low-rank linear layer via factorised weight matrices."""
+
+    def __init__(self, in_features: int, out_features: int, rank: int) -> None:
         super().__init__()
-        self.u_weight = nn.Parameter(torch.randn(in_features, rank) / math.sqrt(rank))
-        self.v_weight = nn.Parameter(torch.randn(rank, out_features) / math.sqrt(rank))
+        scale = math.sqrt(rank)
+        self.u_weight = nn.Parameter(torch.randn(in_features, rank) / scale)
+        self.v_weight = nn.Parameter(torch.randn(rank, out_features) / scale)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.matmul(x, self.u_weight).matmul(self.v_weight)
+        return x.matmul(self.u_weight).matmul(self.v_weight)
 
 class RandomFourierFeatures(nn.Module):
+    """Project inputs using random Fourier features.
+
+    The random parameters are registered as buffers to avoid appearing in the
+    optimiser state while still moving with the module across devices.
     """
-    Projects input features using random Fourier features.
-    """
-    def __init__(self, input_dim: int, rff_dim: int):
+
+    def __init__(self, input_dim: int, rff_dim: int) -> None:
         super().__init__()
-        self.omega = nn.Parameter(torch.randn(input_dim, rff_dim), requires_grad=False)
-        self.bias = nn.Parameter(torch.rand(rff_dim) * 2 * math.pi, requires_grad=False)
+        self.register_buffer("omega", torch.randn(input_dim, rff_dim))
+        self.register_buffer("bias", torch.rand(rff_dim) * 2 * math.pi)
         self.scale = math.sqrt(2.0 / rff_dim)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         projection = x.matmul(self.omega) + self.bias
         return torch.cos(projection) * self.scale
 
 class LSHTable(nn.Module):
-    """
-    Locality-sensitive hashing (LSH) table.
-    """
-    def __init__(self, dim: int, n_buckets: int, bandwidth: float, n_hashes: int):
+    """Locality-sensitive hashing (LSH) table."""
+
+    def __init__(self, dim: int, n_buckets: int, bandwidth: float, n_hashes: int) -> None:
         super().__init__()
         self.dim = dim
         self.n_buckets = n_buckets
         self.bandwidth = bandwidth
         self.n_hashes = n_hashes
-        self.random_vectors = nn.Parameter(torch.randn(dim, n_hashes), requires_grad=False)
+        self.register_buffer("random_vectors", torch.randn(dim, n_hashes))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         proj = x.matmul(self.random_vectors)
         return torch.floor(proj / self.bandwidth) % self.n_buckets
 
-_TRIE_INDICES_KEY = '_indices'
+@dataclass
+class _TrieNode:
+    children: Dict[Tuple[int, ...], "_TrieNode"] = field(default_factory=dict)
+    indices: List[int] = field(default_factory=list)
+
+
 class Trie(nn.Module):
-    """
-    Trie (prefix tree) for candidate lookup using binary quantization.
-    """
-    def __init__(self, stride: int):
+    """Prefix tree for candidate lookup using binary quantisation."""
+
+    def __init__(self, stride: int) -> None:
         super().__init__()
-        self.root_node: Dict = {}
         self.stride_len = stride
+        self.reset()
+
+    def reset(self) -> None:
+        self.root = _TrieNode()
+
     def insert(self, binary_vector: torch.Tensor, index: int) -> None:
-        current_node = self.root_node
+        node = self.root
         for i in range(0, len(binary_vector), self.stride_len):
-            prefix = tuple(binary_vector[i:i+self.stride_len].tolist())
-            if prefix not in current_node:
-                current_node[prefix] = {}
-            current_node = current_node[prefix]
-        current_node.setdefault(_TRIE_INDICES_KEY, []).append(index)
+            prefix = tuple(binary_vector[i : i + self.stride_len].tolist())
+            node = node.children.setdefault(prefix, _TrieNode())
+        node.indices.append(index)
+
+    def bulk_insert(self, binary_matrix: torch.Tensor) -> None:
+        self.reset()
+        for idx, row in enumerate(binary_matrix):
+            self.insert(row, idx)
+
     def search(self, binary_vector: torch.Tensor) -> List[int]:
-        current_node = self.root_node
+        node = self.root
         for i in range(0, len(binary_vector), self.stride_len):
-            prefix = tuple(binary_vector[i:i+self.stride_len].tolist())
-            if prefix not in current_node:
+            prefix = tuple(binary_vector[i : i + self.stride_len].tolist())
+            if prefix not in node.children:
                 return []
-            current_node = current_node[prefix]
-        return current_node.get(_TRIE_INDICES_KEY, [])
+            node = node.children[prefix]
+        return list(node.indices)
 
 class CandidateFinder(nn.Module):
-    """
-    Candidate search module using LSH, Wu-Manber, and Trie-based methods.
-    """
-    def __init__(self, config: FastAttentionConfig, tries: List[Trie], lsh_tables: nn.ModuleList):
+    """Candidate search module combining simple heuristics."""
+
+    def __init__(self, config: FastAttentionConfig, tries: Iterable[Trie], lsh_tables: nn.ModuleList) -> None:
         super().__init__()
         self.config = config
-        self.tries = tries
+        self.tries = list(tries)
         self.lsh_tables = lsh_tables
         self.wu_manber_prefix_len = config.wu_manber_prefix_len
         self.hyper_cuts_dim_groups = config.hyper_cuts_dim_groups
 
-    def binary_quantize(self, x: torch.Tensor) -> torch.Tensor:
-        return (x > 0).float()
+    @staticmethod
+    def _binary_quantize(x: torch.Tensor) -> torch.Tensor:
+        return (x > 0).to(dtype=torch.int8)
 
     def split_features_by_dim_groups(self, features: torch.Tensor) -> List[torch.Tensor]:
         if self.hyper_cuts_dim_groups is None:
             return [features]
-        groups = []
+        groups: List[torch.Tensor] = []
         start = 0
         for group_dim in self.hyper_cuts_dim_groups:
-            groups.append(features[:, :, start:start+group_dim])
+            groups.append(features[:, :, start : start + group_dim])
             start += group_dim
         return groups
 
-    def _build_wu_manber_hash_table(self, key_bin: torch.Tensor) -> Dict[tuple, List[int]]:
-        table: Dict[tuple, List[int]] = {}
-        L = key_bin.size(0)
-        for i in range(L):
-            prefix = tuple(key_bin[i, :self.config.wu_manber_prefix_len].tolist())
-            table.setdefault(prefix, []).append(i)
+    def _build_wu_manber_hash_table(self, key_bin: torch.Tensor) -> Dict[Tuple[int, ...], List[int]]:
+        table: Dict[Tuple[int, ...], List[int]] = {}
+        prefix_len = self.wu_manber_prefix_len
+        if prefix_len <= 0:
+            return table
+        for index, vector in enumerate(key_bin):
+            prefix = tuple(vector[:prefix_len].tolist())
+            table.setdefault(prefix, []).append(index)
         return table
 
-    def _wu_manber_search(self, query_bin: torch.Tensor, table: Dict[tuple, List[int]]) -> List[int]:
-        prefix = tuple(query_bin[:self.config.wu_manber_prefix_len].tolist())
+    def _wu_manber_search(self, query_bin: torch.Tensor, table: Dict[Tuple[int, ...], List[int]]) -> List[int]:
+        if not table:
+            return []
+        prefix = tuple(query_bin[: self.wu_manber_prefix_len].tolist())
         return table.get(prefix, [])
 
     def _get_wu_manber_candidates_group(self, query_grp: torch.Tensor, key_grp: torch.Tensor) -> List[List[List[int]]]:
-        B, L, _ = key_grp.size()
-        key_bin = self.binary_quantize(key_grp)
-        query_bin = self.binary_quantize(query_grp)
-        cand_lists = []
-        for b in range(B):
-            table = self._build_wu_manber_hash_table(key_bin[b])
-            batch_list = [self._wu_manber_search(query_bin[b, i], table) for i in range(L)]
-            cand_lists.append(batch_list)
-        return cand_lists
+        key_bin = self._binary_quantize(key_grp)
+        query_bin = self._binary_quantize(query_grp)
+        batch_candidates: List[List[List[int]]] = []
+        for key_batch, query_batch in zip(key_bin, query_bin):
+            table = self._build_wu_manber_hash_table(key_batch)
+            batch_candidates.append([
+                self._wu_manber_search(query_vec, table) for query_vec in query_batch
+            ])
+        return batch_candidates
 
     def _get_trie_candidates_group(self, query_grp: torch.Tensor, key_grp: torch.Tensor, head_idx: int) -> List[List[List[int]]]:
-        B, L, _ = key_grp.size()
-        cand_lists = []
-        for b in range(B):
-            trie = Trie(self.config.stride)
-            key_bin = self.binary_quantize(key_grp[b])
-            for i in range(L):
-                trie.insert(key_bin[i], i)
-            batch_list = [trie.search(self.binary_quantize(query_grp[b][i])) for i in range(L)]
-            cand_lists.append(batch_list)
-        return cand_lists
+        trie = self.tries[head_idx]
+        batch_candidates: List[List[List[int]]] = []
+        for key_batch, query_batch in zip(key_grp, query_grp):
+            trie.bulk_insert(self._binary_quantize(key_batch))
+            batch_candidates.append([
+                trie.search(self._binary_quantize(query_vec)) for query_vec in query_batch
+            ])
+        return batch_candidates
 
-    def merge_candidate_indices_groups(self, cand_tensors: List[torch.Tensor]) -> torch.Tensor:
+    def _merge_candidate_indices_groups(self, cand_tensors: List[torch.Tensor]) -> torch.Tensor:
         merged = torch.cat(cand_tensors, dim=-1)
-        merged, _ = torch.sort(merged)
-        return torch.unique_consecutive(merged, dim=-1)
+        B, L, _ = merged.shape
+        output = torch.full((B, L, self.config.k_max), -1, device=merged.device, dtype=merged.dtype)
+        for b in range(B):
+            for i in range(L):
+                valid = merged[b, i][merged[b, i] >= 0]
+                if valid.numel() == 0:
+                    continue
+                unique = torch.unique(valid, sorted=True)
+                count = min(unique.numel(), self.config.k_max)
+                output[b, i, :count] = unique[:count]
+        return output
 
     def _process_dimension_group_candidates(self, query_grp: torch.Tensor, key_grp: torch.Tensor, head_idx: int) -> torch.Tensor:
         B, L, _ = query_grp.size()
@@ -199,41 +228,45 @@ class CandidateFinder(nn.Module):
         candidates = torch.full((B, L, self.config.k_max), -1, dtype=torch.long, device=query_grp.device)
         for b in range(B):
             for i in range(L):
-                common = list(set(wu_cands[b][i]) & set(trie_cands[b][i]))
-                if common:
-                    common_tensor = torch.tensor(common, dtype=torch.long, device=query_grp.device)
-                    if common_tensor.numel() > self.config.k_max:
-                        common_tensor = common_tensor[:self.config.k_max]
-                    candidates[b, i, :common_tensor.numel()] = common_tensor
+                seen: List[int] = []
+                for idx in wu_cands[b][i]:
+                    if idx in trie_cands[b][i] and idx not in seen:
+                        seen.append(idx)
+                        if len(seen) == self.config.k_max:
+                            break
+                if seen:
+                    candidates[b, i, : len(seen)] = torch.tensor(seen, dtype=torch.long, device=query_grp.device)
         return candidates
 
     def forward(self, query_up: torch.Tensor, key_up: torch.Tensor, head_idx: int) -> torch.Tensor:
-        B, L, _ = query_up.size()
         query_groups = self.split_features_by_dim_groups(query_up)
         key_groups = self.split_features_by_dim_groups(key_up)
-        cand_list = [self._process_dimension_group_candidates(q_grp, k_grp, head_idx)
-                     for q_grp, k_grp in zip(query_groups, key_groups)]
-        if cand_list:
-            merged = self.merge_candidate_indices_groups(cand_list)
-            return merged[:, :, :self.config.k_max]
-        return torch.full((B, L, self.config.k_max), -1, dtype=torch.long, device=query_up.device)
+        cand_list = [
+            self._process_dimension_group_candidates(q_grp, k_grp, head_idx)
+            for q_grp, k_grp in zip(query_groups, key_groups)
+        ]
+        if not cand_list:
+            B, L, _ = query_up.size()
+            return torch.full((B, L, self.config.k_max), -1, dtype=torch.long, device=query_up.device)
+        return self._merge_candidate_indices_groups(cand_list)
 
 class AbsorptionProjection(nn.Module):
-    """
-    Projects queries into the key space using a low-rank 'absorption' transformation.
-    """
-    def __init__(self, query_dim: int, key_dim: int, rank: int):
+    """Project queries into the key space using a low-rank transform."""
+
+    def __init__(self, query_dim: int, key_dim: int, rank: int) -> None:
         super().__init__()
-        self.u_q = nn.Parameter(torch.randn(query_dim, rank) / math.sqrt(rank))
-        self.v_q = nn.Parameter(torch.randn(rank, key_dim) / math.sqrt(rank))
-        self.u_k = nn.Parameter(torch.randn(key_dim, rank) / math.sqrt(rank))
-        self.v_k = nn.Parameter(torch.randn(rank, key_dim) / math.sqrt(rank))
+        scale = math.sqrt(rank)
+        self.u_q = nn.Parameter(torch.randn(query_dim, rank) / scale)
+        self.v_q = nn.Parameter(torch.randn(rank, key_dim) / scale)
+        self.u_k = nn.Parameter(torch.randn(key_dim, rank) / scale)
+        self.v_k = nn.Parameter(torch.randn(rank, key_dim) / scale)
+
     def forward(self, query: torch.Tensor, key: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        W_UQ = torch.matmul(self.u_q, self.v_q)
-        W_UK = torch.matmul(self.u_k, self.v_k)
-        W_absorb = torch.matmul(W_UK.transpose(0, 1), W_UQ)
-        Q_proj = torch.matmul(query, W_absorb.transpose(0, 1))
-        return Q_proj, key
+        w_uq = self.u_q.matmul(self.v_q)
+        w_uk = self.u_k.matmul(self.v_k)
+        w_absorb = w_uk.transpose(0, 1).matmul(w_uq)
+        q_proj = query.matmul(w_absorb.transpose(0, 1))
+        return q_proj, key
 
 class FastAttention(nn.Module):
     """
@@ -243,7 +276,8 @@ class FastAttention(nn.Module):
         super().__init__()
         self.config = config
         self.query_down_proj = nn.Linear(config.d_model, config.d_query)
-        self.key_value_down_proj = nn.Linear(config.d_model, config.d_key)
+        self.key_down_proj = nn.Linear(config.d_model, config.d_key)
+        self.value_down_proj = nn.Linear(config.d_model, config.d_key)
         self.absorption_projs = nn.ModuleList([
             AbsorptionProjection(config.d_query, config.d_key, config.rank)
             for _ in range(config.n_heads)
@@ -278,7 +312,10 @@ class FastAttention(nn.Module):
                 mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, L, _ = query.size()
         query_down = self.query_down_proj(query)
-        key_down = self.key_value_down_proj(key)
+        key_down = self.key_down_proj(key)
+        value_down = self.value_down_proj(value)
+        if mask is not None and mask.device != query.device:
+            mask = mask.to(query.device)
         head_outputs = []
         for head_idx in range(self.config.n_heads):
             Q_proj, K_proj = self.absorption_projs[head_idx](query_down, key_down)
@@ -288,19 +325,31 @@ class FastAttention(nn.Module):
             safe_candidates[safe_candidates == -1] = 0
             b_idx = torch.arange(B, device=K_proj.device).view(B, 1, 1).expand(B, L, self.config.k_max)
             candidate_keys = K_proj[b_idx, safe_candidates]
+            candidate_values = value_down[b_idx, safe_candidates]
             q_exp = Q_proj.unsqueeze(2)
             if self.config.use_rff:
                 q_exp = self.rff_encoders[head_idx](q_exp.view(-1, self.config.d_key)).view(B, L, 1, self.config.rff_dim)
-                candidate_keys = self.rff_encoders[head_idx](candidate_keys.view(-1, self.config.d_key)).view(B, L, self.config.k_max, self.config.rff_dim)
+                candidate_keys = self.rff_encoders[head_idx](candidate_keys.view(-1, self.config.d_key)).view(
+                    B, L, self.config.k_max, self.config.rff_dim
+                )
+                candidate_values = self.value_up_projs[head_idx](
+                    candidate_values.view(-1, self.config.d_key)
+                ).view(B, L, self.config.k_max, self.config.d_model)
                 scale = optimized_sqrt(self.config.rff_dim)
             else:
+                candidate_values = self.value_up_projs[head_idx](
+                    candidate_values.view(-1, self.config.d_key)
+                ).view(B, L, self.config.k_max, self.config.d_model)
                 scale = optimized_sqrt(self.config.d_key)
             sim = torch.matmul(q_exp, candidate_keys.transpose(-2, -1)).squeeze(2) / scale
-            sim = sim.masked_fill(~cand_mask, float('-inf'))
+            if mask is not None:
+                if mask.dim() != 3:
+                    raise ValueError("mask must have shape [batch, query_len, key_len]")
+                attn_mask = mask.gather(-1, safe_candidates)
+                sim = sim.masked_fill(~attn_mask, float("-inf"))
+            sim = sim.masked_fill(~cand_mask, float("-inf"))
             attn_weights = F.softmax(sim, dim=-1)
             attn_weights = self.dropout(attn_weights)
-            candidate_values = key_down[b_idx, safe_candidates]
-            candidate_values = self.value_up_projs[head_idx](candidate_values.view(-1, self.config.d_key)).view(B, L, self.config.k_max, self.config.d_model)
             head_out = torch.sum(attn_weights.unsqueeze(-1) * candidate_values, dim=2)
             head_outputs.append(head_out)
         concat = torch.cat(head_outputs, dim=-1)
