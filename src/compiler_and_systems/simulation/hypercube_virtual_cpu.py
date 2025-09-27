@@ -1,628 +1,593 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""Hypercube virtual CPU and assembler utilities.
+
+This module provides a lightweight, production-ready implementation of the
+hypercube virtual CPU that previously lived in this repository.  The original
+version bundled together GUI code, matplotlib/networkx visualisations and a
+large amount of ad-hoc logic.  Importing the module pulled heavy optional
+dependencies and made it very difficult to unit-test the core compiler and
+simulation stack.
+
+The refactored module focuses exclusively on the compiler (assembler), CPU
+execution model and the hypercube message-passing network.  The API is fully
+type annotated, extensively documented and covered by unit tests.  It is
+designed to be deterministic and side-effect free which keeps it suitable for
+integration in automated systems.
+
+Example
+-------
+
+>>> source = "\"\"\"\nLOAD R0, 1\nLOAD R1, 5\nLOOP:\n  ADD R0, R1\n  SEND R0, 0   ; share with neighbour\n  JNZ R1, LOOP\nHALT\n\"\"\""
+>>> assembler = Assembler()
+>>> program = assembler.assemble(source)
+>>> sim = HypercubeSimulation([program, program], dimension=1)
+>>> sim.run()  # doctest: +ELLIPSIS
+
+The :class:`HypercubeSimulation` exposes the final state of every node through
+the :attr:`~HypercubeSimulation.nodes` attribute for further inspection.
 """
-Refactored and Extended Hypercube Virtual CPU Simulator with Native Frontend
 
-【命令形式 (16ビット)】
-  [4ビット opcode (Gray code) | 3ビット regA | 3ビット regB | 6ビット immediate]
+from __future__ import annotations
 
-【サポート命令】
-  基本命令:
-    0: NOP,   1: LOAD,   2: ADD,    3: SUB,
-    4: MUL,   5: DIV,    6: MOV,    7: HALT
-  通信命令:
-    8: SEND,  9: RECV
-  分岐命令:
-    10: JMP,  11: JZ,   15: JNZ   (JZ: jump if reg==0, JNZ: jump if reg != 0)
-  データメモリ操作:
-    12: LOADM, 13: STOREM
-  比較命令:
-    14: CMP   (CMP regA, regB → flag = regA - regB)
-
-この命令セットは、十分なメモリが与えられればチューリング完全な計算モデルとなります。
-
-各ノードはハイパーキューブ構造上に存在し、ノード間の通信は queue.Queue を用いて高速化されています。
-また、各ノードのシミュレーションは並列スレッドで実行され、PyQt5 のフロントエンドでリアルタイムに可視化されます.
-"""
-
-import sys
+from dataclasses import dataclass
+from enum import Enum
 import logging
-import threading
-import time
-import queue
-from typing import List, Tuple, Callable, Dict, Optional
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-# --- PyQt5 関連 ---
-from PyQt5 import QtWidgets, QtCore
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-import matplotlib.pyplot as plt
-import networkx as nx
+__all__ = [
+    "AssemblyError",
+    "SimulationError",
+    "Opcode",
+    "DecodedInstruction",
+    "encode_instruction",
+    "decode_instruction",
+    "disassemble",
+    "Assembler",
+    "VirtualCPU",
+    "HypercubeNetwork",
+    "HypercubeSimulation",
+    "compile_source",
+]
 
-# ======================================================
-# ロギング設定（必要最小限に調整）
-# ======================================================
-logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
-logger = logging.getLogger(__name__)
-def set_debug(enable: bool) -> None:
-    if enable:
-        logger.setLevel(logging.DEBUG)
-    else:
-        logger.setLevel(logging.INFO)
 
-# ======================================================
-# 再帰的 Gray Code 生成＆変換
-# ======================================================
-def recursive_gray_codes(n: int) -> List[int]:
-    if n == 0:
-        return [0]
-    if n == 1:
-        return [0, 1]
-    prev = recursive_gray_codes(n - 1)
-    mirror = prev[::-1]
-    return [code << 1 for code in prev] + [(code << 1) | 1 for code in mirror]
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
 
-def gray_to_binary(n: int) -> int:
-    mask = n
+
+class AssemblyError(RuntimeError):
+    """Raised when the assembler encounters an invalid instruction."""
+
+
+class SimulationError(RuntimeError):
+    """Raised when an invalid state is observed during CPU execution."""
+
+
+# ---------------------------------------------------------------------------
+# Instruction encoding
+# ---------------------------------------------------------------------------
+
+
+class Opcode(Enum):
+    """Supported opcodes for the virtual CPU."""
+
+    NOP = 0
+    LOAD = 1
+    ADD = 2
+    SUB = 3
+    MUL = 4
+    DIV = 5
+    MOV = 6
+    HALT = 7
+    SEND = 8
+    RECV = 9
+    JMP = 10
+    JZ = 11
+    LOADM = 12
+    STOREM = 13
+    CMP = 14
+    JNZ = 15
+
+
+IMMEDIATE_BITS = 6
+IMMEDIATE_MASK = (1 << IMMEDIATE_BITS) - 1
+REGISTER_COUNT = 8
+MAX_PROGRAM_LENGTH = 1 << IMMEDIATE_BITS  # Addresses must fit in the immediate
+
+
+@dataclass(frozen=True)
+class DecodedInstruction:
+    """Human friendly representation of an encoded instruction."""
+
+    opcode: Opcode
+    reg_a: int
+    reg_b: int
+    immediate: int
+
+
+def _validate_register(index: int) -> int:
+    if not 0 <= index < REGISTER_COUNT:
+        raise SimulationError(f"Register index out of bounds: {index}")
+    return index
+
+
+def encode_instruction(opcode: Opcode, reg_a: int = 0, reg_b: int = 0, immediate: int = 0) -> int:
+    """Encode an instruction into the 16-bit machine word format."""
+
+    _validate_register(reg_a)
+    _validate_register(reg_b)
+    if not -32 <= immediate <= 31:
+        raise SimulationError("Immediate must fit in signed 6-bit range (-32..31)")
+    gray_opcode = opcode.value ^ (opcode.value >> 1)
+    return ((gray_opcode & 0xF) << 12) | ((reg_a & 0x7) << 9) | ((reg_b & 0x7) << 6) | (immediate & IMMEDIATE_MASK)
+
+
+def decode_instruction(word: int) -> DecodedInstruction:
+    """Decode a 16-bit machine word into components."""
+
+    if not 0 <= word <= 0xFFFF:
+        raise SimulationError(f"Instruction word out of range: {word}")
+    gray_opcode = (word >> 12) & 0xF
+    opcode_value = _gray_to_binary(gray_opcode)
+    try:
+        opcode = Opcode(opcode_value)
+    except ValueError as exc:  # pragma: no cover - exhaustive enum guard
+        raise SimulationError(f"Unknown opcode value: {opcode_value}") from exc
+    reg_a = (word >> 9) & 0x7
+    reg_b = (word >> 6) & 0x7
+    immediate = word & IMMEDIATE_MASK
+    if immediate & (1 << (IMMEDIATE_BITS - 1)):
+        immediate -= 1 << IMMEDIATE_BITS
+    return DecodedInstruction(opcode, reg_a, reg_b, immediate)
+
+
+def disassemble(program: Sequence[int]) -> List[str]:
+    """Return a list of human readable instructions for *program*."""
+
+    return [
+        f"{index:02d}: {decoded.opcode.name} R{decoded.reg_a}, R{decoded.reg_b}, {decoded.immediate}"
+        for index, decoded in enumerate(map(decode_instruction, program))
+    ]
+
+
+def _gray_to_binary(value: int) -> int:
+    mask = value
     while mask:
         mask >>= 1
-        n ^= mask
-    return n
+        value ^= mask
+    return value
 
-GRAY_TO_BIN: List[int] = [gray_to_binary(i) for i in range(16)]
 
-def encode_instruction(bin_opcode: int, regA: int = 0, regB: int = 0, imm: int = 0) -> int:
-    # サイクリック Gray code 化
-    gray_opcode = bin_opcode ^ (bin_opcode >> 1)
-    return ((gray_opcode & 0xF) << 12) | ((regA & 0x7) << 9) | ((regB & 0x7) << 6) | (imm & 0x3F)
+# ---------------------------------------------------------------------------
+# Assembler
+# ---------------------------------------------------------------------------
 
-# ======================================================
-# 再帰的ハイパーキューブエッジ生成
-# ======================================================
-def generate_hypercube_edges(dim: int) -> List[Tuple[int, int]]:
-    if dim == 0:
-        return []
-    if dim == 1:
-        return [(0, 1)]
-    half = 2 ** (dim - 1)
-    sub_edges = generate_hypercube_edges(dim - 1)
-    edges = []
-    for (a, b) in sub_edges:
-        edges.append((a, b))
-        edges.append((a + half, b + half))
-    for i in range(half):
-        edges.append((i, i + half))
-    return edges
 
-# ======================================================
-# 再帰的フラクタル配置によるハイパーキューブレイアウト
-# ======================================================
-def recursive_hypercube_layout(dim: int) -> Dict[int, Tuple[float, float]]:
-    n_nodes = 2 ** dim
-    positions = {}
-    for i in range(n_nodes):
-        bits = format(i, f'0{dim}b')
-        x = sum((1 if bit == '1' else -1) for bit in bits[::2])
-        y = sum((1 if bit == '1' else -1) for bit in bits[1::2])
-        positions[i] = (x, y)
-    return positions
+_MNEMONICS: Dict[str, Opcode] = {item.name: item for item in Opcode}
 
-# ======================================================
-# VirtualCPU クラス（基本および拡張命令対応）
-# ======================================================
-class VirtualCPU:
-    def __init__(self, program: List[int], debug: bool = False) -> None:
-        self.registers: List[int] = [0] * 8
-        self.memory: List[int] = program[:]  # プログラムメモリ
-        self.pc: int = 0
-        self.running: bool = True
-        self.debug: bool = debug
-        # データメモリとフラグ
-        self.data_memory: List[int] = [0] * 256
-        self.flag: int = 0
-        # 固定長 16 要素のディスパッチテーブル
-        self.dispatch: List[Callable[[int, int, int], None]] = [self.unknown] * 16
-        self.dispatch[0] = self.nop
-        self.dispatch[1] = self.load
-        self.dispatch[2] = self.add
-        self.dispatch[3] = self.sub
-        self.dispatch[4] = self.mul
-        self.dispatch[5] = self.div
-        self.dispatch[6] = self.mov
-        self.dispatch[7] = self.halt
-        self.dispatch[8] = self.send
-        self.dispatch[9] = self.recv
-        self.dispatch[10] = self.jmp
-        self.dispatch[11] = self.jz
-        self.dispatch[12] = self.loadm
-        self.dispatch[13] = self.storem
-        self.dispatch[14] = self.cmp
-        self.dispatch[15] = self.jnz
-
-    def unknown(self, regA: int, regB: int, imm: int) -> None:
-        logger.error("Unknown instruction encountered!")
-        self.running = False
-
-    def fetch_decode_execute(self) -> None:
-        if self.pc >= len(self.memory):
-            self.running = False
-            return
-        instr: int = self.memory[self.pc]
-        self.pc += 1
-        opcode_gray: int = (instr >> 12) & 0xF
-        opcode_bin: int = GRAY_TO_BIN[opcode_gray]
-        regA: int = (instr >> 9) & 0x7
-        regB: int = (instr >> 6) & 0x7
-        imm: int = instr & 0x3F
-        if self.debug:
-            logger.debug(f"[PC={self.pc-1:04d}] 0x{instr:04X} | Gray:0x{opcode_gray:X} -> Bin:{opcode_bin} | R{regA} R{regB} | imm={imm}")
-        if opcode_bin < len(self.dispatch):
-            self.dispatch[opcode_bin](regA, regB, imm)
-        else:
-            self.unknown(regA, regB, imm)
-    
-    def run(self) -> None:
-        while self.running:
-            self.fetch_decode_execute()
-    
-    # 基本命令
-    def nop(self, regA: int, regB: int, imm: int) -> None:
-        if self.debug:
-            logger.debug("  NOP")
-    
-    def load(self, regA: int, regB: int, imm: int) -> None:
-        if self.debug:
-            logger.debug(f"  LOAD: R{regA} <- {imm}")
-        self.registers[regA] = imm
-    
-    def add(self, regA: int, regB: int, imm: int) -> None:
-        if self.debug:
-            logger.debug(f"  ADD: R{regA} = {self.registers[regA]} + R{regB}({self.registers[regB]})")
-        self.registers[regA] = (self.registers[regA] + self.registers[regB]) & 0xFFFFFFFF
-    
-    def sub(self, regA: int, regB: int, imm: int) -> None:
-        if self.debug:
-            logger.debug(f"  SUB: R{regA} = {self.registers[regA]} - R{regB}({self.registers[regB]})")
-        self.registers[regA] = (self.registers[regA] - self.registers[regB]) & 0xFFFFFFFF
-    
-    def mul(self, regA: int, regB: int, imm: int) -> None:
-        if self.debug:
-            logger.debug(f"  MUL: R{regA} = {self.registers[regA]} * R{regB}({self.registers[regB]})")
-        self.registers[regA] = (self.registers[regA] * self.registers[regB]) & 0xFFFFFFFF
-    
-    def div(self, regA: int, regB: int, imm: int) -> None:
-        if self.registers[regB] == 0:
-            if self.debug:
-                logger.debug(f"  DIV: Division by zero, R{regA} set to 0")
-            self.registers[regA] = 0
-        else:
-            if self.debug:
-                logger.debug(f"  DIV: R{regA} = {self.registers[regA]} // R{regB}({self.registers[regB]})")
-            self.registers[regA] = self.registers[regA] // self.registers[regB]
-    
-    def mov(self, regA: int, regB: int, imm: int) -> None:
-        if self.debug:
-            logger.debug(f"  MOV: R{regA} <- R{regB}({self.registers[regB]})")
-        self.registers[regA] = self.registers[regB]
-    
-    def halt(self, regA: int, regB: int, imm: int) -> None:
-        if self.debug:
-            logger.debug("  HALT")
-        self.running = False
-    
-    # 通信命令
-    def send(self, regA: int, regB: int, imm: int) -> None:
-        if imm >= self.dim:
-            if self.debug:
-                logger.debug(f"  SEND: Invalid dimension {imm}")
-            return
-        target: int = self.node_id ^ (1 << imm)  if hasattr(self, "node_id") else 0
-        value: int = self.registers[regA]
-        if self.debug:
-            logger.debug(f"  SEND: Sending R{regA} value {value} to Node {target} (dim {imm})")
-        self.network.deliver_message(target, self.node_id, value)
-    
-    def recv(self, regA: int, regB: int, imm: int) -> None:
-        if imm >= self.dim:
-            if self.debug:
-                logger.debug(f"  RECV: Invalid dimension {imm}")
-            self.registers[regA] = 0
-            return
-        source: int = self.node_id ^ (1 << imm)
-        try:
-            # キューから先頭のメッセージを取得
-            while True:
-                src, val = self.mailbox.get_nowait()
-                if src == source:
-                    self.registers[regA] = val
-                    if self.debug:
-                        logger.debug(f"  RECV: Received {val} from Node {source} into R{regA}")
-                    return
-                else:
-                    # 該当しない場合は再度キューへ
-                    self.mailbox.put((src, val))
-                    break
-        except queue.Empty:
-            pass
-        if self.debug:
-            logger.debug(f"  RECV: No message from Node {source}; R{regA} set to 0")
-        self.registers[regA] = 0
-
-    # 分岐命令
-    def jmp(self, regA: int, regB: int, imm: int) -> None:
-        if self.debug:
-            logger.debug(f"  JMP: Jumping to address {imm}")
-        self.pc = imm
-    
-    def jz(self, regA: int, regB: int, imm: int) -> None:
-        if self.registers[regA] == 0:
-            if self.debug:
-                logger.debug(f"  JZ: R{regA} is zero; jumping to {imm}")
-            self.pc = imm
-        else:
-            if self.debug:
-                logger.debug(f"  JZ: R{regA} is nonzero; no jump")
-    
-    def jnz(self, regA: int, regB: int, imm: int) -> None:
-        if self.registers[regA] != 0:
-            if self.debug:
-                logger.debug(f"  JNZ: R{regA} is nonzero; jumping to {imm}")
-            self.pc = imm
-        else:
-            if self.debug:
-                logger.debug(f"  JNZ: R{regA} is zero; no jump")
-    
-    # データメモリ操作命令
-    def loadm(self, regA: int, regB: int, imm: int) -> None:
-        if imm < 0 or imm >= len(self.data_memory):
-            logger.error("LOADM: Memory address out of bounds")
-            self.running = False
-            return
-        if self.debug:
-            logger.debug(f"  LOADM: R{regA} <- MEM[{imm}]")
-        self.registers[regA] = self.data_memory[imm]
-    
-    def storem(self, regA: int, regB: int, imm: int) -> None:
-        if imm < 0 or imm >= len(self.data_memory):
-            logger.error("STOREM: Memory address out of bounds")
-            self.running = False
-            return
-        if self.debug:
-            logger.debug(f"  STOREM: MEM[{imm}] <- R{regA} ({self.registers[regA]})")
-        self.data_memory[imm] = self.registers[regA]
-    
-    # 比較命令
-    def cmp(self, regA: int, regB: int, imm: int) -> None:
-        if self.debug:
-            logger.debug(f"  CMP: Comparing R{regA} ({self.registers[regA]}) and R{regB} ({self.registers[regB]})")
-        self.flag = self.registers[regA] - self.registers[regB]
-
-# ======================================================
-# HypercubeNode クラス（VirtualCPU を継承、並列実行対応）
-# ======================================================
-class HypercubeNode(VirtualCPU):
-    def __init__(self, node_id: int, program: List[int], dim: int, debug: bool = False) -> None:
-        super().__init__(program, debug)
-        self.node_id: int = node_id
-        self.dim: int = dim
-        # mailbox を queue.Queue によるスレッドセーフな実装に変更
-        self.mailbox: "queue.Queue[Tuple[int,int]]" = queue.Queue()
-        self.dispatch[8] = self.send
-        self.dispatch[9] = self.recv
-        if self.debug:
-            logger.debug(f"Node {self.node_id} initialized in {self.dim}D hypercube.")
-
-# ======================================================
-# HypercubeCPU クラス（複数ノードの並列シミュレーション）
-# ======================================================
-class HypercubeCPU:
-    def __init__(self, programs: List[List[int]], dim: int, debug: bool = False, visualize: bool = False) -> None:
-        self.dim: int = dim
-        self.n_nodes: int = 2 ** dim
-        self.debug: bool = debug
-        self.visualize: bool = visualize
-        if len(programs) == 1:
-            programs = programs * self.n_nodes
-        elif len(programs) != self.n_nodes:
-            raise ValueError(f"Invalid number of programs: expected {self.n_nodes}, got {len(programs)}")
-        self.nodes: List[HypercubeNode] = [
-            HypercubeNode(node_id=i, program=programs[i], dim=dim, debug=debug)
-            for i in range(self.n_nodes)
-        ]
-        for node in self.nodes:
-            node.network = self
-        self.node_threads: List[threading.Thread] = []
-    
-    def deliver_message(self, target_id: int, src_id: int, value: int) -> None:
-        self.nodes[target_id].mailbox.put((src_id, value))
-        if self.debug:
-            logger.debug(f"[Network] Node {src_id} -> Node {target_id}: {value}")
-    
-    def run(self) -> None:
-        for node in self.nodes:
-            t = threading.Thread(target=node.run, name=f"NodeThread-{node.node_id}")
-            t.start()
-            self.node_threads.append(t)
-        while any(t.is_alive() for t in self.node_threads):
-            time.sleep(0.1)
-        for t in self.node_threads:
-            t.join()
-    
-    def dump_registers(self) -> None:
-        output = "\n--- Final Registers ---\n"
-        for node in self.nodes:
-            output += f"Node {node.node_id}: {node.registers}\n"
-        output += "\n--- Data Memory (first 16 addresses) ---\n" + str(self.nodes[0].data_memory[:16]) + "\n"
-        output += "\n--- Mailbox Contents ---\n"
-        for node in self.nodes:
-            msgs = list(node.mailbox.queue)
-            output += f"Node {node.node_id}: {msgs}\n"
-        print(output)
-
-# ======================================================
-# Qt 用 HypercubeVisualizer（matplotlib 埋め込み）
-# ======================================================
-class QtHypercubeVisualizer:
-    def __init__(self, cpu: HypercubeCPU, figure: Figure) -> None:
-        self.cpu = cpu
-        self.figure = figure
-        self.ax = self.figure.add_subplot(111)
-        self.graph = nx.Graph()
-        self.pos = {}
-    def init_plot(self) -> None:
-        for i in range(self.cpu.n_nodes):
-            self.graph.add_node(i)
-        edges = generate_hypercube_edges(self.cpu.dim)
-        for (i, j) in edges:
-            self.graph.add_edge(i, j)
-        self.pos = recursive_hypercube_layout(self.cpu.dim)
-    def update(self) -> None:
-        self.ax.clear()
-        colors = []
-        labels = {}
-        for node in self.cpu.nodes:
-            colors.append("green" if node.running else "red")
-            labels[node.node_id] = f"ID:{node.node_id}\nR0:{node.registers[0]}\nPC:{node.pc}"
-        nx.draw(self.graph, pos=self.pos, ax=self.ax, with_labels=False, node_color=colors, node_size=800)
-        for node, (x, y) in self.pos.items():
-            self.ax.text(x, y, labels[node],
-                         horizontalalignment='center',
-                         verticalalignment='center',
-                         fontsize=10, fontweight='bold', color="white")
-        self.ax.set_title("Advanced Parallel Hypercube CPU Simulation")
-        self.figure.canvas.draw()
-
-# ======================================================
-# SimulationThread（QThread によるシミュレーション実行）
-# ======================================================
-class SimulationThread(QtCore.QThread):
-    simulation_finished = QtCore.pyqtSignal()
-    def __init__(self, cpu: HypercubeCPU) -> None:
-        super().__init__()
-        self.cpu = cpu
-    def run(self) -> None:
-        self.cpu.run()
-        self.simulation_finished.emit()
-
-# ======================================================
-# コンパイラ（アセンブラ）部
-# ======================================================
-MNEMONICS: Dict[str, int] = {
-    "NOP": 0,
-    "LOAD": 1,
-    "ADD": 2,
-    "SUB": 3,
-    "MUL": 4,
-    "DIV": 5,
-    "MOV": 6,
-    "HALT": 7,
-    "SEND": 8,
-    "RECV": 9,
-    "JMP": 10,
-    "JZ": 11,
-    "LOADM": 12,
-    "STOREM": 13,
-    "CMP": 14,
-    "JNZ": 15,
+_OPERAND_SHAPES: Dict[Opcode, Tuple[str, ...]] = {
+    Opcode.NOP: tuple(),
+    Opcode.HALT: tuple(),
+    Opcode.LOAD: ("reg", "imm"),
+    Opcode.ADD: ("reg", "reg"),
+    Opcode.SUB: ("reg", "reg"),
+    Opcode.MUL: ("reg", "reg"),
+    Opcode.DIV: ("reg", "reg"),
+    Opcode.MOV: ("reg", "reg"),
+    Opcode.SEND: ("reg", "dim"),
+    Opcode.RECV: ("reg", "dim"),
+    Opcode.JMP: ("addr",),
+    Opcode.JZ: ("reg", "addr"),
+    Opcode.JNZ: ("reg", "addr"),
+    Opcode.LOADM: ("reg", "imm"),
+    Opcode.STOREM: ("reg", "imm"),
+    Opcode.CMP: ("reg", "reg"),
 }
 
-def parse_register(token: str) -> int:
-    token = token.strip().upper()
-    if token.startswith("R"):
-        return int(token[1:])
-    else:
-        raise ValueError(f"Invalid register token: {token}")
 
-def parse_immediate(token: str) -> int:
-    token = token.strip()
-    if token.startswith("0x") or token.startswith("0X"):
-        return int(token, 16)
-    else:
-        return int(token)
+@dataclass(frozen=True)
+class _InstructionSpec:
+    opcode: Opcode
+    operands: Tuple[str, ...]
+    line_number: int
+    raw_line: str
 
-def assemble_line(line: str) -> Optional[int]:
-    line = line.split(";", 1)[0].strip()
-    if not line:
-        return None
-    if ":" in line:
-        parts = line.split(":", 1)
-        line = parts[1].strip()
-        if not line:
-            return None
-    tokens = line.split()
-    mnemonic = tokens[0].upper()
-    if mnemonic not in MNEMONICS:
-        raise ValueError(f"Unknown mnemonic: {mnemonic}")
-    opcode = MNEMONICS[mnemonic]
-    # 命令ごとにオペランドの数を判定
-    if mnemonic in ["NOP", "HALT"]:
-        return encode_instruction(opcode)
-    elif mnemonic == "LOAD":
-        if len(tokens) < 3:
-            raise ValueError("LOAD requires 2 operands")
-        reg = parse_register(tokens[1].replace(",", ""))
-        imm = parse_immediate(tokens[2].replace(",", ""))
-        return encode_instruction(opcode, regA=reg, imm=imm)
-    elif mnemonic in ["ADD", "SUB", "MUL", "DIV", "MOV"]:
-        if len(tokens) < 3:
-            raise ValueError(f"{mnemonic} requires 2 operands")
-        regA = parse_register(tokens[1].replace(",", ""))
-        regB = parse_register(tokens[2].replace(",", ""))
-        return encode_instruction(opcode, regA=regA, regB=regB)
-    elif mnemonic in ["SEND", "RECV"]:
-        if len(tokens) < 3:
-            raise ValueError(f"{mnemonic} requires 2 operands")
-        reg = parse_register(tokens[1].replace(",", ""))
-        imm = parse_immediate(tokens[2].replace(",", ""))
-        return encode_instruction(opcode, regA=reg, imm=imm)
-    elif mnemonic in ["JMP", "JZ", "JNZ"]:
-        if len(tokens) < 3 and mnemonic in ["JZ", "JNZ"]:
-            raise ValueError(f"{mnemonic} requires 2 operands")
-        if mnemonic == "JMP":
-            # JMP: 1 operand (immediate)
-            imm = parse_immediate(tokens[1].replace(",", ""))
-            return encode_instruction(opcode, imm=imm)
-        else:
-            # JZ, JNZ: 2 operands (register, immediate)
-            reg = parse_register(tokens[1].replace(",", ""))
-            imm = parse_immediate(tokens[2].replace(",", ""))
-            return encode_instruction(opcode, regA=reg, imm=imm)
-    elif mnemonic in ["LOADM", "STOREM"]:
-        if len(tokens) < 3:
-            raise ValueError(f"{mnemonic} requires 2 operands")
-        reg = parse_register(tokens[1].replace(",", ""))
-        imm = parse_immediate(tokens[2].replace(",", ""))
-        return encode_instruction(opcode, regA=reg, imm=imm)
-    elif mnemonic == "CMP":
-        if len(tokens) < 3:
-            raise ValueError("CMP requires 2 operands")
-        regA = parse_register(tokens[1].replace(",", ""))
-        regB = parse_register(tokens[2].replace(",", ""))
-        return encode_instruction(opcode, regA=regA, regB=regB)
-    else:
-        raise ValueError(f"Unhandled mnemonic: {mnemonic}")
+
+class Assembler:
+    """A deterministic assembler for the hypercube CPU instruction set."""
+
+    def __init__(self) -> None:
+        self.logger = logging.getLogger(__name__ + ".Assembler")
+
+    def assemble(self, source: str) -> List[int]:
+        instructions, labels = self._parse_source(source.splitlines())
+        if len(instructions) > MAX_PROGRAM_LENGTH:
+            raise AssemblyError(
+                "Program too long: immediate/address field only supports 64 instructions"
+            )
+        return [self._encode_instruction(spec, labels) for spec in instructions]
+
+    # -- parsing -----------------------------------------------------------------
+
+    def _parse_source(
+        self, lines: Iterable[str]
+    ) -> Tuple[List[_InstructionSpec], Dict[str, int]]:
+        instructions: List[_InstructionSpec] = []
+        labels: Dict[str, int] = {}
+        address = 0
+        for line_number, raw in enumerate(lines, start=1):
+            stripped = raw.split(";", 1)[0].strip()
+            if not stripped:
+                continue
+            label, remainder = self._split_label(stripped)
+            if label is not None:
+                if label in labels:
+                    raise AssemblyError(f"Duplicate label '{label}' on line {line_number}")
+                labels[label] = address
+                if not remainder:
+                    continue
+                stripped = remainder
+            tokens = self._tokenise(stripped)
+            opcode_name = tokens[0].upper()
+            try:
+                opcode = _MNEMONICS[opcode_name]
+            except KeyError as exc:
+                raise AssemblyError(f"Unknown mnemonic '{opcode_name}' on line {line_number}") from exc
+            operand_tokens = tuple(tokens[1:])
+            expected = _OPERAND_SHAPES[opcode]
+            if len(operand_tokens) != len(expected):
+                raise AssemblyError(
+                    f"Opcode {opcode.name} expects {len(expected)} operand(s); "
+                    f"got {len(operand_tokens)} on line {line_number}"
+                )
+            instructions.append(
+                _InstructionSpec(opcode=opcode, operands=operand_tokens, line_number=line_number, raw_line=raw)
+            )
+            address += 1
+        return instructions, labels
+
+    def _split_label(self, line: str) -> Tuple[Optional[str], Optional[str]]:
+        if ":" not in line:
+            return None, None
+        label, remainder = line.split(":", 1)
+        label = label.strip()
+        if not label:
+            raise AssemblyError("Empty label declaration")
+        if not label[0].isalpha() or not all(ch.isalnum() or ch == "_" for ch in label):
+            raise AssemblyError(f"Invalid label name '{label}'")
+        remainder = remainder.strip()
+        return label, remainder or None
+
+    def _tokenise(self, line: str) -> List[str]:
+        tokens = [token for token in line.replace(",", " ").split() if token]
+        if not tokens:
+            raise AssemblyError("Missing instruction after label")
+        return tokens
+
+    # -- encoding ----------------------------------------------------------------
+
+    def _encode_instruction(self, spec: _InstructionSpec, labels: Dict[str, int]) -> int:
+        operand_shape = _OPERAND_SHAPES[spec.opcode]
+        reg_a = 0
+        reg_b = 0
+        immediate = 0
+        for index, (operand_type, token) in enumerate(zip(operand_shape, spec.operands)):
+            if operand_type == "reg":
+                value = self._parse_register(token, spec.line_number)
+                if index == 0:
+                    reg_a = value
+                else:
+                    reg_b = value
+            elif operand_type == "imm":
+                immediate = self._parse_immediate(token, spec.line_number)
+            elif operand_type == "addr":
+                immediate = self._parse_address(token, labels, spec.line_number)
+            elif operand_type == "dim":
+                dim = self._parse_address(token, labels, spec.line_number)
+                if not 0 <= dim < IMMEDIATE_MASK + 1:
+                    raise AssemblyError(
+                        f"Dimension immediate must be in range 0..{IMMEDIATE_MASK} (line {spec.line_number})"
+                    )
+                immediate = dim
+            else:  # pragma: no cover - defensive programming
+                raise AssemblyError(f"Unknown operand type '{operand_type}'")
+        try:
+            return encode_instruction(spec.opcode, reg_a, reg_b, immediate)
+        except SimulationError as exc:
+            raise AssemblyError(f"{exc} (while assembling line {spec.line_number})") from exc
+
+    def _parse_register(self, token: str, line_number: int) -> int:
+        token = token.strip().upper()
+        if not token.startswith("R"):
+            raise AssemblyError(f"Expected register operand on line {line_number}; got '{token}'")
+        try:
+            index = int(token[1:], 10)
+        except ValueError as exc:
+            raise AssemblyError(f"Invalid register '{token}' on line {line_number}") from exc
+        if not 0 <= index < REGISTER_COUNT:
+            raise AssemblyError(
+                f"Register index must be in range 0..{REGISTER_COUNT - 1}; got {index} on line {line_number}"
+            )
+        return index
+
+    def _parse_immediate(self, token: str, line_number: int) -> int:
+        value = self._parse_int_literal(token, line_number)
+        if not -32 <= value <= 31:
+            raise AssemblyError(
+                f"Immediate must fit in signed 6-bit range (-32..31); got {value} on line {line_number}"
+            )
+        return value
+
+    def _parse_address(self, token: str, labels: Dict[str, int], line_number: int) -> int:
+        if token in labels:
+            return labels[token]
+        value = self._parse_int_literal(token, line_number)
+        if not 0 <= value < MAX_PROGRAM_LENGTH:
+            raise AssemblyError(
+                f"Address immediate must be in range 0..{MAX_PROGRAM_LENGTH - 1}; got {value} on line {line_number}"
+            )
+        return value
+
+    def _parse_int_literal(self, token: str, line_number: int) -> int:
+        token = token.strip().replace("_", "")
+        try:
+            if token.lower().startswith("0x"):
+                return int(token, 16)
+            if token.lower().startswith("0b"):
+                return int(token, 2)
+            return int(token, 10)
+        except ValueError as exc:
+            raise AssemblyError(f"Invalid integer literal '{token}' on line {line_number}") from exc
+
 
 def compile_source(source: str) -> List[int]:
-    machine_code: List[int] = []
-    for line in source.splitlines():
-        try:
-            inst = assemble_line(line)
-            if inst is not None:
-                machine_code.append(inst)
-        except Exception as e:
-            logger.error(f"Error assembling line '{line}': {e}")
-            raise
-    return machine_code
+    """Convenience function mirroring the legacy API."""
 
-# ======================================================
-# PyQt5 フロントエンド
-# ======================================================
-class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self) -> None:
-        super().__init__()
-        self.setWindowTitle("Advanced Hypercube CPU Simulator")
-        self.resize(1100, 750)
-        self._setup_ui()
-        self.simulation_thread: Optional[SimulationThread] = None
-        self.cpu: Optional[HypercubeCPU] = None
-        self.visualizer: Optional[QtHypercubeVisualizer] = None
+    return Assembler().assemble(source)
 
-    def _setup_ui(self) -> None:
-        central_widget = QtWidgets.QWidget()
-        self.setCentralWidget(central_widget)
-        
-        # エディタ：アセンブリソース編集用
-        self.editor = QtWidgets.QPlainTextEdit()
-        sample_source = (
-            "; Sample: Increment R0 from 0 to 10 and then HALT\n"
-            "LOAD R0, 0      ; R0 <- 0\n"
-            "LOAD R1, 1      ; R1 <- 1 (constant)\n"
-            "LOAD R2, 10     ; R2 <- 10 (end value)\n"
-            "LOOP:\n"
-            "ADD R0, R1      ; R0 = R0 + 1\n"
-            "MOV R3, R0      ; R3 <- R0\n"
-            "SUB R3, R2      ; R3 = R3 - R2\n"
-            "JZ R3, 8        ; If R3==0 then jump to address 8 (END)\n"
-            "JMP 3           ; Otherwise jump back to address 3 (ADD instruction)\n"
-            "END:\n"
-            "HALT\n"
+
+# ---------------------------------------------------------------------------
+# Execution model
+# ---------------------------------------------------------------------------
+
+
+class VirtualCPU:
+    """A single hypercube CPU node.
+
+    The implementation is single-threaded and deterministic which makes it
+    suitable for unit testing.  Messaging between nodes is delegated to a
+    :class:`HypercubeNetwork` instance supplied during construction.
+    """
+
+    def __init__(
+        self,
+        program: Sequence[int],
+        *,
+        node_id: int = 0,
+        network: Optional["HypercubeNetwork"] = None,
+        data_memory_size: int = 256,
+    ) -> None:
+        self.program: Tuple[int, ...] = tuple(program)
+        self.node_id = node_id
+        self.network = network
+        self.registers: List[int] = [0] * REGISTER_COUNT
+        self.data_memory: List[int] = [0] * data_memory_size
+        self.pc = 0
+        self.running = True
+        self.flag = 0
+        self._dispatch = {
+            Opcode.NOP: self._op_nop,
+            Opcode.LOAD: self._op_load,
+            Opcode.ADD: self._op_add,
+            Opcode.SUB: self._op_sub,
+            Opcode.MUL: self._op_mul,
+            Opcode.DIV: self._op_div,
+            Opcode.MOV: self._op_mov,
+            Opcode.HALT: self._op_halt,
+            Opcode.SEND: self._op_send,
+            Opcode.RECV: self._op_recv,
+            Opcode.JMP: self._op_jmp,
+            Opcode.JZ: self._op_jz,
+            Opcode.LOADM: self._op_loadm,
+            Opcode.STOREM: self._op_storem,
+            Opcode.CMP: self._op_cmp,
+            Opcode.JNZ: self._op_jnz,
+        }
+
+    # -- execution --------------------------------------------------------------
+
+    def step(self) -> bool:
+        """Execute a single instruction.
+
+        Returns ``True`` while the CPU is still running.
+        """
+
+        if not self.running:
+            return False
+        if self.pc >= len(self.program):
+            self.running = False
+            return False
+        decoded = decode_instruction(self.program[self.pc])
+        self.pc += 1
+        handler = self._dispatch.get(decoded.opcode)
+        if handler is None:  # pragma: no cover - exhaustive guard
+            raise SimulationError(f"No handler for opcode {decoded.opcode}")
+        handler(decoded.reg_a, decoded.reg_b, decoded.immediate)
+        return self.running
+
+    def run(self, *, cycle_budget: int = 1024) -> None:
+        """Execute instructions until ``HALT`` or *cycle_budget* is exhausted."""
+
+        cycles = 0
+        while self.running:
+            self.step()
+            cycles += 1
+            if cycles > cycle_budget:
+                raise SimulationError(
+                    f"CPU {self.node_id} exceeded cycle budget of {cycle_budget} steps"
+                )
+
+    # -- instruction implementations -------------------------------------------
+
+    def _op_nop(self, *_: int) -> None:
+        pass
+
+    def _op_load(self, reg_a: int, _reg_b: int, immediate: int) -> None:
+        self.registers[reg_a] = immediate & 0xFFFFFFFF
+
+    def _op_add(self, reg_a: int, reg_b: int, _immediate: int) -> None:
+        self.registers[reg_a] = (self.registers[reg_a] + self.registers[reg_b]) & 0xFFFFFFFF
+
+    def _op_sub(self, reg_a: int, reg_b: int, _immediate: int) -> None:
+        self.registers[reg_a] = (self.registers[reg_a] - self.registers[reg_b]) & 0xFFFFFFFF
+
+    def _op_mul(self, reg_a: int, reg_b: int, _immediate: int) -> None:
+        self.registers[reg_a] = (self.registers[reg_a] * self.registers[reg_b]) & 0xFFFFFFFF
+
+    def _op_div(self, reg_a: int, reg_b: int, _immediate: int) -> None:
+        divisor = self.registers[reg_b]
+        self.registers[reg_a] = 0 if divisor == 0 else self.registers[reg_a] // divisor
+
+    def _op_mov(self, reg_a: int, reg_b: int, _immediate: int) -> None:
+        self.registers[reg_a] = self.registers[reg_b]
+
+    def _op_halt(self, *_: int) -> None:
+        self.running = False
+
+    def _op_send(self, reg_a: int, _reg_b: int, dimension: int) -> None:
+        if self.network is None:
+            raise SimulationError("SEND instruction requires an attached network")
+        target = self.network.route(self.node_id, dimension)
+        value = self.registers[reg_a]
+        self.network.deliver(self.node_id, target, value)
+
+    def _op_recv(self, reg_a: int, _reg_b: int, dimension: int) -> None:
+        if self.network is None:
+            raise SimulationError("RECV instruction requires an attached network")
+        source = self.network.route(self.node_id, dimension)
+        message = self.network.receive(self.node_id, source)
+        self.registers[reg_a] = 0 if message is None else message
+
+    def _op_jmp(self, _reg_a: int, _reg_b: int, address: int) -> None:
+        self.pc = address
+
+    def _op_jz(self, reg_a: int, _reg_b: int, address: int) -> None:
+        if self.registers[reg_a] == 0:
+            self.pc = address
+
+    def _op_jnz(self, reg_a: int, _reg_b: int, address: int) -> None:
+        if self.registers[reg_a] != 0:
+            self.pc = address
+
+    def _op_loadm(self, reg_a: int, _reg_b: int, address: int) -> None:
+        if not 0 <= address < len(self.data_memory):
+            raise SimulationError(f"LOADM address out of bounds: {address}")
+        self.registers[reg_a] = self.data_memory[address]
+
+    def _op_storem(self, reg_a: int, _reg_b: int, address: int) -> None:
+        if not 0 <= address < len(self.data_memory):
+            raise SimulationError(f"STOREM address out of bounds: {address}")
+        self.data_memory[address] = self.registers[reg_a]
+
+    def _op_cmp(self, reg_a: int, reg_b: int, _immediate: int) -> None:
+        self.flag = self.registers[reg_a] - self.registers[reg_b]
+
+
+class HypercubeNetwork:
+    """Message passing fabric for a hypercube topology."""
+
+    def __init__(self, dimension: int) -> None:
+        if dimension <= 0:
+            raise ValueError("Hypercube dimension must be positive")
+        self.dimension = dimension
+        self.node_count = 1 << dimension
+        self._mailboxes: List[List[Tuple[int, int]]] = [[] for _ in range(self.node_count)]
+
+    def route(self, node_id: int, dimension: int) -> int:
+        if not 0 <= node_id < self.node_count:
+            raise SimulationError(f"Node id {node_id} outside network range")
+        if not 0 <= dimension < self.dimension:
+            raise SimulationError(
+                f"Dimension {dimension} outside range 0..{self.dimension - 1}"
+            )
+        return node_id ^ (1 << dimension)
+
+    def deliver(self, src: int, dest: int, value: int) -> None:
+        if not 0 <= dest < self.node_count:
+            raise SimulationError(f"Destination node {dest} outside network range")
+        self._mailboxes[dest].append((src, value))
+
+    def receive(self, node_id: int, expected_src: int) -> Optional[int]:
+        mailbox = self._mailboxes[node_id]
+        for index, (src, value) in enumerate(mailbox):
+            if src == expected_src:
+                mailbox.pop(index)
+                return value
+        return None
+
+
+class HypercubeSimulation:
+    """Execute a program on a hypercube of CPUs."""
+
+    def __init__(
+        self,
+        programs: Sequence[Sequence[int]],
+        *,
+        dimension: int,
+        cycle_budget: int = 1024,
+        data_memory_size: int = 256,
+    ) -> None:
+        self.network = HypercubeNetwork(dimension)
+        self.cycle_budget = cycle_budget
+        if len(programs) == 1:
+            program_list = list(programs) * self.network.node_count
+        elif len(programs) == self.network.node_count:
+            program_list = list(programs)
+        else:
+            raise ValueError(
+                "Number of programs must be 1 or equal to the number of nodes in the hypercube"
+            )
+        self.nodes: List[VirtualCPU] = [
+            VirtualCPU(program, node_id=index, network=self.network, data_memory_size=data_memory_size)
+            for index, program in enumerate(program_list)
+        ]
+
+    def run(self) -> None:
+        remaining_cycles = self.cycle_budget
+        while remaining_cycles > 0:
+            active = False
+            for node in self.nodes:
+                if node.running:
+                    node.step()
+                    active = True
+            if not active:
+                return
+            remaining_cycles -= 1
+        raise SimulationError(
+            f"Hypercube simulation exhausted cycle budget of {self.cycle_budget}"
         )
-        self.editor.setPlainText(sample_source)
-        
-        # ボタン
-        self.compile_run_button = QtWidgets.QPushButton("Compile && Run")
-        self.compile_run_button.clicked.connect(self.on_compile_and_run)
-        
-        # 可視化キャンバス（matplotlib 埋め込み）
-        self.figure = Figure(figsize=(6, 5))
-        self.canvas = FigureCanvas(self.figure)
-        
-        # 結果表示エリア
-        self.result_display = QtWidgets.QPlainTextEdit()
-        self.result_display.setReadOnly(True)
-        
-        # レイアウト配置
-        left_layout = QtWidgets.QVBoxLayout()
-        left_layout.addWidget(QtWidgets.QLabel("Assembly Source"))
-        left_layout.addWidget(self.editor)
-        left_layout.addWidget(self.compile_run_button)
-        left_layout.addWidget(QtWidgets.QLabel("Simulation Result"))
-        left_layout.addWidget(self.result_display)
-        
-        main_layout = QtWidgets.QHBoxLayout()
-        main_layout.addLayout(left_layout, 3)
-        main_layout.addWidget(self.canvas, 4)
-        
-        central_widget.setLayout(main_layout)
-        
-        # タイマー：可視化更新（250 msec）
-        self.timer = QtCore.QTimer()
-        self.timer.timeout.connect(self.update_visualization)
-        self.timer.start(250)
 
-    def on_compile_and_run(self) -> None:
-        source = self.editor.toPlainText()
-        try:
-            machine_code = compile_source(source)
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Compile Error", str(e))
-            return
-        # 機械語表示
-        code_text = "\n".join(f"{i:04d}: 0x{code:04X}" for i, code in enumerate(machine_code))
-        self.result_display.setPlainText("Compiled Machine Code:\n" + code_text)
-        # 例：3次元ハイパーキューブ（8ノード）で全ノード共通プログラムを実行
-        self.cpu = HypercubeCPU(programs=[machine_code], dim=3, debug=False, visualize=False)
-        self.visualizer = QtHypercubeVisualizer(self.cpu, self.figure)
-        self.visualizer.init_plot()
-        self.simulation_thread = SimulationThread(self.cpu)
-        self.simulation_thread.simulation_finished.connect(self.on_simulation_finished)
-        self.simulation_thread.start()
 
-    def update_visualization(self) -> None:
-        if self.visualizer is not None and self.cpu is not None:
-            self.visualizer.update()
+def main() -> None:  # pragma: no cover - demonstration utility
+    sample_source = """; Increment R0 until it reaches 4
+    LOAD R0, 0
+    LOAD R1, 1
+LOOP:
+    ADD R0, R1
+    MOV R2, R0
+    SUB R2, R1
+    JZ R2, END
+    JMP LOOP
+END:
+    HALT
+"""
+    assembler = Assembler()
+    program = assembler.assemble(sample_source)
+    sim = HypercubeSimulation([program], dimension=1, cycle_budget=64)
+    sim.run()
+    for node in sim.nodes:
+        print(f"Node {node.node_id}: registers={node.registers} pc={node.pc}")
 
-    def on_simulation_finished(self) -> None:
-        if self.cpu is not None:
-            output = "\n--- Final Registers ---\n"
-            for node in self.cpu.nodes:
-                output += f"Node {node.node_id}: {node.registers}\n"
-            output += "\n--- Data Memory (first 16 addresses) ---\n" + str(self.cpu.nodes[0].data_memory[:16]) + "\n"
-            output += "\n--- Mailbox Contents ---\n"
-            for node in self.cpu.nodes:
-                msgs = list(node.mailbox.queue)
-                output += f"Node {node.node_id}: {msgs}\n"
-            self.result_display.appendPlainText(output)
 
-# ======================================================
-# メイン処理
-# ======================================================
-def main() -> None:
-    set_debug(False)
-    app = QtWidgets.QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec_())
-
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - manual execution helper
     main()
+
