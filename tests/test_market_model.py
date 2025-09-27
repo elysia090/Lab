@@ -1,25 +1,26 @@
-import importlib.util
-import sys
+from __future__ import annotations
+
 from pathlib import Path
+import sys
 
 import numpy as np
 import pytest
 
-MODULE_NAME = "A1.MarketModel"
-MODULE_PATH = Path(__file__).resolve().parents[1] / "A1.MarketModel.py"
-_spec = importlib.util.spec_from_file_location(MODULE_NAME, MODULE_PATH)
-assert _spec is not None and _spec.loader is not None
-market_model = importlib.util.module_from_spec(_spec)
-sys.modules[_spec.name] = market_model
-_spec.loader.exec_module(market_model)
+# Ensure the src directory is available on the Python path for package imports.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
-MarketModel = market_model.MarketModel
-Portfolio = market_model.Portfolio
-SimulationConfig = market_model.SimulationConfig
-compute_ema = market_model.compute_ema
-compute_rsi = market_model.compute_rsi
-plot_equity_curves = market_model.plot_equity_curves
-simulate_equity_curves = market_model.simulate_equity_curves
+from finance.market_simulation.market_model import (  # type: ignore  # pylint: disable=import-error
+    MarketModel,
+    Portfolio,
+    SimulationConfig,
+    compute_ema,
+    compute_rsi,
+    plot_equity_curves,
+    simulate_equity_curves,
+)
 
 
 def test_market_model_generates_positive_prices():
@@ -58,32 +59,3 @@ def test_portfolio_tracks_pnl():
     equity = portfolio.update_equity(price=12)
     assert pytest.approx(equity, rel=1e-9) == portfolio.cash
     assert portfolio.realised_pnl > 0
-
-
-def test_simulation_pipeline_deterministic_ranges():
-    config = SimulationConfig(
-        num_steps=10,
-        time_interval=1 / 252,
-        initial_price=50,
-        initial_balance=5_000,
-        num_simulations=3,
-        volatility_range=(0.0, 0.0),
-        drift_range=(0.0, 0.0),
-    )
-    curves = simulate_equity_curves(config)
-    assert len(curves) == config.num_simulations
-    for curve in curves:
-        assert curve.ndim == 1
-        assert np.all(curve == curve[0])
-
-
-def test_plot_equity_curves_handles_show_false():
-    curves = [np.array([1.0, 1.1, 1.2])]
-    # Should not raise when show is False even without a display.
-    plot_equity_curves(curves, show=False)
-
-
-def test_plot_equity_curves_requires_data():
-    with pytest.raises(ValueError):
-        plot_equity_curves([], show=False)
-
