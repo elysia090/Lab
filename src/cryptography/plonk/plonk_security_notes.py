@@ -3,20 +3,25 @@
 # input validation, secure JSON processing, sanitizing file paths,
 # missing argument validation, improved logging, better side-channel protection
 
-import math
-import time
-import json
-import threading
 import argparse
+import json
+import logging
+import math
+import threading
+import time
 from dataclasses import dataclass, asdict, field
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union, ClassVar
+
+import secrets
 import numpy as np
 import numpy.typing as npt
 from tqdm import tqdm
 
 # Version metadata
 __version__ = "1.0.0"
+__author__ = "SymPLONK Research Team"
 
 
 # JSON schema definitions
@@ -44,6 +49,22 @@ SECRET_SCHEMA = {
     "required": ["coefficients"]
 }
 
+# Logging configuration
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+# Base directory for safe file operations
+BASE_DIR = Path.cwd().resolve()
+
+# Secure RNG for blinding
+SECURE_RNG = secrets.SystemRandom()
+
+
 # GPU acceleration setup
 try:
     import cupy as cp
@@ -68,6 +89,158 @@ class Constants:
     KNOWN_PRIMITIVE_ROOTS = {
         (1 << 256) - (1 << 32) - 977: 7  # secp256k1 prime
     }
+
+
+def _secure_random_uniform() -> float:
+    """Return a cryptographically secure uniform random float in (0, 1)."""
+
+    # Avoid returning exactly 0 to keep Box-Muller transform stable.
+    value = 0.0
+    while value == 0.0:
+        value = SECURE_RNG.random()
+    return value
+
+
+def _secure_random_gaussian(mean: float = 0.0, std: float = 1.0) -> float:
+    """Generate a cryptographically secure Gaussian sample via Box-Muller."""
+
+    u1 = _secure_random_uniform()
+    u2 = SECURE_RNG.random()
+    z0 = math.sqrt(-2.0 * math.log(u1)) * math.cos(2 * math.pi * u2)
+    return mean + std * z0
+
+
+def _secure_complex_vector(length: int) -> np.ndarray:
+    """Generate a complex vector using cryptographically secure randomness."""
+
+    real = np.array([_secure_random_gaussian() for _ in range(length)], dtype=np.float64)
+    imag = np.array([_secure_random_gaussian() for _ in range(length)], dtype=np.float64)
+    return real + 1j * imag
+
+
+def _ensure_safe_path(path_str: str, must_exist: bool = False) -> Path:
+    """Resolve a filesystem path and ensure it stays within the repository."""
+
+    if not path_str:
+        raise ValueError("File path must be provided.")
+
+    path = Path(path_str).expanduser()
+    if not path.is_absolute():
+        path = (BASE_DIR / path).resolve()
+    else:
+        path = path.resolve()
+
+    if not path.is_relative_to(BASE_DIR):
+        raise ValueError(f"Unsafe path detected: {path_str}")
+
+    if must_exist and not path.exists():
+        raise FileNotFoundError(f"Path does not exist: {path}")
+
+    return path
+
+
+def _is_probable_prime(value: int) -> bool:
+    """Deterministic Miller-Rabin for 64-bit integers."""
+
+    if value < 2:
+        return False
+    small_primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
+    if value in small_primes:
+        return True
+    if any(value % p == 0 for p in small_primes):
+        return False
+
+    d = value - 1
+    s = 0
+    while d % 2 == 0:
+        d //= 2
+        s += 1
+
+    # Deterministic bases for testing 64-bit integers
+    for a in [2, 325, 9375, 28178, 450775, 9780504, 1795265022]:
+        if a % value == 0:
+            continue
+        x = pow(a, d, value)
+        if x == 1 or x == value - 1:
+            continue
+        for _ in range(s - 1):
+            x = pow(x, 2, value)
+            if x == value - 1:
+                break
+        else:
+            return False
+    return True
+
+
+def _validate_positive_int(name: str, value: Any, minimum: int = 1) -> int:
+    """Validate an integer argument."""
+
+    if not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer.")
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}.")
+    return value
+
+
+def _validate_config_data(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate configuration JSON data against the schema."""
+
+    if not isinstance(config, dict):
+        raise ValueError("Configuration must be a JSON object.")
+
+    validated: Dict[str, Any] = {}
+    try:
+        validated["n"] = _validate_positive_int("n", config["n"], minimum=2)
+        validated["p"] = _validate_positive_int("p", config["p"], minimum=2)
+    except KeyError as exc:
+        raise ValueError(f"Missing required configuration field: {exc.args[0]}") from exc
+
+    if not _is_probable_prime(validated["p"]):
+        raise ValueError("Prime modulus p must be prime.")
+
+    epsilon = config.get("epsilon", 1e-10)
+    if not isinstance(epsilon, (int, float)) or epsilon <= 0:
+        raise ValueError("epsilon must be a positive number.")
+    validated["epsilon"] = float(epsilon)
+
+    use_gpu = config.get("use_gpu", False)
+    if not isinstance(use_gpu, bool):
+        raise ValueError("use_gpu must be a boolean.")
+    validated["use_gpu"] = use_gpu
+
+    if "flow_time" in config:
+        flow_time = config["flow_time"]
+        if not isinstance(flow_time, (int, float)):
+            raise ValueError("flow_time must be a number.")
+        validated["flow_time"] = float(flow_time)
+
+    return validated
+
+
+def _validate_secret_data(secret_data: Dict[str, Any]) -> List[int]:
+    """Validate secret polynomial coefficients."""
+
+    if not isinstance(secret_data, dict):
+        raise ValueError("Secret file must be a JSON object.")
+    if "coefficients" not in secret_data:
+        raise ValueError("Secret file must contain 'coefficients'.")
+    coefficients = secret_data["coefficients"]
+    if not isinstance(coefficients, list) or not coefficients:
+        raise ValueError("coefficients must be a non-empty list.")
+    if not all(isinstance(c, int) for c in coefficients):
+        raise ValueError("All coefficients must be integers.")
+    return coefficients
+
+
+def _load_json_file(path: Path) -> Dict[str, Any]:
+    """Load JSON from a file with safe defaults."""
+
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            return json.load(file)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in {path}: {exc}") from exc
+
 
 @dataclass
 class Commitment:
@@ -314,16 +487,24 @@ class SymPLONK:
         """
         Initialize with domain size n and prime p.
         All processing is done on the GPU using asynchronous CuPy streams.
-        
+
         Args:
             n: Domain size
             p: Prime modulus
             epsilon: Error tolerance
             use_gpu: Whether to use GPU acceleration if available
         """
-        self.n = n
-        self.p = p
-        self.epsilon = epsilon
+        self.n = _validate_positive_int("n", n, minimum=2)
+        self.p = _validate_positive_int("p", p, minimum=2)
+        if not _is_probable_prime(self.p):
+            raise ValueError("Prime modulus p must be prime.")
+
+        if not isinstance(epsilon, (int, float)) or float(epsilon) <= 0:
+            raise ValueError("epsilon must be a positive number.")
+        self.epsilon = float(epsilon)
+
+        if not isinstance(use_gpu, bool):
+            raise ValueError("use_gpu must be a boolean.")
         self.using_gpu = False
         self.threads_per_block = Constants.MAX_THREADS_PER_BLOCK
         self.metadata = {
@@ -338,24 +519,24 @@ class SymPLONK:
                 _ = cp.array([1, 2, 3])
                 self.xp = cp
                 self.using_gpu = True
-                print("Using GPU acceleration with CuPy (GPU-native mode).")
+                logger.info("Using GPU acceleration with CuPy (GPU-native mode).")
                 device_props = cp.cuda.runtime.getDeviceProperties(0)
                 device_name = device_props['name'].decode('utf-8')
                 device_memory = device_props['totalGlobalMem'] / 1e9
-                print(f"GPU: {device_name}, Memory: {device_memory:.2f} GB")
+                logger.info("GPU: %s, Memory: %.2f GB", device_name, device_memory)
                 self.metadata["gpu"] = {
                     "name": device_name,
                     "memory_gb": device_memory
                 }
                 self.threads_per_block = min(Constants.MAX_THREADS_PER_BLOCK, device_props['maxThreadsPerBlock'])
             except Exception as e:
-                print(f"GPU initialization failed: {e}. Falling back to CPU (NumPy).")
+                logger.warning("GPU initialization failed: %s. Falling back to CPU (NumPy).", e)
                 self.xp = np
                 self.metadata["gpu"] = None
         else:
             self.xp = np
             self.metadata["gpu"] = None
-            print("Using CPU (NumPy).")
+            logger.info("Using CPU (NumPy).")
 
         self._setup_domains()
         self.flow = HamiltonianFlow(self.xp)
@@ -370,7 +551,7 @@ class SymPLONK:
         """Compute finite field domain D_f and Teichmüller lifts on the GPU using asynchronous streams."""
         self.omega_f = FiniteFieldUtils.find_primitive_nth_root(self.n, self.p)
         if self.omega_f is None:
-            print(f"Warning: No primitive {self.n}-th root found in F_{self.p}. Using sequential domain.")
+            logger.warning("No primitive %s-th root found in F_%s. Using sequential domain.", self.n, self.p)
             self.D_f = np.arange(1, self.n + 1, dtype=np.int64)
         else:
             self.D_f = np.empty(self.n, dtype=np.int64)
@@ -474,6 +655,11 @@ class SymPLONK:
         Encode the secret polynomial (with constant term first) as evaluations over the domain.
         Fully GPU-native and asynchronous.
         """
+        if not isinstance(secret, list) or not secret:
+            raise ValueError("Secret must be a non-empty list of coefficients.")
+        if not all(isinstance(coeff, int) for coeff in secret):
+            raise ValueError("All polynomial coefficients must be integers.")
+
         coeffs = np.array([c % self.p for c in secret] + [0]*(self.n - len(secret)), dtype=np.int64)
         if self.using_gpu and self.p > Constants.MODULUS_THRESHOLD:
             poly_vals = self.poly_eval_horner_batch_gpu_mp(self.D_f, coeffs, self.p)
@@ -489,13 +675,22 @@ class SymPLONK:
 
     def blind_evaluations(self, evaluations: Any, r: Optional[complex] = None) -> Tuple[Any, complex, Any]:
         """
-        Apply random blinding for zero-knowledge using GPU arrays.
+        Apply cryptographically secure blinding for zero-knowledge proofs.
         """
+
         xp = self.xp
         if r is None:
-            r = complex(xp.random.normal(), xp.random.normal())
-        mask = xp.random.normal(size=self.n) + 1j * xp.random.normal(size=self.n)
-        mask = mask / xp.linalg.norm(mask)
+            r = complex(_secure_random_gaussian(), _secure_random_gaussian())
+        elif not isinstance(r, complex):
+            raise ValueError("Blinding scalar r must be complex.")
+
+        mask_np = _secure_complex_vector(self.n)
+        norm = float(np.linalg.norm(mask_np))
+        if norm < self.epsilon:
+            raise ValueError("Generated blinding mask has near-zero norm.")
+        mask_np /= norm
+
+        mask = xp.asarray(mask_np) if xp is cp else mask_np.astype(np.complex128)
         return evaluations + r * mask, r, mask
 
     def alice_prove(self, secret: List[int], flow_time: float = math.pi/4) -> Commitment:
@@ -510,8 +705,8 @@ class SymPLONK:
         Returns:
             Commitment object containing the proof
         """
-        print("\n=== Alice (Prover) ===")
-        print(f"Secret (mod {self.p}): {secret}")
+        logger.info("=== Alice (Prover) ===")
+        logger.debug("Secret (mod %s): %s", self.p, secret)
         start_time = time.perf_counter()
 
         encoding = None
@@ -538,7 +733,7 @@ class SymPLONK:
             mask_cpu = mask
 
         end_time = time.perf_counter()
-        print(f"Total proof generation time: {end_time - start_time:.4f} seconds")
+        logger.info("Total proof generation time: %.4f seconds", end_time - start_time)
         
         # Add execution metrics to metadata
         proof_metadata = {
@@ -568,7 +763,7 @@ class SymPLONK:
         Returns:
             Boolean indicating if verification succeeded
         """
-        print("\n=== Bob (Verifier) ===")
+        logger.info("=== Bob (Verifier) ===")
         
         # Handle both Commitment objects and dictionary representations
         if isinstance(commitment, dict):
@@ -581,7 +776,7 @@ class SymPLONK:
         else:
             comm = commitment
             
-        print(f"Flow time: t = {comm.flow_time:.4f}")
+        logger.info("Flow time: t = %.4f", comm.flow_time)
         start_time = time.perf_counter()
 
         xp = self.xp
@@ -597,9 +792,9 @@ class SymPLONK:
         verified = diff_norm < self.epsilon
         
         verification_time = time.perf_counter() - start_time
-        print(f"L2 norm difference: {diff_norm:.8e}")
-        print(f"Verification {'SUCCESS' if verified else 'FAILED'}")
-        print(f"Total verification time: {verification_time:.4f} seconds")
+        logger.info("L2 norm difference: %.8e", diff_norm)
+        logger.info("Verification %s", "SUCCESS" if verified else "FAILED")
+        logger.info("Total verification time: %.4f seconds", verification_time)
         
         # Add verification metrics to metadata
         verification_metadata = {
@@ -615,21 +810,25 @@ class SymPLONK:
     def save_commitment(self, commitment: Commitment, filepath: str) -> None:
         """Save commitment to JSON file."""
         data = commitment.to_dict()
-        with open(filepath, 'w') as f:
+        path = _ensure_safe_path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('w', encoding='utf-8') as f:
             json.dump(data, f, indent=2)
-        print(f"Commitment saved to {filepath}")
-    
+        logger.info("Commitment saved to %s", path)
+
     def load_commitment(self, filepath: str) -> Commitment:
         """Load commitment from JSON file."""
-        with open(filepath, 'r') as f:
-            data = json.load(f)
+        path = _ensure_safe_path(filepath, must_exist=True)
+        data = _load_json_file(path)
         return Commitment.from_dict(data)
-    
+
     def export_metadata(self, filepath: str) -> None:
         """Export current metadata to JSON file."""
-        with open(filepath, 'w') as f:
+        path = _ensure_safe_path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('w', encoding='utf-8') as f:
             json.dump(self.metadata, f, indent=2)
-        print(f"Metadata exported to {filepath}")
+        logger.info("Metadata exported to %s", path)
 
 def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments for SymPLONK."""
@@ -670,95 +869,113 @@ def parse_arguments() -> argparse.Namespace:
 def main() -> None:
     """Main entry point for SymPLONK command-line interface."""
     args = parse_arguments()
-    
-    if args.command == "version":
-        print(f"SymPLONK version {__version__}")
-        print(f"Author: {__author__}")
-        return
-        
-    # Setup command
-    if args.command == "setup":
-        config = {}
-        if args.config:
-            with open(args.config, 'r') as f:
-                config = json.load(f)
-        
-        n = args.n if args.n else config.get("n")
-        p = args.p if args.p else config.get("p")
-        epsilon = args.epsilon if args.epsilon else config.get("epsilon", 1e-10)
-        use_gpu = args.use_gpu if args.use_gpu else config.get("use_gpu", False)
-        
-        if not n or not p:
-            print("Error: Domain size (n) and prime modulus (p) must be provided.")
+
+    try:
+        if args.command == "version":
+            logger.info("SymPLONK version %s", __version__)
+            logger.info("Author: %s", __author__)
             return
-            
-        symplonk = SymPLONK(n=n, p=p, epsilon=epsilon, use_gpu=use_gpu)
-        
-        if args.export_config:
-            with open(args.export_config, 'w') as f:
-                json.dump({
-                    "n": n,
-                    "p": p,
-                    "epsilon": epsilon,
-                    "use_gpu": use_gpu
-                }, f, indent=2)
-            print(f"Configuration exported to {args.export_config}")
-        
-        return
-        
-    # Prove command
-    elif args.command == "prove":
-        with open(args.config, 'r') as f:
-            config = json.load(f)
-            
-        with open(args.secret, 'r') as f:
-            secret_data = json.load(f)
-            
-        symplonk = SymPLONK(
-            n=config["n"],
-            p=config["p"],
-            epsilon=config.get("epsilon", 1e-10),
-            use_gpu=config.get("use_gpu", False)
-        )
-        
-        flow_time = args.flow_time if args.flow_time else config.get("flow_time", math.pi/4)
-        commitment = symplonk.alice_prove(secret_data["coefficients"], flow_time)
-        symplonk.save_commitment(commitment, args.commitment)
-        
-        return
-        
-    # Verify command
-    elif args.command == "verify":
-        with open(args.config, 'r') as f:
-            config = json.load(f)
-            
-        symplonk = SymPLONK(
-            n=config["n"],
-            p=config["p"],
-            epsilon=config.get("epsilon", 1e-10),
-            use_gpu=config.get("use_gpu", False)
-        )
-        
-        commitment = symplonk.load_commitment(args.commitment)
-        verified = symplonk.bob_verify(commitment)
-        
-        return verified
-        
-    # Export metadata command
-    elif args.command == "metadata":
-        with open(args.config, 'r') as f:
-            config = json.load(f)
-            
-        symplonk = SymPLONK(
-            n=config["n"],
-            p=config["p"],
-            epsilon=config.get("epsilon", 1e-10),
-            use_gpu=config.get("use_gpu", False)
-        )
-        
-        symplonk.export_metadata(args.output)
-        
-        return
+
+        if args.command == "setup":
+            config_data: Dict[str, Any] = {}
+            if args.config:
+                config_path = _ensure_safe_path(args.config, must_exist=True)
+                config_data = _validate_config_data(_load_json_file(config_path))
+
+            merged_config = dict(config_data)
+            if args.n is not None:
+                merged_config["n"] = _validate_positive_int("n", args.n, minimum=2)
+            if args.p is not None:
+                merged_config["p"] = _validate_positive_int("p", args.p, minimum=2)
+            if args.epsilon is not None:
+                if args.epsilon <= 0:
+                    raise ValueError("epsilon must be positive.")
+                merged_config["epsilon"] = float(args.epsilon)
+            if args.use_gpu:
+                merged_config["use_gpu"] = True
+
+            validated = _validate_config_data(merged_config)
+            symplonk = SymPLONK(
+                n=validated["n"],
+                p=validated["p"],
+                epsilon=validated["epsilon"],
+                use_gpu=validated["use_gpu"],
+            )
+
+            if args.export_config:
+                export_path = _ensure_safe_path(args.export_config)
+                export_path.parent.mkdir(parents=True, exist_ok=True)
+                export_payload = {
+                    "n": validated["n"],
+                    "p": validated["p"],
+                    "epsilon": validated["epsilon"],
+                    "use_gpu": validated["use_gpu"],
+                }
+                if "flow_time" in validated:
+                    export_payload["flow_time"] = validated["flow_time"]
+                with export_path.open("w", encoding="utf-8") as f:
+                    json.dump(export_payload, f, indent=2)
+                logger.info("Configuration exported to %s", export_path)
+
+            # Retain reference for potential future commands
+            _ = symplonk
+            return
+
+        if args.command == "prove":
+            config_path = _ensure_safe_path(args.config, must_exist=True)
+            config = _validate_config_data(_load_json_file(config_path))
+
+            secret_path = _ensure_safe_path(args.secret, must_exist=True)
+            secret_coeffs = _validate_secret_data(_load_json_file(secret_path))
+
+            symplonk = SymPLONK(
+                n=config["n"],
+                p=config["p"],
+                epsilon=config.get("epsilon", 1e-10),
+                use_gpu=config.get("use_gpu", False),
+            )
+
+            flow_time = float(args.flow_time if args.flow_time is not None else config.get("flow_time", math.pi / 4))
+            if flow_time <= 0:
+                raise ValueError("flow_time must be positive.")
+            commitment = symplonk.alice_prove(secret_coeffs, flow_time)
+            symplonk.save_commitment(commitment, args.commitment)
+            return
+
+        if args.command == "verify":
+            config_path = _ensure_safe_path(args.config, must_exist=True)
+            config = _validate_config_data(_load_json_file(config_path))
+
+            symplonk = SymPLONK(
+                n=config["n"],
+                p=config["p"],
+                epsilon=config.get("epsilon", 1e-10),
+                use_gpu=config.get("use_gpu", False),
+            )
+
+            commitment = symplonk.load_commitment(args.commitment)
+            verified = symplonk.bob_verify(commitment)
+            return verified
+
+        if args.command == "metadata":
+            config_path = _ensure_safe_path(args.config, must_exist=True)
+            config = _validate_config_data(_load_json_file(config_path))
+
+            symplonk = SymPLONK(
+                n=config["n"],
+                p=config["p"],
+                epsilon=config.get("epsilon", 1e-10),
+                use_gpu=config.get("use_gpu", False),
+            )
+
+            symplonk.export_metadata(args.output)
+            return
+
+        raise ValueError("No command provided. Use --help for usage information.")
+
+    except Exception as exc:
+        logger.error("Command '%s' failed: %s", getattr(args, "command", "unknown"), exc)
+        raise SystemExit(1) from exc
 
 if __name__ == "__main__":
     main()
