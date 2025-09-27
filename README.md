@@ -1,60 +1,34 @@
-# プロジェクト概要
+# Repository Overview
 
-このリポジトリは、金融モデリング、機械学習、コンパイラ最適化、ゼロ知識証明など、多岐にわたる研究用スクリプトをまとめたものです。従来はルートディレクトリに多数のファイルが混在していましたが、用途に合わせて整理した高品質なディレクトリ構成に刷新しました。
+This repository is a grab bag of research prototypes and utilities spanning finance, machine learning, systems, cryptography, quantum computing, and general-purpose tooling.  Each subpackage under `src/` is self-contained and can be imported once the project root is added to `PYTHONPATH`.
 
-## ディレクトリ構成
+## Directory Structure
 
 ```
 src/
-├── finance/
-│   ├── analytics/
-│   ├── corporate_finance/
-│   ├── econometrics/
-│   └── market_simulation/
-├── machine_learning/
-│   ├── classical/
-│   ├── deep_learning/
-│   │   ├── experiments/
-│   │   ├── generative/
-│   │   ├── graph/
-│   │   ├── quantization/
-│   │   └── vision/
-│   ├── nlp/
-│   ├── state_space/
-│   └── time_series/
-├── attention/
-├── compiler_and_systems/
-│   ├── gpu_acceleration/
-│   ├── llvm_ptx/
-│   ├── native/
-│   └── simulation/
-├── cryptography/
-│   └── plonk/
-├── quantum/
-└── utilities/
-    └── fractals/
+├── finance/                 # Pricing analytics, econometrics pipelines, corporate finance models, and market simulations
+├── machine_learning/        # Classical ML experiments, state-space models, NLP pipelines, and time-series demos
+├── attention/               # Implementations of custom and fast attention mechanisms
+├── compiler_and_systems/    # LLVM→PTX tooling, GPU acceleration utilities, native stubs, and virtual CPU experiments
+├── cryptography/            # PLONK-inspired zero-knowledge proof simulations and helpers
+├── quantum/                 # Minimal quantum gate simulation utilities
+└── utilities/               # Miscellaneous helpers including fractal generators and network/game theory tools
 ```
 
-各ディレクトリには `__init__.py` を配置して Python パッケージとして利用できるようにしています。主な分類は以下の通りです。
+Every directory contains an `__init__.py` so modules can be imported directly (for example, `from finance.market_simulation import market_model`).  The repository is intentionally broad; there is no single entry point, so consult individual modules for details and example usage.
 
-- **finance/**: 市場シミュレーション、経済計量モデル、企業価値評価、指標分析など金融分野のスクリプト。
-- **machine_learning/**: 古典的な機械学習、自然言語処理、カルマンフィルタや時系列分析、各種ディープラーニング実験をカテゴリ別に格納。
-- **attention/**: 高速注意機構や SERA/SLUM など注意系研究の実装。
-- **compiler_and_systems/**: LLVM→PTX 変換、PyCUDA 実験、仮想 CPU、ネイティブ資産 (C++/Rust/PowerShell) を含むシステムレベルのツール群。
-- **cryptography/plonk/**: SymPLONK 系のゼロ知識証明実装と検証ユーティリティ。
-- **quantum/**: 量子ゲートシミュレータなどの量子計算関連コード。
-- **utilities/**: クリフォード代数メモ、ラーチアルゴリズム、ネットワーク解析、フラクタル生成などの汎用ツール。
+## Getting Started
 
-## テスト
+1. Ensure you are using Python 3.9+.
+2. Add the project to your module search path, e.g. `export PYTHONPATH="$(pwd)/src:$PYTHONPATH"`.
+3. Import the modules you need inside your own scripts or interactive sessions.
+
+## Testing
+
+The test suite currently covers the market simulation utilities.
 
 ```
 pytest
 ```
 
-現在は `finance.market_simulation.market_model` を対象とした単体テストを提供しています。必要に応じて `src` ディレクトリを `PYTHONPATH` に追加して実行してください。
-
-## 変更履歴
-
-- ルート直下に散在していたスクリプトをカテゴリ別のサブディレクトリに移動。
-- すべてのコードを Python パッケージ構造に整備し、再利用性を向上。
-- `tests/test_market_model.py` を新しいパス構成に合わせて更新。
+Run tests from the repository root after setting `PYTHONPATH` as shown above.
