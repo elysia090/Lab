@@ -23,9 +23,15 @@ Every directory contains an `__init__.py` so modules can be imported directly (f
 2. Add the project to your module search path, e.g. `export PYTHONPATH="$(pwd)/src:$PYTHONPATH"`.
 3. Import the modules you need inside your own scripts or interactive sessions.
 
+## Documentation
+
+Detailed usage notes for the market simulation utilities are available in
+`docs/market_simulation.md`.
+
 ## Testing
 
-The test suite currently covers the market simulation utilities.
+The test suite currently covers the market simulation utilities, including the
+analytics helpers introduced in the latest update.
 
 ```
 pytest
