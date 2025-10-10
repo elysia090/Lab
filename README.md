@@ -1,5 +1,9 @@
 # Repository Overview
 
+[![Pytest](https://img.shields.io/badge/tests-pytest-blue.svg)](#testing)
+[![Coverage](https://img.shields.io/badge/coverage-report-brightgreen.svg)](#testing)
+[![Ruff](https://img.shields.io/badge/lint-ruff-5B4FE9.svg)](#testing)
+
 This repository is a grab bag of research prototypes and utilities spanning finance, machine learning, systems, cryptography, quantum computing, and general-purpose tooling.  Each subpackage under `src/` is self-contained and can be imported once the project root is added to `PYTHONPATH`.
 
 ## Directory Structure

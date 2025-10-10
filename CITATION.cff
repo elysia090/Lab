@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+title: Junks
+authors:
+  - name: Junks Contributors
+abstract: >-
+  Junks aggregates research prototypes and utilities across finance, machine learning,
+  systems, cryptography, quantum computing, and general-purpose tooling. Cite this
+  project when using any of the included modules or experiments in academic or
+  policy-oriented work.
+keywords:
+  - finance
+  - machine learning
+  - systems
+  - cryptography
+  - quantum computing
+  - tooling
+license: Apache-2.0 OR MIT
+message: >-
+  If you use this repository in your work, please cite it using the metadata provided
+  in this file and include a reference to the dual Apache-2.0 / MIT licensing terms.
