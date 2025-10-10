@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, asdict, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union, ClassVar
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import secrets
 import numpy as np
@@ -118,8 +118,11 @@ def _secure_complex_vector(length: int) -> np.ndarray:
     return real + 1j * imag
 
 
-def _ensure_safe_path(path_str: str, must_exist: bool = False) -> Path:
+def _ensure_safe_path(path_str: Union[str, Path], must_exist: bool = False) -> Path:
     """Resolve a filesystem path and ensure it stays within the repository."""
+
+    if not isinstance(path_str, (str, Path)):
+        raise TypeError("File path must be a string or Path-like object.")
 
     if not path_str:
         raise ValueError("File path must be provided.")
@@ -212,7 +215,10 @@ def _validate_config_data(config: Dict[str, Any]) -> Dict[str, Any]:
         flow_time = config["flow_time"]
         if not isinstance(flow_time, (int, float)):
             raise ValueError("flow_time must be a number.")
-        validated["flow_time"] = float(flow_time)
+        flow_time_float = float(flow_time)
+        if flow_time_float <= 0:
+            raise ValueError("flow_time must be positive.")
+        validated["flow_time"] = flow_time_float
 
     return validated
 
@@ -268,24 +274,65 @@ class Commitment:
             else:
                 data[key] = value
         return data
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'Commitment':
         """Create commitment from dictionary."""
-        processed = {}
-        for key, value in data.items():
+        required_fields = {
+            "transformed_evaluations",
+            "flow_time",
+            "secret_original_evaluations",
+            "r",
+            "mask",
+        }
+
+        missing = required_fields.difference(data.keys())
+        if missing:
+            raise ValueError(f"Commitment data missing fields: {sorted(missing)}")
+
+        def _complex_array(value: Any, field_name: str) -> np.ndarray:
             if isinstance(value, dict) and "real" in value and "imag" in value:
-                if isinstance(value["real"], list):
-                    # Convert array values
-                    processed[key] = np.array(value["real"]) + 1j * np.array(value["imag"])
-                else:
-                    # Convert complex scalar
-                    processed[key] = complex(value["real"], value["imag"])
-            elif isinstance(value, list):
-                processed[key] = np.array(value)
-            else:
-                processed[key] = value
-        return cls(**processed)
+                real, imag = value["real"], value["imag"]
+                if isinstance(real, (str, bytes)) or isinstance(imag, (str, bytes)):
+                    raise ValueError(f"{field_name} must contain numeric iterables.")
+                if not isinstance(real, Iterable) or not isinstance(imag, Iterable):
+                    raise ValueError(f"{field_name} must contain iterable real/imag components.")
+                real_arr = np.asarray(real, dtype=np.float64)
+                imag_arr = np.asarray(imag, dtype=np.float64)
+                return real_arr + 1j * imag_arr
+            if isinstance(value, np.ndarray):
+                return value.astype(np.complex128, copy=False)
+            if isinstance(value, list):
+                arr = np.array(value)
+                return arr.astype(np.complex128)
+            raise ValueError(f"Unsupported value for {field_name}.")
+
+        def _complex_scalar(value: Any, field_name: str) -> complex:
+            if isinstance(value, dict) and "real" in value and "imag" in value:
+                return complex(value["real"], value["imag"])
+            if isinstance(value, complex):
+                return value
+            if isinstance(value, (int, float)):
+                return complex(value)
+            raise ValueError(f"Unsupported value for {field_name}.")
+
+        transformed = _complex_array(data["transformed_evaluations"], "transformed_evaluations")
+        original = _complex_array(data["secret_original_evaluations"], "secret_original_evaluations")
+        mask = _complex_array(data["mask"], "mask")
+
+        if transformed.shape != original.shape or transformed.shape != mask.shape:
+            raise ValueError("Commitment arrays must have identical shapes.")
+
+        flow_time = float(data["flow_time"])
+        r_value = _complex_scalar(data["r"], "r")
+
+        return cls(
+            transformed_evaluations=transformed,
+            flow_time=flow_time,
+            secret_original_evaluations=original,
+            r=r_value,
+            mask=mask,
+        )
 
 class FiniteFieldUtils:
     """Optimized finite field utility functions with caching."""
