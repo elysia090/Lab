@@ -1,0 +1,9 @@
+repository:
+  description: "Research prototypes and utilities across finance, machine learning, systems, cryptography, quantum, and tooling."
+  topics:
+    - finance
+    - machine-learning
+    - systems
+    - cryptography
+    - quantum-computing
+    - python-utilities

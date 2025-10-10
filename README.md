@@ -1,3 +1,10 @@
+TL;DR: Multi-domain research prototypes spanning finance, ML, systems, cryptography, quantum, and utilities.
+Quickstart:
+1. Clone the repository and change into the project root.
+2. Use Python 3.9+ in your environment of choice.
+3. Export PYTHONPATH="$(pwd)/src:$PYTHONPATH" to expose the packages.
+4. Run pytest to validate the finance market simulation suite.
+
 # Repository Overview
 
 This repository is a grab bag of research prototypes and utilities spanning finance, machine learning, systems, cryptography, quantum computing, and general-purpose tooling.  Each subpackage under `src/` is self-contained and can be imported once the project root is added to `PYTHONPATH`.
