@@ -1,3 +1,10 @@
+TL;DR: Multi-domain research prototypes spanning finance, ML, systems, cryptography, quantum, and utilities.
+Quickstart:
+1. Clone the repository and change into the project root.
+2. Use Python 3.9+ in your environment of choice.
+3. Export PYTHONPATH="$(pwd)/src:$PYTHONPATH" to expose the packages.
+4. Run pytest to validate the finance market simulation suite.
+
 # Repository Overview
 
 [![Pytest](https://img.shields.io/badge/tests-pytest-blue.svg)](#testing)
