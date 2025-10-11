@@ -10,18 +10,19 @@ class MarketModel:
         self.initial_price = initial_price
         self.volatility_range = volatility_range
         self.drift_range = drift_range
-        self.prices = None
+        self.prices = [initial_price]
 
     def simulate_price(self, num_steps, time_interval):
-        prices = [self.initial_price]
+        if num_steps < 0:
+            raise ValueError("num_steps must be non-negative")
+
         for _ in range(num_steps):
             volatility = np.random.uniform(*self.volatility_range)
             drift = np.random.uniform(*self.drift_range)
             shock = np.random.normal(loc=drift * time_interval, scale=volatility * np.sqrt(time_interval))
-            price = prices[-1] + shock
-            prices.append(price)
-        self.prices = prices
-        return prices
+            price = self.prices[-1] + shock
+            self.prices.append(price)
+        return list(self.prices)
 
 
 class TradeStrategy:
