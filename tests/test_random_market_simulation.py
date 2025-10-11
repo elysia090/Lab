@@ -36,6 +36,33 @@ def test_trade_strategy_returns_two_entry_signals():
         assert isinstance(short_signal, bool)
 
 
+def test_market_model_history_extends_and_enables_indicators(monkeypatch):
+    market_model = MarketModel(initial_price=100)
+    # Use a small moving average period so the indicators kick in quickly.
+    strategy = TradeStrategy(moving_average_period=3)
+    time_interval = 4 / (24 * 60)
+
+    ema_call_lengths: list[int] = []
+    original_calculate_ema = strategy.calculate_ema
+
+    def _tracking_calculate_ema(prices, period):
+        ema_call_lengths.append(len(prices))
+        return original_calculate_ema(prices, period)
+
+    monkeypatch.setattr(strategy, "calculate_ema", _tracking_calculate_ema)
+
+    history_lengths = []
+    for _ in range(3):
+        market_model.simulate_price(1, time_interval)
+        history_lengths.append(len(market_model.prices))
+        strategy.evaluate_entry_signal(market_model.prices)
+
+    assert history_lengths == [2, 3, 4]
+    # The EMA calculations should only start once the history is long enough.
+    assert ema_call_lengths
+    assert ema_call_lengths[0] >= strategy.moving_average_period
+
+
 def test_random_market_loop_runs_with_boolean_signals():
     num_simulations = 3
     num_steps = 10
