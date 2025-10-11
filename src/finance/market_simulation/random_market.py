@@ -1,6 +1,9 @@
 #完全な市場ランダムver
+from __future__ import annotations
+
+from typing import Iterable
+
 import numpy as np
-import matplotlib.pyplot as plt
 
 class MarketModel:
     def __init__(self, initial_price, volatility_range=(0.5, 0.8), drift_range=(0.01, 0.02)):
@@ -29,14 +32,14 @@ class TradeStrategy:
 
     def evaluate_entry_signal(self, prices):
         if len(prices) < self.moving_average_period:
-            return True, False  # データが不足している場合はエントリーシグナルなし
+            return False, False  # データが不足している場合はエントリーシグナルなし
 
         # Calculate RSI
         changes = np.diff(prices)
         gains = changes[changes >= 0]
         losses = -changes[changes < 0]
-        avg_gain = np.mean(gains)
-        avg_loss = np.mean(losses)
+        avg_gain = np.mean(gains) if gains.size else 0
+        avg_loss = np.mean(losses) if losses.size else 0
         rs = avg_gain / avg_loss if avg_loss != 0 else np.inf
         rsi = 100 - (100 / (1 + rs))
 
@@ -54,7 +57,10 @@ class TradeStrategy:
         entry_long_mean_reversion = rsi > self.rsi_overbought and prices[-1] < ma and macd_line[-1] > 0
         entry_short_mean_reversion = rsi < self.rsi_oversold and prices[-1] > ma and macd_line[-1] < 0
 
-        return entry_long_momentum, entry_short_momentum, entry_long_mean_reversion, entry_short_mean_reversion
+        entry_long = entry_long_momentum or entry_long_mean_reversion
+        entry_short = entry_short_momentum or entry_short_mean_reversion
+
+        return entry_long, entry_short
 
     def calculate_ema(self, prices, period):
         ema = np.zeros_like(prices)
@@ -115,44 +121,66 @@ class Portfolio:
             self.balance += interest
             self.equity_curve[-1] += interest
 
-# シミュレーションパラメータ
-initial_price = 140  # 初期価格
-num_steps = 1464  # シミュレーションのステップ数（1年分、4時間足）
-time_interval = 4 / (24 * 60)  # 時間間隔（4時間足を1/24で割る）
-initial_balance = 10000  # 初期残高
-num_simulations = 4  # シミュレーション回数
+def simulate_random_market(
+    *,
+    initial_price: float = 140,
+    num_steps: int = 1464,
+    time_interval: float | None = None,
+    initial_balance: float = 10000,
+    num_simulations: int = 4,
+    strategy_factory: type[TradeStrategy] | None = None,
+    model_factory: type[MarketModel] | None = None,
+    portfolio_factory: type[Portfolio] | None = None,
+) -> list[list[float]]:
+    """Run the random market simulation and return the equity curves."""
 
-equity_curves = []
+    if time_interval is None:
+        time_interval = 4 / (24 * 60)
 
-# シミュレーションの実行
-for _ in range(num_simulations):
-    market_model = MarketModel(initial_price)
-    strategy = TradeStrategy()
-    portfolio = Portfolio(initial_balance)
+    strategy_factory = strategy_factory or TradeStrategy
+    model_factory = model_factory or MarketModel
+    portfolio_factory = portfolio_factory or Portfolio
 
-    for _ in range(num_steps):
-        prices = market_model.simulate_price(1, time_interval)
-        entry_long, entry_short = strategy.evaluate_entry_signal(prices)
-        
-        if entry_long:
-            position_size = 1  # 仮のポジションサイズ
-            portfolio.execute_trade(prices[-1], position_size)
-        elif entry_short:
-            position_size = -1  # 仮のポジションサイズ
-            portfolio.execute_trade(prices[-1], position_size)
-        
-        equity = portfolio.calculate_equity(prices)  # 価格のリストを渡す
-    
-    equity_curves.append(portfolio.equity_curve)
+    equity_curves: list[list[float]] = []
 
-# エクイティカーブの可視化
-plt.figure(figsize=(10, 6))
-for i, equity_curve in enumerate(equity_curves):
-    plt.plot(equity_curve, label=f'Simulation {i+1}')
+    for _ in range(num_simulations):
+        market_model = model_factory(initial_price)
+        strategy = strategy_factory()
+        portfolio = portfolio_factory(initial_balance)
 
-plt.xlabel('Time Steps')
-plt.ylabel('Equity')
-plt.title('Equity Curves of Multiple Simulations')
-plt.legend()
-plt.grid(True)
-plt.show()
+        for _ in range(num_steps):
+            prices = market_model.simulate_price(1, time_interval)
+            entry_long, entry_short = strategy.evaluate_entry_signal(prices)
+
+            if entry_long:
+                position_size = 1  # 仮のポジションサイズ
+                portfolio.execute_trade(prices[-1], position_size)
+            elif entry_short:
+                position_size = -1  # 仮のポジションサイズ
+                portfolio.execute_trade(prices[-1], position_size)
+
+            portfolio.calculate_equity(prices)  # 価格のリストを渡す
+
+        equity_curves.append(list(portfolio.equity_curve))
+
+    return equity_curves
+
+
+def plot_equity_curves(equity_curves: Iterable[Iterable[float]]) -> None:
+    import matplotlib.pyplot as plt
+
+    plt.figure(figsize=(10, 6))
+    for i, equity_curve in enumerate(equity_curves):
+        plt.plot(equity_curve, label=f'Simulation {i+1}')
+
+    plt.xlabel('Time Steps')
+    plt.ylabel('Equity')
+    plt.title('Equity Curves of Multiple Simulations')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+if __name__ == "__main__":
+    curves = simulate_random_market()
+    plot_equity_curves(curves)
