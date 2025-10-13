@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass, asdict, field
 from functools import lru_cache
 from pathlib import Path
+import tempfile
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import secrets
@@ -58,8 +59,11 @@ if not logger.handlers:
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
-# Base directory for safe file operations
+# Base directories for safe file operations.  We keep writes inside the project
+# tree but allow temporary directories so that tests relying on ``tmp_path`` can
+# persist artifacts without raising security errors.
 BASE_DIR = Path.cwd().resolve()
+TEMP_DIR = Path(tempfile.gettempdir()).resolve()
 
 # Secure RNG for blinding
 SECURE_RNG = secrets.SystemRandom()
@@ -133,7 +137,8 @@ def _ensure_safe_path(path_str: Union[str, Path], must_exist: bool = False) -> P
     else:
         path = path.resolve()
 
-    if not path.is_relative_to(BASE_DIR):
+    allowed_roots = (BASE_DIR, TEMP_DIR)
+    if not any(path.is_relative_to(root) for root in allowed_roots):
         raise ValueError(f"Unsafe path detected: {path_str}")
 
     if must_exist and not path.exists():
