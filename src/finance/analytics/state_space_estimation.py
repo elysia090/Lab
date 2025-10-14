@@ -23,8 +23,11 @@ autoregressive parameters, sets up a small Extended Kalman Filter and returns a
 from __future__ import annotations
 
 from dataclasses import dataclass
+import csv
 from pathlib import Path
 from typing import Iterable, Sequence
+
+import math
 
 import numpy as np
 import pandas as pd
@@ -66,7 +69,7 @@ class StateSpaceModel:
 
         return max(int(self.ar_params.size), int(self.ma_params.size), 1)
 
-    def state_transition(self, state: np.ndarray) -> tuple[np.ndarray, float]:
+    def state_transition(self, state: Sequence[float]) -> tuple[list[float], float]:
         """Advance the state by one step.
 
         Parameters
@@ -81,107 +84,75 @@ class StateSpaceModel:
             external control signal is applied.
         """
 
-        if state.ndim != 1:
-            raise ValueError("State vector must be one-dimensional.")
-        if state.size != self.state_dimension:
+        if len(state) != self.state_dimension:
             raise ValueError(
                 "State vector has incorrect dimension: "
-                f"expected {self.state_dimension}, received {state.size}."
+                f"expected {self.state_dimension}, received {len(state)}."
             )
 
-        ar_contribution = 0.0
-        if self.ar_params.size:
-            ar_contribution = float(
-                np.dot(self.ar_params, state[-self.ar_params.size :])
-            )
+        ar_order = len(self.ar_params)
+        ma_order = len(self.ma_params)
 
-        ma_contribution = 0.0
-        if self.ma_params.size:
-            ma_contribution = float(
-                np.dot(self.ma_params, state[-self.ma_params.size :])
-            )
+        ar_window = state[-ar_order:] if ar_order else []
+        ma_window = state[-ma_order:] if ma_order else []
+
+        ar_contribution = float(np.dot(self.ar_params, ar_window)) if ar_window else 0.0
+        ma_contribution = float(np.dot(self.ma_params, ma_window)) if ma_window else 0.0
 
         predicted_observation = ar_contribution + ma_contribution
-        next_state = np.roll(state, -1)
-        next_state[-1] = predicted_observation
+        next_state = list(state[1:]) + [predicted_observation]
         return next_state, predicted_observation
 
 
 class ExtendedKalmanFilter:
-    """Minimal Extended Kalman Filter operating on :class:`StateSpaceModel`."""
+    """Tiny scalar Kalman filter used for the compatibility implementation."""
 
-    def __init__(self, state_space_model: StateSpaceModel, process_noise_cov: np.ndarray) -> None:
+    def __init__(self, state_space_model: StateSpaceModel, process_noise: float) -> None:
         self.state_space_model = state_space_model
-        self.process_noise_cov = np.asarray(process_noise_cov, dtype=float)
-        self.state_estimation: np.ndarray | None = None
-        self.state_covariance: np.ndarray | None = None
+        self.process_noise = float(process_noise)
+        self.state_estimation: list[float] | None = None
+        self.state_variance: float | None = None
 
-    def initialize(self, initial_state: np.ndarray, initial_state_cov: np.ndarray) -> None:
-        state = np.asarray(initial_state, dtype=float)
-        covariance = np.asarray(initial_state_cov, dtype=float)
-
-        if state.ndim != 1:
-            raise ValueError("Initial state must be a one-dimensional vector.")
-        if state.size != self.state_space_model.state_dimension:
+    def initialize(self, initial_state: Sequence[float], initial_variance: float) -> None:
+        state_list = [float(value) for value in initial_state]
+        if len(state_list) != self.state_space_model.state_dimension:
             raise ValueError(
                 "Initial state does not match the state-space model dimension."
             )
-        if covariance.shape != (state.size, state.size):
-            raise ValueError(
-                "Initial covariance matrix must be square with size matching the state vector."
-            )
-        if self.process_noise_cov.shape != covariance.shape:
-            raise ValueError(
-                "Process noise covariance must match the shape of the covariance matrix."
-            )
-
-        self.state_estimation = state.copy()
-        self.state_covariance = covariance.copy()
+        self.state_estimation = state_list
+        self.state_variance = float(initial_variance)
 
     def _ensure_initialized(self) -> None:
-        if self.state_estimation is None or self.state_covariance is None:
+        if self.state_estimation is None or self.state_variance is None:
             raise RuntimeError("Kalman filter has not been initialised yet.")
 
     def predict(self, control_signal: float = 0.0) -> float:
-        """Predict the next observation given an optional control signal."""
-
         self._ensure_initialized()
-        assert self.state_estimation is not None  # for mypy
-        assert self.state_covariance is not None
+        assert self.state_estimation is not None
+        assert self.state_variance is not None
 
-        next_state, predicted_observation = self.state_space_model.state_transition(
+        next_state, predicted = self.state_space_model.state_transition(
             self.state_estimation
         )
         next_state[-1] += float(control_signal)
         self.state_estimation = next_state
-        self.state_covariance = self.state_covariance + self.process_noise_cov
+        self.state_variance = self.state_variance + self.process_noise
         return float(self.state_estimation[-1])
 
     def update(self, observation: float) -> float:
-        """Correct the prediction using the provided observation."""
-
         self._ensure_initialized()
         assert self.state_estimation is not None
-        assert self.state_covariance is not None
+        assert self.state_variance is not None
 
-        measurement_vector = np.zeros_like(self.state_estimation)
-        measurement_vector[-1] = 1.0
-
-        predicted_observation = float(self.state_estimation[-1])
-        innovation = float(observation) - predicted_observation
-
-        s = float(
-            measurement_vector @ self.state_covariance @ measurement_vector.T
-        ) + float(self.process_noise_cov[-1, -1])
-        if s <= 0:
+        predicted = float(self.state_estimation[-1])
+        innovation = float(observation) - predicted
+        innovation_covariance = self.state_variance + self.process_noise
+        if innovation_covariance <= 0:
             raise RuntimeError("Innovation covariance must be positive.")
 
-        kalman_gain = (self.state_covariance @ measurement_vector) / s
-        self.state_estimation = self.state_estimation + kalman_gain * innovation
-        identity = np.eye(self.state_covariance.shape[0])
-        self.state_covariance = (
-            identity - np.outer(kalman_gain, measurement_vector)
-        ) @ self.state_covariance
+        kalman_gain = self.state_variance / innovation_covariance
+        self.state_estimation[-1] = predicted + kalman_gain * innovation
+        self.state_variance = (1.0 - kalman_gain) * self.state_variance
         return float(self.state_estimation[-1])
 
 
@@ -194,43 +165,42 @@ class CWLEM:
     """
 
     def __init__(self, weights: Iterable[float]) -> None:
-        weights_array = np.asarray(list(weights), dtype=float)
-        if weights_array.ndim != 1 or not weights_array.size:
-            raise ValueError("Weights must be a one-dimensional, non-empty iterable.")
+        values = [float(weight) for weight in weights]
+        if not values:
+            raise ValueError("Weights must be a non-empty iterable.")
 
-        total = float(np.sum(weights_array))
-        if not np.isfinite(total) or abs(total) < np.finfo(float).eps:
-            weights_array = np.ones_like(weights_array)
-            total = float(weights_array.size)
+        total = sum(values)
+        if not np.isfinite([total]).all() or abs(total) < 1e-12:
+            values = [1.0 for _ in values]
+            total = float(len(values))
 
-        self.weights = weights_array / total
+        self.weights = [value / total for value in values]
 
     def predict(self, external_factors: Sequence[float]) -> float:
-        factors_array = np.asarray(external_factors, dtype=float)
-        if factors_array.ndim != 1:
-            raise ValueError("External factors must be one-dimensional.")
-        if factors_array.size != self.weights.size:
+        factors = [float(value) for value in external_factors]
+        if len(factors) != len(self.weights):
             raise ValueError(
                 "Number of external factors does not match the number of weights."
             )
-        return float(np.dot(factors_array, self.weights))
+        return float(sum(factor * weight for factor, weight in zip(factors, self.weights)))
 
 
 class PerformanceEvaluator:
     """Collection of evaluation metrics for the forecasting pipeline."""
 
     @staticmethod
-    def calculate_rmsle(predictions: np.ndarray, true_values: np.ndarray) -> float:
-        predictions = np.asarray(predictions, dtype=float)
-        true_values = np.asarray(true_values, dtype=float)
+    def calculate_rmsle(predictions: Sequence[float], true_values: Sequence[float]) -> float:
+        pred = [float(value) for value in predictions]
+        truth = [float(value) for value in true_values]
 
-        if predictions.shape != true_values.shape:
+        if len(pred) != len(truth):
             raise ValueError("Predictions and true values must share the same shape.")
-        if np.any(predictions < 0) or np.any(true_values < 0):
+        if any(value < 0 for value in pred) or any(value < 0 for value in truth):
             raise ValueError("RMSLE is undefined for negative values.")
 
-        log_diff = np.log1p(predictions) - np.log1p(true_values)
-        return float(np.sqrt(np.mean(np.square(log_diff))))
+        log_diff = [math.log1p(p) - math.log1p(t) for p, t in zip(pred, truth)]
+        mean_square = np.mean(np.square(log_diff))
+        return float(np.sqrt(mean_square))
 
 
 @dataclass(frozen=True)
@@ -261,10 +231,24 @@ def load_csv_columns(file_path: str | Path, columns: Sequence[str]) -> pd.DataFr
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
 
-    data = pd.read_csv(path, usecols=list(columns))
-    if data.empty:
+    requested = list(columns)
+    rows: dict[str, list[float]] = {column: [] for column in requested}
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            raise ValueError(f"File is empty or missing requested columns: {path}")
+        missing = [column for column in requested if column not in reader.fieldnames]
+        if missing:
+            raise ValueError(
+                "File is empty or missing requested columns: "
+                f"{path} (missing {', '.join(missing)})"
+            )
+        for row in reader:
+            for column in requested:
+                rows[column].append(float(row[column]))
+    if not any(rows.values()):
         raise ValueError(f"File is empty or missing requested columns: {path}")
-    return data
+    return pd.DataFrame(rows)
 
 
 def _prepare_external_factors(
@@ -321,13 +305,14 @@ def _compute_feature_weights(external_factors: pd.DataFrame) -> np.ndarray:
         raise ValueError("At least one external factor is required.")
 
     correlation = external_factors.corr().abs().fillna(0.0)
-    weights = correlation.mean(axis=0).to_numpy(dtype=float)
+    weights_series = correlation.mean(axis=0)
+    weights = list(weights_series.to_numpy(dtype=float))
 
-    if not np.isfinite(weights).all() or np.allclose(weights, 0):
-        weights = np.ones(external_factors.shape[1], dtype=float)
+    if not np.isfinite(weights).all() or all(abs(value) < 1e-12 for value in weights):
+        weights = [1.0] * len(weights)
 
-    weights /= np.sum(weights)
-    return weights
+    total = sum(weights)
+    return np.asarray([value / total for value in weights])
 
 
 def initialize_models(
@@ -356,12 +341,7 @@ def initialize_models(
     if train_series.empty:
         raise ValueError("Training series must not be empty.")
 
-    model = ARIMA(
-        train_series.to_numpy(dtype=float),
-        order=arima_order,
-        enforce_stationarity=False,
-        enforce_invertibility=False,
-    )
+    model = ARIMA(train_series.to_numpy(dtype=float), order=arima_order)
     results = model.fit()
 
     state_space_model = StateSpaceModel(
@@ -370,13 +350,9 @@ def initialize_models(
     )
 
     state_dimension = state_space_model.state_dimension
-    initial_state = np.zeros(state_dimension, dtype=float)
-    covariance_scale = float(process_noise)
-    initial_state_cov = np.eye(state_dimension, dtype=float) * covariance_scale
-    process_noise_cov = np.eye(state_dimension, dtype=float) * covariance_scale
-
-    kalman_filter = ExtendedKalmanFilter(state_space_model, process_noise_cov)
-    kalman_filter.initialize(initial_state, initial_state_cov)
+    initial_state = [0.0 for _ in range(state_dimension)]
+    kalman_filter = ExtendedKalmanFilter(state_space_model, float(process_noise))
+    kalman_filter.initialize(initial_state, float(process_noise))
 
     weights = _compute_feature_weights(external_factors)
     cwlem = CWLEM(weights)

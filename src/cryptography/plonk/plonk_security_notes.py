@@ -18,7 +18,11 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import secrets
 import numpy as np
 import numpy.typing as npt
-from tqdm import tqdm
+try:  # pragma: no cover - optional dependency
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - degraded progress reporting
+    def tqdm(iterable, **_: object):
+        return iterable
 
 # Version metadata
 __version__ = "1.0.0"
