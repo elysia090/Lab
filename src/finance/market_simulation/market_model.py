@@ -5,8 +5,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
-import matplotlib.pyplot as plt
 import numpy as np
+
+try:  # pragma: no cover - optional dependency in minimal environments
+    import matplotlib.pyplot as plt
+except ImportError:  # pragma: no cover - plotting disabled when matplotlib missing
+    plt = None  # type: ignore[assignment]
 
 __all__ = [
     "SimulationConfig",
@@ -476,6 +480,9 @@ def plot_equity_curves(equity_curves: Sequence[np.ndarray], *, show: bool = True
 
     if not equity_curves:
         raise ValueError("No equity curves supplied for plotting")
+
+    if plt is None:
+        raise RuntimeError("matplotlib is required for plotting equity curves")
 
     figure = plt.figure(figsize=(10, 6))
     for i, equity_curve in enumerate(equity_curves, start=1):

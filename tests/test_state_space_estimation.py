@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
 import pytest
+
+np = pytest.importorskip("numpy")
+pd = pytest.importorskip("pandas")
+pytest.importorskip("statsmodels")
 
 from finance.analytics.state_space_estimation import (
     PerformanceEvaluator,
