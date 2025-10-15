@@ -1,6 +1,6 @@
 Smooth Hypersurfaces in CP^n
 
-	0.	Setup and conventions
+0.	Setup and conventions
 Base field: C. Ambient: CP^n with hyperplane class H = c1(O_CP^n(1)).
 Hypersurface: X = V(f) ⊂ CP^n, smooth, deg f = d. Complex dimension m = n−1.
 Write h := H|_X ∈ Pic(X). Normalization: ∫_X h^m = deg X = d.
