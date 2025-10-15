@@ -1,8 +1,8 @@
 TITLE
-Lossless Hashed Linear: Exact-Equivalence Online Learning via Injective Addressing 
+Lossless Hashed Linear: The Linear Memory Unit (LMU) for Exact-Equivalence Online Learning via Injective Addressing (Plain ASCII, English)
 
 ABSTRACT
-We present an online learning system for sparse-feature linear models that reproduces the reference computation
+We present the Linear Memory Unit (LMU), an online learning system for sparse-feature linear models that reproduces the reference computation
 y_hat = b + sum_j w[id_j] * x[id_j]
 exactly up to IEEE-754 rounding. The design enforces zero-collision addressing for all known features using a two-layer scheme. The base layer is a dense weight array addressed by a minimal perfect hash (MPHF) over a stabilized key set and guarded by exact membership via a parallel key array. The delta layer is a strictly bounded cuckoo-style dictionary with fixed bucket size, fixed relocation cap, constant-size stash, constant-size overflow ring that yields stable references, and a single always-empty emergency slot. The hot path for each (id,val) event performs a fixed, short sequence of operations, independent of the total number of unique features U and the events-per-sample F, giving O(1) per event and O(F) per sample with O(U) memory. Base rebuilds run asynchronously on a snapshot and are published by a single atomic pointer swap; readers never block and never mix generations. We formalize invariants (injection, stability, boundedness, exactness), prove equivalence to the reference model, derive tight operation-count bounds, provide a scheduling inequality that guarantees bounded behavior under adversarial novel-key arrivals, and specify concurrency, persistence, security, and validation sufficient for reproducible deployment.
 
@@ -60,7 +60,7 @@ Keys and IDs: ids may be 64-bit integers or byte strings. Keys_base stores eithe
    PREDICT_STEP(acc, id, val):
    r = LOCATEREF(id)
    w = (r != NULL ? *r : 0.0)
-   acc = KAHAN_ADD(acc, w * val)    // optional; plain add permitted
+   acc = KAHAN_ADD(acc, w * val) // optional; plain add permitted
    return acc
 
 UPDATE_STEP(id, val, e, lr, l2):
@@ -101,13 +101,13 @@ enqueue_async_rebuild()
 
 ASYNC REBUILD (snapshot):
 Ksnap = Keys(base) union Keys(delta)
-h2   = BuildMPHF(Ksnap)
-W2   = new float[|Ksnap|]
-Keys2= new key  [|Ksnap|]
+h2 = BuildMPHF(Ksnap)
+W2 = new float[|Ksnap|]
+Keys2= new key [|Ksnap|]
 for id in Ksnap:
 src = (delta.has(id) ? W_delta[addr(id)] : W_base[h(id)])
-i2  = h2(id)
-W2[i2]    = src
+i2 = h2(id)
+W2[i2] = src
 Keys2[i2] = id
 AtomicSwap(base <- {h2, W2, Keys2}, ver_base++)
 delta.clear(ver_delta++)
@@ -187,9 +187,9 @@ Estimation guidance: measure lambda_max as a high-quantile novel-key rate under 
 
 19. PSEUDOCODE (ASCII)
     struct Base {
-    MPHF     h;
-    float*   W_base;
-    key_t*   Keys_base;
+    MPHF h;
+    float* W_base;
+    key_t* Keys_base;
     uint64_t ver_base;
     uint64_t seed_base;
     };
@@ -197,11 +197,11 @@ Estimation guidance: measure lambda_max as a high-quantile novel-key rate under 
 struct Entry { key_t key; uint32_t widx; };
 struct Bucket { Entry slot[BMAX]; };
 struct Delta {
-Bucket*  buckets;   // sized from C, d, b
-Entry    stash[SMAX];
-Entry    ring[QMAX];
-Entry    emergency;
-float*   W_delta;
+Bucket* buckets; // sized from C, d, b
+Entry stash[SMAX];
+Entry ring[QMAX];
+Entry emergency;
+float* W_delta;
 uint64_t ver_delta;
 uint64_t seed_delta;
 };
