@@ -53,8 +53,8 @@ Step 1. Lift coordinate emission and accumulation
 * Extract the up-to-B_max nonzeros of x_t as index/value pairs (S).
 * EmitLift(S, DelayBuf) deterministically enumerates at most T_phi coordinate ids that must be updated this token. Each id is guaranteed to be listed in id_map; obtain its array position pos via id_map[pos] = id.
 * For each emitted coordinate u:
-  M[pos].value  = KahanAdd(M[pos].value,  contrib(u; S, DelayBuf))
-  M[pos].comp   = updated compensation term
+  M[pos].value = KahanAdd(M[pos].value, contrib(u; S, DelayBuf))
+  M[pos].comp = updated compensation term
 * Rotate DelayBuf in O(1) by moving the head index only.
 
 Step 2. Lift readout
@@ -71,7 +71,7 @@ Option A: SOS cascade (L fixed)
 
 * y_mem = u_t
 * For s = 1..L (fully unrolled in production):
-  tmp   = y_mem
+  tmp = y_mem
   y_mem = b0[s]*tmp + z1[s]
   z1[s] = b1[s]*tmp - a1[s]*y_mem + z2[s]
   z2[s] = b2[s]*tmp - a2[s]*y_mem
@@ -219,9 +219,9 @@ Output: y_t
 
 struct LumState {
 // lift
-DelayBuf[K];          // ring heads only
-double M[m_eff];      // accumulators
-double C[m_eff];      // compensation terms for Kahan
+DelayBuf[K]; // ring heads only
+double M[m_eff]; // accumulators
+double C[m_eff]; // compensation terms for Kahan
 // memory (choose one)
 // SOS
 double b0[L], b1[L], b2[L], a1[L], a2[L];
@@ -230,35 +230,35 @@ double z1[L], z2[L];
 double a[p], b[q+1];
 double y_hist[p], u_hist[q+1];
 // head
-double W[H];          // H = fixed head feature count
+double W[H]; // H = fixed head feature count
 // audit
 hash_t prev_hash;
 }
 
 function Step(L, x_t):
-S = sparse_nonzeros(x_t)                     // <= B_max
-Uc = emit_lift_ids(S, L.DelayBuf)           // <= T_phi
+S = sparse_nonzeros(x_t) // <= B_max
+Uc = emit_lift_ids(S, L.DelayBuf) // <= T_phi
 for each id in Uc:
-idx = id_map[id]                         // direct array index
-val = contrib(id, S, L.DelayBuf)         // fixed arithmetic
-y   = L.M[idx] + val
-c   = (y - L.M[idx]) - val               // Neumaier comp
+idx = id_map[id] // direct array index
+val = contrib(id, S, L.DelayBuf) // fixed arithmetic
+y = L.M[idx] + val
+c = (y - L.M[idx]) - val // Neumaier comp
 L.M[idx] = y
 L.C[idx] = L.C[idx] + c
-rotate(L.DelayBuf)                           // index++ mod K
+rotate(L.DelayBuf) // index++ mod K
 
-u_t = read_lift(L.M, L.C)                    // fixed linear/rational forms
+u_t = read_lift(L.M, L.C) // fixed linear/rational forms
 
 // memory: SOS example
 y_mem = u_t
-for s in 0..L-1:                             // unrolled
-tmp   = y_mem
+for s in 0..L-1: // unrolled
+tmp = y_mem
 y_mem = L.b0[s]*tmp + L.z1[s]
 L.z1[s] = L.b1[s]*tmp - L.a1[s]*y_mem + L.z2[s]
 L.z2[s] = L.b2[s]*tmp - L.a2[s]*y_mem
 
 // head
-F = build_aux_features(u_t, L)               // fixed H-length
+F = build_aux_features(u_t, L) // fixed H-length
 y = y_mem + dot(L.W, F)
 
 // audit (fixed-size)
