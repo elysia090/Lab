@@ -18,3 +18,7 @@ This catalog unifies the documentation in `docs/` under a single, neutral naming
 | Unit 12 | Deterministic Weight Depot | ASCII-only, self-checking snapshot format for deterministic, auditable parameter storage. | [unit-12-weight.md](./unit-12-weight.md) |
 
 Each linked specification retains the full technical detail, while this index provides a calm, consistent gateway into the system model.
+
+For the constant-time algorithm notes that underpin several of these units,
+refer to the consolidated index in
+[`constant-algorithms/README.md`](./constant-algorithms/README.md).
