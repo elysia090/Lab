@@ -3,6 +3,7 @@
 import json
 import math
 from pathlib import Path
+from typing import List
 
 import pytest
 
@@ -90,3 +91,63 @@ def test_symplonk_round_trip_with_persistence(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError):
         symplonk.load_commitment(corrupted_path)
+
+
+def _sample_commitment() -> plonk.Commitment:
+    return plonk.Commitment(
+        transformed_evaluations=np.array([1.0 + 0.5j, 0.25 - 0.25j]),
+        flow_time=math.pi / 5,
+        secret_original_evaluations=np.array([1.0 + 0.5j, 0.25 - 0.25j]),
+        r=complex(0.1, -0.2),
+        mask=np.array([0.5 - 0.1j, -0.3 + 0.4j]),
+    )
+
+
+def test_save_commitment_validates_type_and_persists_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Saving a commitment should enforce the type and persist deterministic JSON."""
+
+    monkeypatch.setattr(plonk, "BASE_DIR", tmp_path)
+    symplonk = plonk.SymPLONK(n=8, p=97, epsilon=1e-8, use_gpu=False)
+    commitment = _sample_commitment()
+
+    target = tmp_path / "nested" / "commitment.json"
+    symplonk.save_commitment(commitment, target)
+
+    with target.open("r", encoding="utf-8") as handle:
+        stored = json.load(handle)
+
+    assert stored == commitment.to_dict()
+
+    with pytest.raises(TypeError):
+        symplonk.save_commitment({}, target)  # type: ignore[arg-type]
+
+
+def test_save_commitment_cleans_up_temporary_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Atomic writes should remove temporary artifacts when replacement fails."""
+
+    monkeypatch.setattr(plonk, "BASE_DIR", tmp_path)
+    symplonk = plonk.SymPLONK(n=8, p=97, epsilon=1e-8, use_gpu=False)
+    commitment = _sample_commitment()
+
+    created: List[Path] = []
+    original_mkstemp = plonk.tempfile.mkstemp
+
+    def tracking_mkstemp(*args, **kwargs):
+        fd, name = original_mkstemp(*args, **kwargs)
+        created.append(Path(name))
+        return fd, name
+
+    monkeypatch.setattr(plonk.tempfile, "mkstemp", tracking_mkstemp)
+
+    def failing_replace(src: str, dst: str) -> None:
+        raise RuntimeError("replace failed")
+
+    monkeypatch.setattr(plonk.os, "replace", failing_replace)
+
+    target = tmp_path / "commitment.json"
+    with pytest.raises(RuntimeError):
+        symplonk.save_commitment(commitment, target)
+
+    assert created, "temporary file should have been created"
+    assert not target.exists()
+    assert all(not path.exists() for path in created)

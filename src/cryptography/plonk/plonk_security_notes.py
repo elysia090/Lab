@@ -4,6 +4,7 @@
 # missing argument validation, improved logging, better side-channel protection
 
 import argparse
+import os
 import json
 import logging
 import math
@@ -255,6 +256,35 @@ def _load_json_file(path: Path) -> Dict[str, Any]:
             return json.load(file)
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid JSON in {path}: {exc}") from exc
+    except OSError as exc:
+        raise IOError(f"Failed to read JSON file {path}: {exc}") from exc
+
+
+def _write_json_atomic(path: Path, data: Dict[str, Any]) -> None:
+    """Persist ``data`` to ``path`` using an atomic replace strategy."""
+
+    serialized = json.dumps(data, indent=2, sort_keys=True)
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    tmp_path = Path(tmp_name)
+
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Failed to remove temporary file %s", tmp_path)
+        raise
 
 
 @dataclass
@@ -863,13 +893,15 @@ class SymPLONK:
         
         return verified
     
-    def save_commitment(self, commitment: Commitment, filepath: str) -> None:
+    def save_commitment(self, commitment: Commitment, filepath: Union[str, Path]) -> None:
         """Save commitment to JSON file."""
+        if not isinstance(commitment, Commitment):
+            raise TypeError("commitment must be a Commitment instance.")
+
         data = commitment.to_dict()
         path = _ensure_safe_path(filepath)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open('w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2)
+        _write_json_atomic(path, data)
         logger.info("Commitment saved to %s", path)
 
     def load_commitment(self, filepath: str) -> Commitment:
