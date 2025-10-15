@@ -1,6 +1,6 @@
-Hlm × Sera × Enc × Gen : A Constant-Time, Auditable, Streaming Seq2Seq Architecture
+Hlm x Sera x Enc x Gen : A Constant-Time, Auditable, Streaming Seq2Seq Architecture
 ABSTRACT
-This document specifies a fully streaming, constant-time encoder–generator (decoder) stack that integrates:
+This document specifies a fully streaming, constant-time encoder-generator (decoder) stack that integrates:
 
 * Hlm: a lossless hashed linear model with injective addressing and exact-equivalence sparse learning.
 * Sera: decayed-softmax attention via positive random features (PRF) with query-only whitening and anytime-valid e-process risk control.
@@ -12,15 +12,15 @@ This document specifies a fully streaming, constant-time encoder–generator (de
    Sequences: input tokens x_1..x_T, output tokens y_1..y_L.
    Embeddings: emb(x), emb(y) in R^d.
    PRF count r, low-rank value dimension r_v, model value dim d_v.
-   Decay gamma in (0,1] with L_eff = 1/(1−gamma).
+   Decay gamma in (0,1] with L_eff = 1/(1-gamma).
    Temperature tau>0.
    All logs are natural. IEEE-754 double, Kahan compensation for decayed sums.
-   Predictable == F_{t−1}-measurable (previsible).
+   Predictable == F_{t-1}-measurable (previsible).
    We target O(1)/event(token) with fixed constants for all hot-path functions.
 
 1. OBJECTS
    1.1 Hlm (Hashed Linear Model)
-   Base: MPHF h: K_base->[0..n−1], arrays W_base[n], Keys_base[n], ver_base.
+   Base: MPHF h: K_base->[0..n - 1], arrays W_base[n], Keys_base[n], ver_base.
    Delta: bounded cuckoo table D(d,b,S,L,Q), stash S, overflow ring Q, emergency slot 1, W_delta aligned, ver_delta.
    Bias b, seeds (secret), thresholds tau_low,tau_high, capacity C.
 
@@ -36,6 +36,25 @@ Streaming tokenizer (reversible), embedding projector, K/V head (W_k,W_v or iden
 1.4 Gen (Generator/Decoder)
 Self-attention Sera over generated tokens; cross-attention Sera over encoder memory; linear gate/logit add-on via Hlm; sampler tuned by margins.
 
+Reference formulas (hot path)
+   Sparse linear head (Hlm): For encoder features x_enc,t = {(id_j, val_j)},
+   \(\hat{y}_{\text{hlm},t} = b + \sum_j w[id_j] \cdot val_j.\)
+   After observing loss residual e_t, the exact SGD+L2 update applied in-place is
+   \(w[id_j] \leftarrow (1-\eta_t \lambda)\, w[id_j] + \eta_t\, e_t\, val_j\) and
+   \(b \leftarrow b + \eta_t e_t.\)
+   Streaming attention state (Sera): With positive random features
+   \(\phi_i(x) = r^{-1/2}\exp(w_i^\top x / \sqrt{\tau} - \lVert x \rVert^2 / (2\tau))\), the encoder update per token is
+   \(R_{\text{enc}} \leftarrow \gamma_{\text{enc}} R_{\text{enc}} + \phi(k_t) v_t^\top\) and
+   \(s_{\text{enc}} \leftarrow \gamma_{\text{enc}} s_{\text{enc}} + \phi(k_t).\)
+   Query readout uses whitening \(\phi_w(q) = \text{diag}(\sigma^2 + \varepsilon)^{-1/2} \phi(q)\) and evaluates
+   \(\hat{y}_{\text{sera}}(q) = (\phi_w(q)^\top R)/(\phi_w(q)^\top s + \lambda_*(t)).\)
+   Gate (learned by Hlm) combines the heads via a logistic projection:
+   \(G_t = \sigma(w_g^\top z_t)\),
+   \(\hat{y}_t = G_t \hat{y}_{\text{sera}} + (1-G_t) \hat{y}_{\text{hlm}} + z_{\text{lin}}.\)
+   Risk process: the anytime-valid mixture e-process maintained on predictable statistics satisfies
+   \(E_{\text{mix}}(t) = \sum_{\lambda \in \Lambda} \pi_\lambda \exp\Big(\sum_{i \le t} \lambda g_i - \psi_i(\lambda)\Big)\)
+   with logged margin \(m_t = \log(1/\alpha) - \log E_{\text{mix}}(t)\).
+
 2. INPUT/OUTPUT CONTRACTS
    Input to Enc per token t:
    bytes or tok_id, timestamp t.
@@ -43,27 +62,27 @@ Self-attention Sera over generated tokens; cross-attention Sera over encoder mem
    (k_t, v_t) in R^d x R^{d_v} (or v_t in U-lowrank), Hlm feature ids x_enc,t, and an audit record.
 
 Decode step t (Gen):
-Inputs: prev token y_{t−1}, optional teacher token y**t, encoder versions, context features.
+Inputs: prev token y_{t - 1}, optional teacher token y**t, encoder versions, context features.
 Outputs: sampled token y_t, logits digest, yhat_sera*{self,cross}, yhat_hlm_addon, Gate G_t, audit record.
 
 3. FORMAL TARGETS
    Decayed attention (for any query q):
-   A_t(q) = sum_{j<=t} gamma^{t−j} exp(q^T k_j / tau) v_j
-   B_t(q) = sum_{j<=t} gamma^{t−j} exp(q^T k_j / tau)
+   A_t(q) = sum_{j<=t} gamma^{t - j} exp(q^T k_j / tau) v_j
+   B_t(q) = sum_{j<=t} gamma^{t - j} exp(q^T k_j / tau)
    y_t(q) = A_t(q) / B_t(q)
-   Sera approximates y_t(q) in O(1)/token with uniform-in-t r^{−1/2} error for gamma<1, with stabilized variant using query-only whitening and predictable lambda_* to keep denominators safe.
+   Sera approximates y_t(q) in O(1)/token with uniform-in-t r^{-1/2} error for gamma<1, with stabilized variant using query-only whitening and predictable lambda_* to keep denominators safe.
 
 4. INVARIANTS (ALL COMPONENTS)
    I1 Injective addressing (Hlm): any known id resolves to exactly one weight pointer (delta OR base), never both.
    I2 Generational stability: readers pin versions {ver_base,ver_delta,ver_sera_enc,ver_sera_dec} at step entry and never mix generations within a step.
    I3 Boundedness: each hot-path function completes in at most a fixed number of primitive operations (constants depend only on configuration params, not on U or t).
    I4 Auditability: every step emits a Merkle-chained record sufficient for deterministic replay and one-pass verification.
-   I5 Predictability: control changes (lambda_*, beta_floor, gate clamps) are F_{t−1}-measurable to preserve e-process validity.
+   I5 Predictability: control changes (lambda_*, beta_floor, gate clamps) are F_{t-1}-measurable to preserve e-process validity.
 
 5. POSITIVE RANDOM FEATURES (PRF)
    For x in R^d:
-   phi_i(x) = r^{−1/2} * exp( w_i^T x / sqrt(tau) − ||x||^2 / (2*tau) ), i=1..r
-   Clip exponent g in [−c,c]; optionally pair (w,−w).
+   phi_i(x) = r^{-1/2} * exp( w_i^T x / sqrt(tau) - ||x||^2 / (2*tau) ), i=1..r
+   Clip exponent g in [-c,c]; optionally pair (w, - w).
    Unbiased kernelization (no clipping):
    E_W[phi(q)^T phi(k)] = exp(q^T k / tau).
    Clipping bias budgeted by small clip rate rho_clip in [0.1%,1%] and logged.
@@ -71,28 +90,28 @@ Outputs: sampled token y_t, logits digest, yhat_sera*{self,cross}, yhat_hlm_addo
 6. SERA STATES AND UPDATES
    6.1 Enc-side Sera
    Let phi_t = phi(k_t).
-   R_enc  <- gamma_enc * R_enc + GER_Kahan(phi_t, v_t^T)      // r x d_v  (or r x r_v)
-   s_enc  <- gamma_enc * s_enc + KahanAdd(phi_t)               // r
+   R_enc <- gamma_enc * R_enc + GER_Kahan(phi_t, v_t^T) // r x d_v (or r x r_v)
+   s_enc <- gamma_enc * s_enc + KahanAdd(phi_t) // r
    Preconditioner at ingest:
-   mu_enc  <- (1−beta_mu) * mu_enc + beta_mu * phi_t
-   sig2_enc<- (1−beta_sig)*sig2_enc + beta_sig * (phi_t − mu_enc)^2 + eps
+   mu_enc <- (1 - beta_mu) * mu_enc + beta_mu * phi_t
+   sig2_enc<- (1 - beta_sig)*sig2_enc + beta_sig * (phi_t - mu_enc)^2 + eps
    Risk/e-process (predictable):
-   self-normalized stats on phi_t build E_mix_enc(t); margin_enc m_enc(t)=log(1/alpha)−log E_mix_enc(t)
+   self-normalized stats on phi_t build E_mix_enc(t); margin_enc m_enc(t)=log(1/alpha) - log E_mix_enc(t)
    RJ_half (Enc): split coordinates; RJ_gap_enc reported.
 
 6.2 Dec-side Sera (self-attention memory)
 On each generated/teacher token with key k_t^dec and value v_t^dec:
-R_dec  <- gamma_dec * R_dec + GER_Kahan(phi(k_t^dec), v_t^dec^T)
-s_dec  <- gamma_dec * s_dec + KahanAdd(phi(k_t^dec))
+R_dec <- gamma_dec * R_dec + GER_Kahan(phi(k_t^dec), v_t^dec^T)
+s_dec <- gamma_dec * s_dec + KahanAdd(phi(k_t^dec))
 Preconditioner mu_dec,sig2_dec updated predictably as in encoder.
 Risk/e-process E_mix_dec(t); margins m_dec(t); RJ_gap_dec.
 
 6.3 Sera Query (any side)
 Given query q and side S in {enc,dec}:
-phi_q   = phi(q)
-phi_w   = diag(sig2_S + eps)^{−1/2} * phi_q          // query-only whitening
-den_S   = phi_w^T s_S + lambda_*^S(t)                // >= 0, predictable
-yhat_S  = (phi_w^T R_S) / den_S                      // or U( phi_w^T H_S / den_S ) if low-rank
+phi_q = phi(q)
+phi_w = diag(sig2_S + eps)^{-1/2} * phi_q // query-only whitening
+den_S = phi_w^T s_S + lambda_*^S(t) // >= 0, predictable
+yhat_S = (phi_w^T R_S) / den_S // or U( phi_w^T H_S / den_S ) if low-rank
 Return yhat_S, den_S, RJ_gap_S, margin_S. Complexity O(r d) + O(r d_v) (or O(r r_v)).
 
 7. ENCODER (Enc)
@@ -104,8 +123,8 @@ Return yhat_S, den_S, RJ_gap_S, margin_S. Complexity O(r d) + O(r d_v) (or O(r r
 
 7.2 Embedding and K/V Heads
 
-* x_t = Emb(tok_id) in R^d  (learned/frozen).
-* k_t = W_k * x_t ; v_t = W_v * x_t   (or v_t_lowrank = U^T * x_t).
+* x_t = Emb(tok_id) in R^d (learned/frozen).
+* k_t = W_k * x_t ; v_t = W_v * x_t (or v_t_lowrank = U^T * x_t).
 * Sera ingest Enc: update R_enc,s_enc,mu_enc,sig2_enc, E_mix_enc, RJ_gap_enc.
 
 7.3 Hlm Featureizer
@@ -121,7 +140,7 @@ Return yhat_S, den_S, RJ_gap_S, margin_S. Complexity O(r d) + O(r d_v) (or O(r r
 8. GENERATOR (Gen)
    8.1 Decoder Query Construction
 
-* q_t = W_q * emb(y_{t−1}) + S_tiny   // small recurrent state if desired (kept O(1)/token)
+* q_t = W_q * emb(y_{t - 1}) + S_tiny // small recurrent state if desired (kept O(1)/token)
 * Optional conditioning on shallow context (e.g., time, speaker).
 
 8.2 Self- and Cross-Attention via Sera
@@ -133,39 +152,39 @@ Both use the SAME PRF basis W for tight cache and shared whitening stats per sid
 
 8.3 Hlm Fusion (gate + linear add-on)
 Diagnostics vector z_t:
-z_t = [RJ_self, RJ_cross, m_self, m_cross, den_self, den_cross, ||phi_w||_1, rolling |e|, context bins...]  // all predictably computed
+z_t = [RJ_self, RJ_cross, m_self, m_cross, den_self, den_cross, ||phi_w||_1, rolling |e|, context bins...] // all predictably computed
 Gate (exact, interpretable):
-G_t = sigma( w_g^T z_t )  // w_g learned by Hlm on sparse features derived from z_t
+G_t = sigma( w_g^T z_t ) // w_g learned by Hlm on sparse features derived from z_t
 Context composition:
-c_t = G_t * yhat_self + (1−G_t) * yhat_cross   // or meta-linear head learned by Hlm on [yhat_self,yhat_cross]
+c_t = G_t * yhat_self + (1 - G_t) * yhat_cross // or meta-linear head learned by Hlm on [yhat_self,yhat_cross]
 Logit linear add-on (exact sparse):
-z_lin = Hlm.Linear(x_dec_t)  // optional per-token features (topic, persona, plan)
+z_lin = Hlm.Linear(x_dec_t) // optional per-token features (topic, persona, plan)
 
 8.4 Logits and Risk-Aware Sampling
 logits_t = W_out * c_t + b_out + z_lin
-margin_t = m_dec(t)           // from Sera decoder e-process
-temperature_t = f_temp(margin_t)         // monotone nonincreasing in risk
+margin_t = m_dec(t) // from Sera decoder e-process
+temperature_t = f_temp(margin_t) // monotone nonincreasing in risk
 (top_k, top_p) = f_filter(margin_t, RJ_self, RJ_cross)
 token_t = Sample(logits_t, temperature_t, top_k, top_p)
-Predictable safety actions when margin_t<0 or RJ “red”:
+Predictable safety actions when margin_t<0 or RJ "red":
 
 * Clamp G_t <= G_max(margin_t) (favor cross or linear).
 * Increase beta_floor and lambda_*^S predictably for next step.
 * Reduce temperature and top_p bounds.
 
 8.5 Online Learning (optional, supervised)
-e_t = loss_grad(y_t*, logits_t) or e_t = y_t* − yhat_t (for regression heads).
+e_t = loss_grad(y_t*, logits_t) or e_t = y_t* - yhat_t (for regression heads).
 Hlm updates exact per-id weights touched at step t.
 Sera_dec ingest with k_t^dec, v_t^dec from the realized token embedding.
 
 8.6 Complexity
-Per token: 2×Sera query + small projections + Hlm gate/linear; overall O(r d) + O(r d_v) (or O(r r_v)) + O(#ids)*O(1).
+Per token: 2 x Sera query + small projections + Hlm gate/linear; overall O(r d) + O(r d_v) (or O(r r_v)) + O(#ids)*O(1).
 
 9. HLM DETAILS (RECAP, IMPLEMENTATION-GRADE)
    9.1 Bounds and Defaults
    d=2, b=4, S=8, L=8, Q=16
    C_lookup <= 2*4 + 8 + 1 = 17
-   C_insert <= 2*4 + 8 + 8 + 1 + c0 <= 25 + c0  (often ~19)
+   C_insert <= 2*4 + 8 + 8 + 1 + c0 <= 25 + c0 (often ~19)
    9.2 Operations
    LOCATEREF(id):
    scan d*b delta slots, then S stash, then MPHF base membership via Keys_base[h(id)]; return &W if found; else NULL.
@@ -174,15 +193,15 @@ Per token: 2×Sera query + small projections + Hlm gate/linear; overall O(r d) +
    if vacancy in candidate buckets: place, return
    else do <=L relocations (bounded), else stash if space, else ring enqueue (stable shadow), else emergency slot CAS; return pointer.
    9.3 Rebuild Scheduling (safety inequality)
-   slack = C*(tau_high − tau_low)
+   slack = C*(tau_high - tau_low)
    require slack >= lambda_max * T_rb + margin
    start rebuild at tau_low; guarantee swap before tau_high with probability 1 under the bound; maintain O(1) inserts indefinitely.
    9.4 Concurrency and Publication
    Build {h2,W2,Keys2} off-thread; publish pointer/version by single release-store; readers acquire-load at step entry; free old gen after epoch quiescence.
 
 10. CONTROL PLANE (PREDICTABLE GOVERNORS)
-    10.1 Sera→Hlm Early-Warning
-    Persistent RJ “red” or thinning margins -> lower tau_low (earlier rebuild), increase C at next rollout, reduce Hlm learning rate temporarily.
+    10.1 Sera -> Hlm Early-Warning
+    Persistent RJ "red" or thinning margins -> lower tau_low (earlier rebuild), increase C at next rollout, reduce Hlm learning rate temporarily.
     10.2 Denominator Safety
     If den_S < beta_floor: raise lambda_*^S predictably and clamp Gate down.
     10.3 Gate Policy
@@ -217,8 +236,8 @@ Per token: 2×Sera query + small projections + Hlm gate/linear; overall O(r d) +
     }
     12.2 Verifier (one pass, O(1) memory)
 
-* Check merkle_prev→curr continuity.
-* Validate Ville margins: log(1/alpha) − log E_mix_S(t) >= 0 for S in {enc,dec}.
+* Check merkle_prev -> curr continuity.
+* Validate Ville margins: log(1/alpha) - log E_mix_S(t) >= 0 for S in {enc,dec}.
 * Check RJ policy thresholds and action logs.
 * Confirm Hlm step counts <= configured constants; check Keys_base[h(id)] == id on sampled entries (or full scan offline).
 * Optional: verify linear Farkas certificates if present.
@@ -229,12 +248,12 @@ Per token: 2×Sera query + small projections + Hlm gate/linear; overall O(r d) +
 EncIngest(tok):
 x = Emb(tok)
 k = W_k * x
-v = W_v * x          // or v_low = U^T * x
-phi_k = PRF(k)       // clipped, paired optional
+v = W_v * x // or v_low = U^T * x
+phi_k = PRF(k) // clipped, paired optional
 R_enc = gamma_enc * R_enc + GER_Kahan(phi_k, v^T)
 s_enc = gamma_enc * s_enc + KahanAdd(phi_k)
 mu_enc, sig2_enc = EWM2_update(phi_k)
-update_e_process_enc(phi_k)       // predictable envelope
+update_e_process_enc(phi_k) // predictable envelope
 RJ_enc = RJ_half_split_enc()
 emit_Hlm_features_from_encoder(tok, diagnostics_from{den_enc, RJ_enc, margin_enc})
 AuditEmit(...)
@@ -242,7 +261,7 @@ AuditEmit(...)
 13.2 Gen Decode Step
 GenDecodeStep(prev_token, ctx):
 pin_versions(ver_sera_enc, ver_sera_dec, ver_base, ver_delta)
-q  = QProj(Emb(prev_token), ctx_state)
+q = QProj(Emb(prev_token), ctx_state)
 // Sera self
 phi_q = PRF(q); phi_w_dec = whiten(phi_q; sig2_dec)
 den_self = dot(phi_w_dec, s_dec) + lambda_star_self
@@ -252,12 +271,12 @@ RJ_self, margin_dec = diagnostics_dec()
 phi_w_enc = whiten(phi_q; sig2_enc)
 den_cross = dot(phi_w_enc, s_enc) + lambda_star_cross
 yhat_cross = dot(phi_w_enc, R_enc) / den_cross
-RJ_cross, margin_enc = diagnostics_enc()   // from pinned record
+RJ_cross, margin_enc = diagnostics_enc() // from pinned record
 // Hlm fusion
 z_gate = featurize(RJ_self, RJ_cross, margin_dec, margin_enc, den_self, den_cross, norm1(phi_w_dec), ctx)
 G = clamp( sigmoid( Hlm.Linear(z_gate_ids) ), g_min(margin_dec), g_max(margin_dec) )
-z_lin = Hlm.Linear(x_dec_ids)   // exact sparse contribution
-c = G * yhat_self + (1−G) * yhat_cross
+z_lin = Hlm.Linear(x_dec_ids) // exact sparse contribution
+c = G * yhat_self + (1 - G) * yhat_cross
 logits = W_out * c + b_out + z_lin
 (temp, topk, topp) = risk_to_sampling(margin_dec, RJ_self, RJ_cross)
 y = Sample(logits, temp, topk, topp)
@@ -269,7 +288,7 @@ GenLearnStep(x_dec_ids, y_true, logits):
 e = grad_loss(logits, y_true)
 for id,val in x_dec_ids:
 p = LOCATEREF_OR_INSERT(id)
-*p = (1 − lr*l2) * (*p) + lr * e * val
+*p = (1 - lr*l2) * (*p) + lr * e * val
 b_hlm += lr * e
 
 13.4 Sera Decoder Ingest (after emitting y)
@@ -284,14 +303,14 @@ mu_dec, sig2_dec = EWM2_update(phi_k)
 update_e_process_dec(phi_k)
 
 14. COMPLEXITY SUMMARY (PER TOKEN/EVENT)
-    Enc ingest:  O(r d) PRF + O(r d_v) GER (+O(r r_v) if low-rank) + O(r) stats + O(#ids)*O(1) Hlm updates.
-    Gen step:    2×(O(r d) + O(r d_v)) + O(#ids)*O(1) + tiny projections.
-    Hlm ops:     LOCATE <= 17 primitive probes; INSERT <= 25+c0; independent of U,F,t.
+    Enc ingest: O(r d) PRF + O(r d_v) GER (+O(r r_v) if low-rank) + O(r) stats + O(#ids)*O(1) Hlm updates.
+    Gen step: 2 x (O(r d) + O(r d_v)) + O(#ids)*O(1) + tiny projections.
+    Hlm ops: LOCATE <= 17 primitive probes; INSERT <= 25+c0; independent of U,F,t.
 
 15. MEMORY LAYOUT AND CACHE
     PRF:
 
-* W (r x d) row-major; exp arguments computed as (w_i^T x)/sqrt(tau) − ||x||^2/(2*tau).
+* W (r x d) row-major; exp arguments computed as (w_i^T x)/sqrt(tau) - ||x||^2/(2*tau).
 * Avoid per-call salt fetch; keep seed in TLS.
   Sera:
 * R_* (r x d_v) row-major; s_* (r) contiguous; mu/sig2 contiguous.
@@ -302,22 +321,22 @@ update_e_process_dec(phi_k)
 
 16. DEFAULTS AND SIZING
     Sera:
-    r ≈ C0 * (r_v + log(1/δ)) / ε^2   for target error ε and confidence 1−δ.
-    r_v ∈ [64,128], tau ≈ sqrt(d), gamma_enc ∈ [0.97,0.99], gamma_dec ∈ [0.98,0.997].
-    clip c tuned for rho_clip ≈ 0.5%; beta_floor in [1e−6, 1e−4] when gamma→1.
+    r ~ C0 * (r_v + log(1/delta)) / epsilon^2 for target error epsilon and confidence 1 - delta.
+    r_v in [64,128], tau ~ sqrt(d), gamma_enc in [0.97,0.99], gamma_dec in [0.98,0.997].
+    clip c tuned for rho_clip ~ 0.5%; beta_floor in [1e - 6, 1e - 4] when gamma -> 1.
     Hlm:
     d=2, b=4, S=8, L=8, Q=16; tau_low=0.6, tau_high=0.8.
-    C from lambda_max and T_rb with >= 2× safety.
+    C from lambda_max and T_rb with >= 2 x safety.
 
 17. FAILURE MODES AND RUNBOOK
     Sera margins low or RJ red:
-    action: beta_floor↑, lambda_*^S↑ predictably, Gate clamp↓, reduce temperature/top-p, optionally r↑; log all.
+    action: beta_floor up , lambda_*^S up predictably, Gate clamp down , reduce temperature/top-p, optionally r up ; log all.
     Hlm ring pressure or emergency used:
-    action: tau_low↓ (early rebuild), increase C at next deployment, rebuild parallelism↑, lr↓ temporarily, confirm slack >= arrivals.
+    action: tau_low down (early rebuild), increase C at next deployment, rebuild parallelism up , lr down temporarily, confirm slack >= arrivals.
     Denominator instability:
     action: enforce beta_floor>0, extended precision accumulation, never quantize s or denominators.
     NaN/Inf:
-    action: quarantine sample, record in audit, fall back to linear path (G→0) until healthy.
+    action: quarantine sample, record in audit, fall back to linear path (G -> 0) until healthy.
 
 18. SECURITY AND PRIVACY
 
@@ -341,18 +360,18 @@ update_e_process_dec(phi_k)
 
 21. END-TO-END SCENARIO (DRIFT + NOVELTY BURSTS)
     Phase A steady:
-    margins high, RJ low, Gate ~0.8, Hlm ring≈0, rebuilds rare.
+    margins high, RJ low, Gate ~0.8, Hlm ring ~ 0, rebuilds rare.
     Phase B burst:
     RJ red 6/10, margins thin, den dips; controller predictably raises beta_floor, lambda_*; clamps Gate<=0.4; Hlm lowers tau_low and enqueues early rebuild; inserts remain O(1); p99 stable.
     Phase C recover:
     base published; seeds rotated; ring drains; margins recover; clamps relax; Gate returns to attention-heavy.
 
 22. CHECKLIST (IMPLEMENTATION BRING-UP)
-    [ ] Hlm: enforce I1–I4; log bounds; enable rebuild inequality.
+    [ ] Hlm: enforce I1 - I4; log bounds; enable rebuild inequality.
     [ ] Sera: PRF clipping logged; whitening at query only; denominators in extended precision; RJ/e-process connected to policy.
     [ ] Enc: reversible tokenizer; K/V heads; Hlm featureizer; audit stream on.
     [ ] Gen: two Sera queries/token; gate via Hlm; risk-aware sampler; teacher forcing path.
     [ ] Audit: Merkle chain; one-pass verifier exercised; snapshot/restore rehearsal.
 
 23. SUMMARY
-    By co-designing Enc and Gen around Sera’s PRF-based, length-free attention and Hlm’s injective, exact linearity, the stack achieves: strict O(1)/token/event hot paths; deterministic audit and replay; quantitative health signals that steer gates, denominators, and rebuilds predictably; and interpretable contributions at every stage. It scales horizontally by sharding ids, remains reversible under crash/restore, and sustains real-time SLOs under drift without sacrificing correctness.
+    By co-designing Enc and Gen around Sera's PRF-based, length-free attention and Hlm's injective, exact linearity, the stack achieves: strict O(1)/token/event hot paths; deterministic audit and replay; quantitative health signals that steer gates, denominators, and rebuilds predictably; and interpretable contributions at every stage. It scales horizontally by sharding ids, remains reversible under crash/restore, and sustains real-time SLOs under drift without sacrificing correctness.

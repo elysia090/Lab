@@ -20,7 +20,7 @@ Lemma 1 (constant overlap in 2D L1). In 2D L1 with the four-phase construction a
 Proof. Fix x. In each phase, centers whose balls can cover x form a 2x2 block at step 2R_ell, so at most 4 per phase; over four phases, at most 8. QED.
 
 1.2 Nerves and adjacency degree
-For each U_ell, define the (1-skeleton) Cech nerve N_ell with vertices the centers c, and an edge (c,c') iff B_ell(c) cap B_ell(c') is nonempty. In L1, the same-radius Vietoris–Rips graph (edge if L1(c,c') <= 2R_ell) contains the Cech nerve.
+For each U_ell, define the (1-skeleton) Cech nerve N_ell with vertices the centers c, and an edge (c,c') iff B_ell(c) cap B_ell(c') is nonempty. In L1, the same-radius Vietoris - Rips graph (edge if L1(c,c') <= 2R_ell) contains the Cech nerve.
 
 Lemma 2 (bounded degree of the nerve). In 2D L1 with four-phase placement, each center c has O(1) neighbors in N_ell (e.g., <= 8 to 12 depending on diagonal inclusion).
 Proof. If B_ell(c) cap B_ell(c') != empty, then ||c-c'||_1 <= 2R_ell. Centers lie on four shifted grids of step 2R_ell; enumerating such centers within that L1-radius is a constant bound in 2D. QED.
@@ -121,7 +121,7 @@ Proof. For each hub h (O(1) per local region and constant total factor), run Dij
    All results above transfer verbatim with directions respected; the 2-hop cover assumption becomes the directed hub-labeling property.
 
 9. Numerical Robustness
-   Distances are stored in fixed-point Q_{m.n}; comparisons use a tolerance eps_comp >= 0 so inequalities are only decided when a < b - eps_comp. Triangle inequality remains valid; Theorems 1–4 rely on metric inequalities stable under such banding, so the results persist.
+   Distances are stored in fixed-point Q_{m.n}; comparisons use a tolerance eps_comp >= 0 so inequalities are only decided when a < b - eps_comp. Triangle inequality remains valid; Theorems 1 - 4 rely on metric inequalities stable under such banding, so the results persist.
 
 10. Assumptions: What They Buy
     Cov(Delta): bounded overlap and nerve degree -> constant-width construction; |H(v)| <= kappa = L*Delta*(1+d_port).

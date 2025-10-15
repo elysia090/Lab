@@ -2,13 +2,13 @@ REVERSE+SCAN (camera-ready)
 Constant-Memory, Length-Free O(1)/token Streaming Reasoning via Positive Random Features, Anytime-Valid E-Processes, and Reversible Certificates
 
 Abstract
-We mathematically specify, analyze, and operationalize a streaming estimator for decayed softmax attention that uses constant memory and constant per-token time. The method combines positive random features (PRF) to linearize the exponential kernel, exponentially weighted sufficient statistics with decay, optional fixed-rank value compression, query-only whitening for conditioning, anytime-valid e-processes under previsible adaptation for risk control, and reversible scan-checkable certificates for linear logic. We state assumptions, estimands, estimators, and stopping rules; prove unbiasedness (no whitening), consistency (with whitening), length-free r^{-1/2} error bounds uniform in time for gamma in (0,1), and time-uniform Type-I control via Ville’s inequality; and bound finite-precision and clipping budgets. The design is fully auditable via a Merkle-chained record and a one-pass verifier.
+We mathematically specify, analyze, and operationalize a streaming estimator for decayed softmax attention that uses constant memory and constant per-token time. The method combines positive random features (PRF) to linearize the exponential kernel, exponentially weighted sufficient statistics with decay, optional fixed-rank value compression, query-only whitening for conditioning, anytime-valid e-processes under previsible adaptation for risk control, and reversible scan-checkable certificates for linear logic. We state assumptions, estimands, estimators, and stopping rules; prove unbiasedness (no whitening), consistency (with whitening), length-free r^{-1/2} error bounds uniform in time for gamma in (0,1), and time-uniform Type-I control via Ville's inequality; and bound finite-precision and clipping budgets. The design is fully auditable via a Merkle-chained record and a one-pass verifier.
 
 0. Problem and Estimand
    Let d,d_v in N. For a stream (k_t,v_t) in R^d x R^{d_v}, temperature tau>0, decay gamma in (0,1], and query q in R^d define
-   (1)  A_t(q) = sum_{j=1}^t gamma^{t-j} exp(q^T k_j / tau) v_j
-   (2)  B_t(q) = sum_{j=1}^t gamma^{t-j} exp(q^T k_j / tau)
-   (3)  y_t(q) = A_t(q) / B_t(q)
+   (1) A_t(q) = sum_{j=1}^t gamma^{t-j} exp(q^T k_j / tau) v_j
+   (2) B_t(q) = sum_{j=1}^t gamma^{t-j} exp(q^T k_j / tau)
+   (3) y_t(q) = A_t(q) / B_t(q)
    Goal: construct yhat_t(q) with state independent of t and O(1) time per token, with guarantees uniform in t. The estimator should be implementable as a single forward scan that maintains a fixed-size state, supports optional low-rank compression of values, and provides auditable risk and logic certificates.
 
 1. Notation
@@ -28,7 +28,7 @@ We mathematically specify, analyze, and operationalize a streaming estimator for
 
 3. Positive Random Features (PRF)
    For x in R^d define a positive feature map phi(x) in R^r by
-   (4)  phi_i(x) = r^{-1/2} exp( w_i^T x / sqrt(tau) - ||x||^2 / (2 tau) ),  i = 1..r
+   (4) phi_i(x) = r^{-1/2} exp( w_i^T x / sqrt(tau) - ||x||^2 / (2 tau) ), i = 1..r
    Optionally pair features as (w, -w) to reduce variance while preserving positivity and unbiasedness. The scaling ensures that E||phi(x)||^2 is O(1) as r grows.
 
 Theorem 3.1 (unbiased kernelization, no clipping).
@@ -45,22 +45,22 @@ Variance note: Var(phi(q)^T phi(k)) = Theta( r^{-1} exp(2 q^T k / tau) ) under n
 
 4. Streaming Sufficient Statistics
    Let phi_t := phi(k_t). Maintain decayed sufficient statistics
-   (6)  R_t = gamma R_{t-1} + phi_t v_t^T        in R^{r x d_v}   [Kahan per row]
-   (7)  s_t = gamma s_{t-1} + phi_t              in R^{r}
+   (6) R_t = gamma R_{t-1} + phi_t v_t^T in R^{r x d_v} [Kahan per row]
+   (7) s_t = gamma s_{t-1} + phi_t in R^{r}
    When low-rank values are desired (fixed U),
-   (8)  H_t = gamma H_{t-1} + phi_t rhat_t^T     in R^{r x r_v},  with rhat_t approx U^T v_t
+   (8) H_t = gamma H_{t-1} + phi_t rhat_t^T in R^{r x r_v}, with rhat_t approx U^T v_t
    Updates (6)-(8) are O(r d_v) or O(r r_v) per step respectively. Kahan compensation reduces accumulation error in decayed sums and is logged.
 
 5. Query, Whitening, Readout
    Per-coordinate ingest-time preconditioner:
-   (9)  mu_t  = (1 - beta_mu) mu_{t-1} + beta_mu phi_t
+   (9) mu_t = (1 - beta_mu) mu_{t-1} + beta_mu phi_t
    (10) sigma_t^2 = (1 - beta_sigma) sigma_{t-1}^2 + beta_sigma (phi_t - mu_t)^2 + epsilon 1
    Query-only whitening (predictable at time t):
    (11) phi_w(q) = diag( sigma_t^2 + epsilon )^{-1/2} phi(q)
    Denominator with predictable regularization:
-   (12) den_t(q) = phi_w(q)^T s_t + lambda_star(t)     (>= 0)
+   (12) den_t(q) = phi_w(q)^T s_t + lambda_star(t) (>= 0)
    Readouts:
-   (13) yhat_t(q)       = (phi_w(q)^T R_t) / den_t(q)
+   (13) yhat_t(q) = (phi_w(q)^T R_t) / den_t(q)
    (14) yhat_t^{low}(q) = U ( (phi_w(q)^T H_t) / den_t(q) )
    RJ half-split for diagnostics (Sec. 10):
    (15) yhat_t^{(j)}(q) = (phi_{w,I_j}(q)^T R_t^{(j)}) / (phi_{w,I_j}(q)^T s_t^{(j)} + lambda_star)
@@ -70,26 +70,26 @@ Whitening rationale: scaling coordinates by sigma_t stabilizes the denominator d
 
 6. Targets and Estimators
    Targets:
-   (17) y_t(q)          decayed softmax attention
-   (18) y_t^{(w)}(q)    whitened-kernel limit, defined by replacing phi with phi_w in the kernel identity
+   (17) y_t(q) decayed softmax attention
+   (18) y_t^{(w)}(q) whitened-kernel limit, defined by replacing phi with phi_w in the kernel identity
    Estimators:
-   (19) yhat_t^{PRF}(q) = (phi(q)^T R_t) / (phi(q)^T s_t)         correctness path (no whitening, lambda=0)
-   (20) yhat_t^{(w)}(q) = (phi_w(q)^T R_t) / den_t(q)             stabilized path
-   (21) yhat_t^{low}(q) = U ( (phi_w(q)^T H_t) / den_t(q) )       stabilized, low-rank values
+   (19) yhat_t^{PRF}(q) = (phi(q)^T R_t) / (phi(q)^T s_t) correctness path (no whitening, lambda=0)
+   (20) yhat_t^{(w)}(q) = (phi_w(q)^T R_t) / den_t(q) stabilized path
+   (21) yhat_t^{low}(q) = U ( (phi_w(q)^T H_t) / den_t(q) ) stabilized, low-rank values
    The correctness path matches y_t(q) in expectation (no clipping) and concentrates with r^{-1/2}; the stabilized path targets y_t^{(w)}(q) and enjoys improved conditioning and denominator control.
 
 7. Expectation Alignment, Concentration, Ratio
    Lemma 7.1 (alignment). E[phi(q)^T R_t] = A_t(q), and E[phi(q)^T s_t] = B_t(q), under no clipping and with independence from W.
    Lemma 7.2 (coordinate tails). For any fixed a, the scalar a^T (phi(x) - E phi(x)) is sub-exponential with parameters
-   nu^2 <= K_nu e^{2c} ||a||^2 / r,   b' <= K_b e^{c} ||a||_inf / sqrt(r).
+   nu^2 <= K_nu e^{2c} ||a||^2 / r, b' <= K_b e^{c} ||a||_inf / sqrt(r).
    The constants K_nu, K_b depend only on tau and distributional bounds for k_t.
-   Length-free uniformity for gamma in (0,1): the predictable quadratic variation (PQV) of compensated decayed sums is bounded by C/(1-gamma^2). Freedman’s inequality yields, simultaneously for all t, with probability at least 1-delta,
+   Length-free uniformity for gamma in (0,1): the predictable quadratic variation (PQV) of compensated decayed sums is bounded by C/(1-gamma^2). Freedman's inequality yields, simultaneously for all t, with probability at least 1-delta,
    (22) || phi(q)^T R_t - E phi(q)^T R_t || <= K_A(gamma, c, tau) [ sqrt( (d_v + log(1/delta)) / r ) + (d_v + log(1/delta))/r ]
    (23) | phi(q)^T s_t - E phi(q)^T s_t | <= K_S(gamma, c, tau) [ sqrt( log(1/delta) / r ) + log(1/delta)/r ]
    Ratio perturbation bound. For vectors a,a_0 and scalars b,b_0 with beta = min{|b|,|b_0|} > 0,
    (24) || a/b - a_0/b_0 || <= ||a - a_0||/beta + ||a_0|| |b - b_0| / beta^2
    Theorem 7.3 (length-free approximation to y_t, gamma in (0,1)).
-   Let beta_den(t,q) := min{ phi(q)^T s_t, E[phi(q)^T s_t] }. Under A1–A4, with no whitening and lambda=0, with probability at least 1-delta simultaneously for all t >= 1,
+   Let beta_den(t,q) := min{ phi(q)^T s_t, E[phi(q)^T s_t] }. Under A1 - A4, with no whitening and lambda=0, with probability at least 1-delta simultaneously for all t >= 1,
    (25) || yhat_t^{PRF}(q) - y_t(q) ||
    <= (C1 / beta_den) sqrt( (d_v + log(1/delta)) / r )
 
@@ -111,17 +111,17 @@ Remark on gamma=1. When gamma=1, PQV grows with t and Freedman yields horizon-de
 
 9. Anytime-Valid E-Processes (predictable, constructive)
    Self-normalized coordinates:
-   (29) f_t   = (1 - beta_f)   f_{t-1} + beta_f   phi_t
+   (29) f_t = (1 - beta_f) f_{t-1} + beta_f phi_t
    (30) mu_t~ = (1 - beta_mu~) mu_{t-1}~ + beta_mu~ phi_t
-   (31) v_t~  = (1 - beta_v~)  v_{t-1}~ + beta_v~ (phi_t - mu_{t-1}~)^2
-   (32) s_t*  = (phi_t - mu_t~) ./ sqrt( v_t~ + epsilon ),  Z_t = || s_t* ||^2
+   (31) v_t~ = (1 - beta_v~) v_{t-1}~ + beta_v~ (phi_t - mu_{t-1}~)^2
+   (32) s_t* = (phi_t - mu_t~) ./ sqrt( v_t~ + epsilon ), Z_t = || s_t* ||^2
    Predictable mgf envelope:
-   (33) psi(lambda) = nu^2 lambda^2 / (2 (1 - b' |lambda|)),  for |lambda| < 1/b'
+   (33) psi(lambda) = nu^2 lambda^2 / (2 (1 - b' |lambda|)), for |lambda| < 1/b'
    Mixture process and previsible tilt:
    (34) log E_t(lambda) = sum_{tau <= t} [ lambda (Z_tau - bbar) - psi(lambda) ]
    (35) E_mix(t) = sum_k pi_k exp( log E_t(lambda_k) )
    (36) w_k(t) = pi_k exp( log E_t(lambda_k) ) / E_mix(t)
-   (37) lambda_star(t) = sum_k w_k(t-1) lambda_k     // predictable
+   (37) lambda_star(t) = sum_k w_k(t-1) lambda_k // predictable
    Domain projection (predictable). At time t-1 compute b'*hat from {s_tau*}*{tau <= t-1} and replace each lambda_k by sign(lambda_k) * min{ |lambda_k|, (1 - xi)/b'*hat } with fixed xi in (0,1).
    Theorem 9.1 (Ville). Each M_t(lambda) = exp( log E_t(lambda) ) is a nonnegative supermartingale; therefore E_mix(t) is a supermartingale. For any stopping time T and any alpha in (0,1),
    (38) P( sup*{t >= 1} E_mix(t) >= 1/alpha ) <= alpha
@@ -136,7 +136,7 @@ Remark on gamma=1. When gamma=1, PQV grows with t and Freedman yields horizon-de
     Kahan-compensated decayed sums S_t = sum_j gamma^{t-j} x_j satisfy
     (40) | fl(S_t) - S_t | <= u * C_K(gamma) * sum_j gamma^{t-j} |x_j| + O(u^2)
     with C_K(gamma) <= (1 + gamma) / (1 - gamma) for gamma in (0,1). For per-row q-bit quantization on R or H with scale s_row and row-2-norm bounded by L_row,
-    (41) E_q,row <= 2^{-q} L_row     per row GEMV
+    (41) E_q,row <= 2^{-q} L_row per row GEMV
     Aggregate the rounding budget into (25) as
     (42) E_round <= u C_K(gamma) ( ||phi_w||_1 <|rows(R/H)|> + ||phi||_1 <|s|> ) + 2^{-q} sum_rows L_row
     Never quantize s or denominators, and keep denominator accumulation in extended precision until readout to avoid catastrophic cancellation.
@@ -151,12 +151,12 @@ Remark on gamma=1. When gamma=1, PQV grows with t and Freedman yields horizon-de
 13. Algorithms (O(1) state pseudocode)
 
 Ingest(k_t, v_t):
-phi_t  <- phi(k_t)                 // PRF with clipping
-R_t    <- gamma R_{t-1} + GER_Kahan(phi_t, v_t^T)
-s_t    <- gamma s_{t-1} + KahanAdd(phi_t)
+phi_t <- phi(k_t) // PRF with clipping
+R_t <- gamma R_{t-1} + GER_Kahan(phi_t, v_t^T)
+s_t <- gamma s_{t-1} + KahanAdd(phi_t)
 if low_rank:
-rhat_t <- U^T v_t                // predictable if U updated
-H_t    <- gamma H_{t-1} + GER_Kahan(phi_t, rhat_t^T)
+rhat_t <- U^T v_t // predictable if U updated
+H_t <- gamma H_{t-1} + GER_Kahan(phi_t, rhat_t^T)
 mu_t, sigma_t^2 <- updates (9)-(10)
 f_t, mu_t~, v_t~ <- (29)-(31); s_t*, Z_t
 fit (nu^2_hat, bprime_hat) predictably from history
@@ -167,7 +167,7 @@ emit audit record (Sec. 15)
 Query(q):
 phi_q <- phi(q)
 phi_w <- diag(sigma_t^2 + epsilon)^{-1/2} phi_q
-den   <- phi_w^T s_t + lambda_star(t)     // >= beta_eff
+den <- phi_w^T s_t + lambda_star(t) // >= beta_eff
 if low_rank:
 z <- phi_w^T H_t
 yhat <- U ( z / den )
@@ -200,7 +200,7 @@ All updates and readouts are O(1) in t for fixed r and r_v.
     init merkle_prev = GENESIS
     for rec in stream:
     assert merkle( rec.body || merkle_prev ) == rec.merkle_curr
-    assert log(1/alpha) - log E_mix(rec.t) >= 0       // Ville margin nonnegative
+    assert log(1/alpha) - log E_mix(rec.t) >= 0 // Ville margin nonnegative
     check RJ policy thresholds and beta_floor actions
     if certificate present:
     recompute sums with streamed a_i,b_i; verify (43)-(45)
@@ -249,7 +249,7 @@ All updates and readouts are O(1) in t for fixed r and r_v.
     Unbiasedness (Thm 3.1). For any fixed q,k, with w ~ N(0,I_d),
     E exp( w^T (q+k)/sqrt(tau) ) = exp( ||q+k||^2 / (2 tau) ).
     Multiplying by exp( - (||q||^2 + ||k||^2) / (2 tau) ) yields exp( q^T k / tau ). Averaging across r i.i.d. features gives an unbiased Monte Carlo estimator with variance O(r^{-1}).
-    Concentration (22)-(23). Write the decayed process X_t = sum_{j<=t} gamma^{t-j} xi_j where xi_j are centered, sub-exponential coordinates coming from a^T(phi(k_j)-E phi(k_j)). The PQV of the compensated version is bounded by C(gamma) sum_j gamma^{2(t-j)} <= C/(1-gamma^2). Apply Freedman’s inequality with sub-exponential tail parameters (nu^2/r, b'/sqrt(r)) to obtain uniform-in-t bounds. A union bound across d_v coordinates yields the displayed dependence.
+    Concentration (22)-(23). Write the decayed process X_t = sum_{j<=t} gamma^{t-j} xi_j where xi_j are centered, sub-exponential coordinates coming from a^T(phi(k_j)-E phi(k_j)). The PQV of the compensated version is bounded by C(gamma) sum_j gamma^{2(t-j)} <= C/(1-gamma^2). Apply Freedman's inequality with sub-exponential tail parameters (nu^2/r, b'/sqrt(r)) to obtain uniform-in-t bounds. A union bound across d_v coordinates yields the displayed dependence.
     Ratio bound (25). Combine alignment, concentration, and (24). The denominator lower bound beta_den controls division sensitivity; the clipping and rounding budgets enter additively.
 
 23. Extended Low-Rank Analysis
@@ -259,23 +259,23 @@ All updates and readouts are O(1) in t for fixed r and r_v.
 
 struct State {
 // Random features
-Matrix<float> R;      // r x d_v   or r x r_v if low-rank
-Vector<float> s;      // r
+Matrix<float> R; // r x d_v or r x r_v if low-rank
+Vector<float> s; // r
 // Preconditioner
-Vector<float> mu;     // r
-Vector<float> sig2;   // r
+Vector<float> mu; // r
+Vector<float> sig2; // r
 // Risk process
-Vector<float> f, mu_tilde, v_tilde;  // r each
-double E_mix;         // scalar e-process mixture
-Vector<double> logE;  // per-lambda accumulators
+Vector<float> f, mu_tilde, v_tilde; // r each
+double E_mix; // scalar e-process mixture
+Vector<double> logE; // per-lambda accumulators
 Vector<double> lambdas; Vector<double> pis;
-double lambda_star;   // predictable tilt
+double lambda_star; // predictable tilt
 // Housekeeping
 double gamma, tau; int r, r_v; bool low_rank;
-Matrix<float> U;      // d_v x r_v, if low_rank
-double beta_floor;    // denominator floor
-double c_clip;        // PRF clip
-Seed prf_seed;        // PRF seed
+Matrix<float> U; // d_v x r_v, if low_rank
+double beta_floor; // denominator floor
+double c_clip; // PRF clip
+Seed prf_seed; // PRF seed
 Hash merkle_prev;
 }
 
@@ -291,36 +291,36 @@ return phi
 
 void Ingest(State& S, const Vector<float>& k_t, const Vector<float>& v_t) {
 phi_t = PRF(k_t, S)
-S.R  = S.gamma * S.R + GER_Kahan(phi_t, (S.low_rank ? (S.U^T * v_t) : v_t))
-S.s  = S.gamma * S.s + KahanAdd(phi_t)
+S.R = S.gamma * S.R + GER_Kahan(phi_t, (S.low_rank ? (S.U^T * v_t) : v_t))
+S.s = S.gamma * S.s + KahanAdd(phi_t)
 // Preconditioner
-S.mu   = (1 - beta_mu) * S.mu   + beta_mu * phi_t
+S.mu = (1 - beta_mu) * S.mu + beta_mu * phi_t
 S.sig2 = (1 - beta_sig)* S.sig2 + beta_sig * square(phi_t - S.mu) + eps
 // Risk
-S.f        = (1 - beta_f)    * S.f        + beta_f    * phi_t
+S.f = (1 - beta_f) * S.f + beta_f * phi_t
 S.mu_tilde = (1 - beta_mu_t) * S.mu_tilde + beta_mu_t * phi_t
-S.v_tilde  = (1 - beta_v_t)  * S.v_tilde  + beta_v_t  * square(phi_t - S.mu_tilde)
-s_star     = (phi_t - S.mu_tilde) ./ sqrt(S.v_tilde + eps)
-Z          = norm2(s_star)
-project_lambda_grid(S)   // uses predictable bprime_hat
-update_e_process_mixture(S, Z)  // (34)-(37)
-emit_audit_record(S)     // Sec. 15
+S.v_tilde = (1 - beta_v_t) * S.v_tilde + beta_v_t * square(phi_t - S.mu_tilde)
+s_star = (phi_t - S.mu_tilde) ./ sqrt(S.v_tilde + eps)
+Z = norm2(s_star)
+project_lambda_grid(S) // uses predictable bprime_hat
+update_e_process_mixture(S, Z) // (34)-(37)
+emit_audit_record(S) // Sec. 15
 }
 
 Vector<float> Query(State& S, const Vector<float>& q) {
-phi_q  = PRF(q, S)
-phi_w  = phi_q ./ sqrt(S.sig2 + eps)
-den    = dot(phi_w, S.s) + max(S.lambda_star, S.beta_floor)
-z      = transpose(phi_w) * S.R
+phi_q = PRF(q, S)
+phi_w = phi_q ./ sqrt(S.sig2 + eps)
+den = dot(phi_w, S.s) + max(S.lambda_star, S.beta_floor)
+z = transpose(phi_w) * S.R
 if S.low_rank: return S.U * (z / den)
-else          : return      (z / den)
+else : return (z / den)
 }
 
 25. Conclusion
-    Under A1–A10 and gamma in (0,1), REVERSE+SCAN achieves constant-memory, O(1)/token estimation of decayed softmax attention with length-free r^{-1/2} approximation error, constructive anytime-valid risk control, and scan-checkable logic certificates. The split between correctness (no whitening, no lambda) and stabilized estimators (whitening plus predictable lambda) provides both unbiasedness and operational robustness. Auditing and one-pass verification make the method suitable for high-assurance streaming deployments.
+    Under A1 - A10 and gamma in (0,1), REVERSE+SCAN achieves constant-memory, O(1)/token estimation of decayed softmax attention with length-free r^{-1/2} approximation error, constructive anytime-valid risk control, and scan-checkable logic certificates. The split between correctness (no whitening, no lambda) and stabilized estimators (whitening plus predictable lambda) provides both unbiasedness and operational robustness. Auditing and one-pass verification make the method suitable for high-assurance streaming deployments.
 
 Appendix A. Length-Free Uniformity via Decay
-For decayed compensated sums {M_t}, PQV <M>*infty <= C/(1 - gamma^2). Freedman’s inequality implies, for centered sub-exponential increments with parameters (nu^2, b), that
+For decayed compensated sums {M_t}, PQV <M>*infty <= C/(1 - gamma^2). Freedman's inequality implies, for centered sub-exponential increments with parameters (nu^2, b), that
 P( sup*{t >= 1} | sum_{j <= t} M_j | >= u ) <= 2 exp( - u^2 / (2 (sigma^2 + b u)) )
 with sigma^2 proportional to <M>_infty. Applying this to phi(q)^T R_t and phi(q)^T s_t yields (22)-(23) without explicit dependence on t.
 
