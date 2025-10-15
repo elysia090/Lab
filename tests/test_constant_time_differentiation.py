@@ -1,4 +1,5 @@
 from math import isclose
+import pytest
 
 from pathlib import Path
 import sys
@@ -19,6 +20,7 @@ spec.loader.exec_module(module)  # type: ignore[union-attr]
 
 ConstantTimeAlgorithm = module.ConstantTimeAlgorithm
 ConstantTimeTemplate = module.ConstantTimeTemplate
+CompiledExpression = module.CompiledExpression
 ExpressionStep = module.ExpressionStep
 PointwiseNonlinearity = module.PointwiseNonlinearity
 
@@ -121,6 +123,39 @@ def test_constant_time_template_builds() -> None:
     assert template.gamma_bound == 0.0
     assert template.neumann_terms >= 1
     assert template.neumann_tail == 0.0
+
+
+def test_compile_expression_is_reusable() -> None:
+    template = build_template()
+    algorithm = ConstantTimeAlgorithm(template)
+    expression = build_expression()
+    compiled = template.compile(expression)
+
+    x = (0.11, -0.22, 0.33)
+    v = (0.5, 0.25, -0.75)
+    cotangent = (1.0,)
+
+    expected_eval = algorithm.evaluate(expression, x)
+    compiled_eval = algorithm.evaluate(compiled, x)
+    assert vector_close(expected_eval, compiled_eval)
+
+    expected_jvp = algorithm.jacobian_vector_product(expression, x, v)
+    compiled_jvp = algorithm.jacobian_vector_product(compiled, x, v)
+    assert vector_close(expected_jvp, compiled_jvp)
+
+    expected_vjp = algorithm.vjp(expression, x, cotangent)
+    compiled_vjp = algorithm.vjp(compiled, x, cotangent)
+    assert vector_close(expected_vjp, compiled_vjp)
+
+
+def test_compile_validates_operator_names() -> None:
+    template = build_template()
+
+    with pytest.raises(KeyError):
+        template.compile((ExpressionStep.linear("missing"),))
+
+    with pytest.raises(KeyError):
+        template.compile((ExpressionStep.nonlinear("missing_nonlin"),))
 
 
 def test_jvp_matches_finite_difference() -> None:
