@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import cos, sin, tanh
-from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Literal, Optional, Sequence, Tuple, Union
 
 Vector = Tuple[float, ...]
 Matrix = Tuple[Tuple[float, ...], ...]
@@ -224,6 +224,30 @@ class ExpressionStep:
         return ExpressionStep("nonlinear", name)
 
 
+@dataclass(frozen=True)
+class _CompiledStep:
+    """Internal helper storing resolved operators for an expression step."""
+
+    kind: Literal["linear", "nonlinear"]
+    name: str
+    operator: Union[LinearOperator, PointwiseNonlinearity]
+
+
+@dataclass(frozen=True)
+class CompiledExpression:
+    """Expression with the operators resolved at compile time.
+
+    Compiled expressions avoid repeated dictionary lookups during runtime and
+    guarantee that all referenced operators exist.  They can be reused across
+    multiple evaluations or derivative computations with the same template.
+    """
+
+    steps: Tuple[_CompiledStep, ...]
+
+    def __iter__(self) -> Iterable[_CompiledStep]:  # pragma: no cover - trivial
+        return iter(self.steps)
+
+
 class ConstantTimeTemplate:
     """Offline data backing the constant-time algorithm."""
 
@@ -312,6 +336,38 @@ class ConstantTimeTemplate:
             raise KeyError(f"unknown linear operator '{name}'")
         return self.linear_operators[name]
 
+    def nonlinearity(self, name: str) -> PointwiseNonlinearity:
+        if name not in self.nonlinearities:
+            raise KeyError(f"unknown nonlinearity '{name}'")
+        return self.nonlinearities[name]
+
+    def compile(self, expression: Sequence[ExpressionStep]) -> CompiledExpression:
+        """Resolve all operators referenced by *expression*.
+
+        The returned :class:`CompiledExpression` can be fed directly to the
+        runtime evaluator.  Compilation performs structural validation once so
+        that subsequent runs cannot fail due to missing operators.
+        """
+
+        steps: List[_CompiledStep] = []
+        for step in expression:
+            if step.kind == "linear":
+                operator: Union[LinearOperator, PointwiseNonlinearity]
+                operator = self.linear(step.name)
+            elif step.kind == "nonlinear":
+                operator = self.nonlinearity(step.name)
+            else:  # pragma: no cover - defensive programming
+                raise ValueError(f"unknown expression step kind '{step.kind}'")
+            steps.append(_CompiledStep(step.kind, step.name, operator))
+        return CompiledExpression(tuple(steps))
+
+    def ensure_compiled(
+        self, expression: Union[Sequence[ExpressionStep], CompiledExpression]
+    ) -> CompiledExpression:
+        if isinstance(expression, CompiledExpression):
+            return expression
+        return self.compile(expression)
+
 
 class ConstantTimeAlgorithm:
     """Runtime evaluator built on top of :class:`ConstantTimeTemplate`."""
@@ -320,33 +376,43 @@ class ConstantTimeAlgorithm:
         self.template = template
 
     # ------------------------------------------------------------------
-    def evaluate(self, expression: Sequence[ExpressionStep], x: Sequence[float] | Vector) -> Vector:
+    def _iter_steps(
+        self, expression: Union[Sequence[ExpressionStep], CompiledExpression]
+    ) -> Iterable[_CompiledStep]:
+        compiled = self.template.ensure_compiled(expression)
+        return compiled
+
+    def evaluate(
+        self,
+        expression: Union[Sequence[ExpressionStep], CompiledExpression],
+        x: Sequence[float] | Vector,
+    ) -> Vector:
         state = _to_vector(x)
-        for step in expression:
+        for step in self._iter_steps(expression):
             if step.kind == "linear":
-                state = self.template.linear(step.name).apply(state)
+                state = step.operator.apply(state)  # type: ignore[union-attr]
             else:
-                nonlin = self.template.nonlinearities[step.name]
+                nonlin = step.operator  # type: ignore[assignment]
                 state = nonlin.apply(state)
         return state
 
     # ------------------------------------------------------------------
     def jacobian_vector_product(
         self,
-        expression: Sequence[ExpressionStep],
+        expression: Union[Sequence[ExpressionStep], CompiledExpression],
         x: Sequence[float] | Vector,
         tangent: Sequence[float] | Vector,
     ) -> Vector:
         primal = _to_vector(x)
         tangent_vec = _to_vector(tangent)
 
-        for step in expression:
+        for step in self._iter_steps(expression):
             if step.kind == "linear":
-                op = self.template.linear(step.name)
+                op = step.operator  # type: ignore[assignment]
                 primal = op.apply(primal)
                 tangent_vec = op.apply(tangent_vec)
             else:
-                nonlin = self.template.nonlinearities[step.name]
+                nonlin = step.operator  # type: ignore[assignment]
                 deriv = nonlin.apply_first_derivative(primal)
                 primal = nonlin.apply(primal)
                 tangent_vec = _vector_pointwise_mul(deriv, tangent_vec)
@@ -355,27 +421,32 @@ class ConstantTimeAlgorithm:
     # ------------------------------------------------------------------
     def vector_jacobian_product(
         self,
-        expression: Sequence[ExpressionStep],
+        expression: Union[Sequence[ExpressionStep], CompiledExpression],
         x: Sequence[float] | Vector,
         cotangent: Sequence[float] | Vector,
     ) -> Vector:
         primal = _to_vector(x)
         primals: List[Vector] = []
 
-        for step in expression:
+        steps = tuple(self._iter_steps(expression))
+        for step in steps:
             primals.append(primal)
             if step.kind == "linear":
-                primal = self.template.linear(step.name).apply(primal)
+                op = step.operator  # type: ignore[assignment]
+                primal = op.apply(primal)
             else:
-                primal = self.template.nonlinearities[step.name].apply(primal)
+                nonlin = step.operator  # type: ignore[assignment]
+                primal = nonlin.apply(primal)
 
         adjoint = _to_vector(cotangent)
 
-        for step, prev in zip(reversed(expression), reversed(primals)):
+        for step, prev in zip(reversed(steps), reversed(primals)):
             if step.kind == "linear":
-                adjoint = _mat_vec_mul(self.template.linear(step.name).adjoint, adjoint)
+                op = step.operator  # type: ignore[assignment]
+                adjoint = _mat_vec_mul(op.adjoint, adjoint)
             else:
-                deriv = self.template.nonlinearities[step.name].apply_first_derivative(prev)
+                nonlin = step.operator  # type: ignore[assignment]
+                deriv = nonlin.apply_first_derivative(prev)
                 adjoint = _vector_pointwise_mul(deriv, adjoint)
 
         return adjoint
@@ -385,7 +456,7 @@ class ConstantTimeAlgorithm:
     # ------------------------------------------------------------------
     def hessian_vector_product(
         self,
-        expression: Sequence[ExpressionStep],
+        expression: Union[Sequence[ExpressionStep], CompiledExpression],
         x: Sequence[float] | Vector,
         tangent: Sequence[float] | Vector,
         cotangent: Sequence[float] | Vector,
@@ -396,16 +467,17 @@ class ConstantTimeAlgorithm:
         primals: List[Vector] = []
         tangents: List[Vector] = []
 
-        for step in expression:
+        steps = tuple(self._iter_steps(expression))
+        for step in steps:
             primals.append(primal)
             tangents.append(tangent_vec)
 
             if step.kind == "linear":
-                op = self.template.linear(step.name)
+                op = step.operator  # type: ignore[assignment]
                 primal = op.apply(primal)
                 tangent_vec = op.apply(tangent_vec)
             else:
-                nonlin = self.template.nonlinearities[step.name]
+                nonlin = step.operator  # type: ignore[assignment]
                 deriv = nonlin.apply_first_derivative(primal)
                 primal = nonlin.apply(primal)
                 tangent_vec = _vector_pointwise_mul(deriv, tangent_vec)
@@ -413,15 +485,13 @@ class ConstantTimeAlgorithm:
         adjoint = _to_vector(cotangent)
         hvp = _vector_zero(len(primal))
 
-        for step, prev_primal, prev_tangent in zip(
-            reversed(expression), reversed(primals), reversed(tangents)
-        ):
+        for step, prev_primal, prev_tangent in zip(reversed(steps), reversed(primals), reversed(tangents)):
             if step.kind == "linear":
-                op = self.template.linear(step.name)
+                op = step.operator  # type: ignore[assignment]
                 adjoint = _mat_vec_mul(op.adjoint, adjoint)
                 hvp = _mat_vec_mul(op.adjoint, hvp)
             else:
-                nonlin = self.template.nonlinearities[step.name]
+                nonlin = step.operator  # type: ignore[assignment]
                 deriv = nonlin.apply_first_derivative(prev_primal)
                 second = nonlin.apply_second_derivative(prev_primal)
                 hvp = _vector_pointwise_add(
@@ -444,6 +514,7 @@ class ConstantTimeAlgorithm:
 __all__ = [
     "ConstantTimeAlgorithm",
     "ConstantTimeTemplate",
+    "CompiledExpression",
     "ExpressionStep",
     "LinearOperator",
     "PointwiseNonlinearity",
