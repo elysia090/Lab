@@ -1,142 +1,171 @@
 Title
-Mass Gap via Identity Factorization (Matrix Factorization), Mosco Convergence, OS Reflection Positivity, and IR Cartan–Kähler Preservation
-— Uniform Lower Bounds from DEC/Čech Gluing —
+Mass Gap via Identity Factorization, Mosco Convergence, OS Reflection Positivity, and IR Cartan–Kahler Preservation
+— Uniform Lower Bounds from DEC/Cech Gluing —
 
 Abstract
-On a complete Kähler manifold with shape-regular meshes, consider the operator acting on 0/1-cochains
-L_a = [ R_a d_a S_a ; W_a^{1/2} B_{Σ,a} ; sqrt(κ) I ],  A_a = L_a^T L_a .
-Under mirror/Robin boundaries, a discrete Green identity plus completing the square yields the Master Identity
-⟨u, A_a u⟩ = || L_a u ||2^2 .
-Using an a-independent discrete Poincaré constant and uniform ellipticity, we obtain a coercive bound
-⟨u, A_a u⟩ ≥ c0 ||u||{0,a}^2,  c0 = min{α, w_min, κ} / (β C_PF^2 + 1) > 0 .
-Whitney–DEC recovery establishes Mosco convergence E_a ⇢_M E and hence strong resolvent/semigroup convergence. Discrete OS reflection positivity follows from a Schur complement argument and is preserved in the limit. Therefore the limit operator A admits a mass gap λ_min(A) ≥ c0. Interpreting A = L^T L as a bosonic square-sum structure, the gap is equivalent to exponential clustering; with SU(3) symmetry, only Cartan data on the Weyl quotient T/W survive in the IR (“IR Cartan–Kähler preservation”). We specify the Robin coefficient, first-order cell-average error, stability under Urn constraints, and model-independence via an AGM sandwich.
-	0.	Setting, Notation, Functional-Analytic Framework
-H1 (Geometry) Complete Kähler (X, ω, J, g), bounded curvature and finitely many covariant derivatives, positive injectivity radius.
-H2 (Meshes) Shape-regular triangulations {T_a}{a↓0} with cell size δ_a → 0.
-H3 (Discrete spaces) 0-cochains V_a = R^{n0(a)}, 1-cochains E_a = R^{n1(a)}. Incidence d_a : V_a → E_a with signed orientation.
-H4 (Hodge weights) *{0,a}, *{1,a}, W_a are diagonal SPD and α I ⪯ *{k,a} ⪯ β I, α I ⪯ W_a ⪯ β I, with w_min := min diag(W_a). Constants α,β independent of a.
-H5 (Whitening and mass) S_a := *{0,a}^{-1/2}, R_a := *{1,a}^{1/2}, κ > 0.
-H6 (Boundary/reflection) Measure-preserving isometric reflection θ with fixed set Σ; meshes compatible with θ. Boundary is mirror-Dirichlet or Robin (coefficient in §12).
-H7 (Whitney–DEC) I_a : H^1(X) → V_a and R_a : V_a → H^1(X) are stable with constants depending only on shape regularity and
-|| R_a I_a v − v ||{L^2} ≤ C δ_a ||v||{H^1},  || d R_a − R_a d_a || ≤ C δ_a .
-H8 (Čech/PoU) A finite cover {U_i} with partition {φ_i} enables local coefficient normalization and DEC gluing.
+On a complete Kahler manifold with shape-regular meshes, define on 0/1-cochains
+L_a = [ Rgrad_a d_a S_a ; W_a^{1/2} B_{Sigma,a} ; sqrt(kappa) I ],   A_a = L_a^T L_a.
+A discrete Green identity plus exact square completion at mirror/Robin boundaries gives the Master Identity
+(u, A_a u) = || L_a u ||2^2.
+With an a-independent discrete Poincare constant and uniform ellipticity we obtain
+(u, A_a u) >= c0 ||u||{0,a}^2,   c0 = min{alpha, w_min, kappa} / (beta_up * C_PF^2 + 1) > 0.
+Whitney–DEC recovery implies Mosco convergence E_a ->_M E and hence strong resolvent/semigroup convergence. Discrete OS reflection positivity holds by a Schur complement and is preserved in the limit. Therefore the limit operator A satisfies a mass gap lambda_min(A) >= c0. Interpreting A = L^T L as a bosonic square-sum, the gap is equivalent to exponential clustering; with SU(3) symmetry, only Cartan data on the Weyl quotient T/W persist in the IR (“IR Cartan–Kahler preservation”). We give an exact Robin coefficient, first-order cell-average error, stability under subspace (Urn) constraints, and model-independence via an arithmetic–geometric mean (AGM) sandwich.
+	0.	Setting, notation, and analytic framework
+H1 (Geometry) Complete Kahler (X, omega, J, g), bounded curvature and finitely many covariant derivatives, positive injectivity radius.
 
-Inner products
-⟨u,v⟩{0,a} := u^T *{0,a} v,   ⟨η,ζ⟩{1,a} := η^T *{1,a} ζ.
-a-independent discrete Poincaré constant C_PF (mean-zero or single-pin), and define C_ := β C_PF^2 + 1 and
-c0 := min{α, w_min, κ} / C_  > 0.
-	1.	Operator and boundary handling
+H2 (Meshes) Shape-regular triangulations {T_a}_{a -> 0+} with cell diameter delta_a -> 0.
+
+H3 (Discrete spaces) V_a = R^{n0(a)} for 0-cochains, E_a = R^{n1(a)} for 1-cochains. d_a : V_a -> E_a is the signed incidence.
+
+H4 (Hodge and weights) Diagonal SPD matrices *{0,a}, *{1,a}, W_a such that
+alpha I <= *_{k,a} <= beta_up I,   alpha I <= W_a <= beta_up I,
+with alpha, beta_up independent of a. Let w_min := min diag(W_a).
+
+H5 (Whitening and mass) S_a := (_{0,a})^{-1/2},  Rgrad_a := (_{1,a})^{1/2},  kappa > 0.
+
+H6 (Boundary/reflection) Measure-preserving isometry theta with fixed set Sigma; meshes compatible with theta. Boundary condition is mirror–Dirichlet or Robin with coefficient prescribed in Sec. 12.
+
+H7 (Whitney–DEC commuting pair) Let Samp_a : H^1(X) -> V_a (sampling) and WhtRec_a : V_a -> H^1(X) (Whitney reconstruction) satisfy
+|| WhtRec_a Samp_a v − v ||{L^2} <= C delta_a ||v||{H^1},   || d (WhtRec_a) − (WhtRec_a) d_a || <= C delta_a,
+with constants depending only on shape-regularity.
+
+H8 (Cech/partition of unity) A finite cover {U_i} with a partition {phi_i} enabling local coefficient normalization and stable DEC gluing.
+
+Inner products and norms
+(u,v){0,a} := u^T (*{0,a}) v,   (eta,zeta){1,a} := eta^T (*{1,a}) zeta,
+||u||{0,a}^2 := (u,u){0,a},     ||eta||{1,a}^2 := (eta,eta){1,a}.
+Let C_PF be an a-independent discrete Poincare constant (mean-zero or one pinned vertex). Define
+Cbar := beta_up * C_PF^2 + 1,   c0 := min{alpha, w_min, kappa} / Cbar > 0.
+	1.	Operator and boundary normalization
 Definition 1.1 (Operator)
-L_a := [ R_a d_a S_a ; W_a^{1/2} B_{Σ,a} ; sqrt(κ) I ],  A_a := L_a^T L_a .
-Lemma 1.2 (Discrete Green identity and boundary absorption)
-⟨u, *{0,a}^{-1} d_a^T *{1,a} d_a u⟩{0,a} = || *{1,a}^{1/2} d_a u ||_2^2 − F_∂(u).
-Mirror boundary gives F_∂ = 0. For Robin, write the normal edge flux ∂_ν^a u and complete the square:
-(∂_ν^a u)^2 = (∂_ν^a u − √β u)^2 + β u^2 − 2 √β u ∂_ν^a u,
-so the boundary functional cancels exactly when β is chosen as in §12.
-	2.	Master Identity and a-independent coercivity
-Proposition 2.1 (Master Identity)  ⟨u, A_a u⟩ = || L_a u ||2^2 and A_a ≻ 0.
-Lemma 2.2 (Discrete Poincaré, a-independent)  For mean-zero (or one pinned vertex),
-||u||{0,a} ≤ C_PF || d_a u ||{1,a}.
+L_a := [ Rgrad_a d_a S_a ; W_a^{1/2} B_{Sigma,a} ; sqrt(kappa) I ],   A_a := L_a^T L_a.
+Discrete Green identity
+(u, (_{0,a})^{-1} d_a^T ({1,a}) d_a u){0,a} = || (*_{1,a})^{1/2} d_a u ||_2^2 − F_boundary(u).
+Mirror boundary gives F_boundary = 0. For Robin, Sec. 12 prescribes beta_a(nu) on each boundary normal edge nu so that completing the square cancels F_boundary exactly.
+	2.	Master identity and a-independent coercivity
+Proposition 2.1 (Master identity)  For all u in V_a,
+(u, A_a u) = || L_a u ||_2^2,  hence A_a is SPD.
+
+Lemma 2.2 (Discrete Poincare, a-independent)  With mean-zero or one pinned vertex,
+||u||{0,a} <= C_PF || d_a u ||{1,a}.
+
 Theorem 2.3 (Coercive lower bound)
-⟨u, A_a u⟩ ≥ c0 ||u||{0,a}^2.
-Proof. From Prop. 2.1,
-⟨u, A_a u⟩ = || R_a d_a S_a u ||2^2 + || W_a^{1/2} B{Σ,a} u ||2^2 + κ ||u||2^2.
-Uniform ellipticity (H4–H5) gives
-|| R_a d_a S_a u ||2^2 ≥ α β^{-1} || d_a u ||{1,a}^2,  ||W_a^{1/2} B{Σ,a} u||2^2 ≥ w_min ||B{Σ,a} u||2^2,  κ ||u||2^2 ≥ κ β^{-1} ||u||{0,a}^2.
-Use Lemma 2.2 to bound ||u||{0,a} by C_PF||d_a u||{1,a}; aggregate terms and normalize by β to obtain
-⟨u, A_a u⟩ ≥ [ min{α, w_min, κ} / (β C_PF^2 + 1) ] ||u||{0,a}^2 = c0 ||u||{0,a}^2.  □
-	3.	Approximation and PoU gluing
-Lemma 3.1 (First-order cell average) If A(x) is Lipschitz with constant L, then ||A − ã_a||∞ ≤ L δ_a.
-Lemma 3.2 (Duhamel) For A,B ⪰ c0 I,  || e^{−tA} − e^{−tB} || ≤ t e^{−t c0} ||A − B||.
-Theorem 3.3 (Semigroup first-order agreement) With the DEC replacement ã_a,
-|| e^{−t A_a} − e^{−t ã_a} || ≤ t e^{−t c0} C L δ_a.
-Proposition 3.4 (Global form by PoU) Define E_a[u] := ∑_i ⟨ φ_i u, A{U_i,a} φ_i u ⟩; PoU overlap errors are o(1) by H8.
+(u, A_a u) >= c0 ||u||_{0,a}^2.
+Proof sketch. From Prop. 2.1,
+(u, A_a u) = || Rgrad_a d_a S_a u ||2^2 + || W_a^{1/2} B{Sigma,a} u ||2^2 + kappa ||u||2^2.
+By H4–H5,
+|| Rgrad_a d_a S_a u ||2^2 >= alpha * beta_up^{-1} || d_a u ||{1,a}^2,
+|| W_a^{1/2} B{Sigma,a} u ||2^2 >= w_min || B{Sigma,a} u ||2^2,
+kappa ||u||2^2 >= kappa * beta_up^{-1} ||u||{0,a}^2.
+Apply Lemma 2.2 to trade ||u||{0,a} for C_PF ||d_a u||{1,a} where needed; collect terms and absorb beta_up to obtain c0. QED.
+	3.	Approximation and Cech/PoU gluing
+Lemma 3.1 (First-order cell average) If a coefficient field A(x) is Lipschitz with constant L, then ||A − A_tilde,a||_inf <= L delta_a.
+
+Lemma 3.2 (Duhamel) If A,B >= c0 I, then for t >= 0,
+|| e^{−tA} − e^{−tB} || <= t e^{−t c0} || A − B ||.
+
+Theorem 3.3 (Semigroup first-order agreement)
+|| e^{−t A_a} − e^{−t A_tilde,a} || <= t e^{−t c0} C L delta_a.
+
+Proposition 3.4 (Global form via PoU)
+Define E_a[u] := sum_i ( phi_i u, A_{U_i,a} phi_i u ). Overlap errors are o(1) by H8 and Lemma 3.1.
 	4.	Mosco convergence and strong limits
-Lemma 4.1 (Recovery sequence) H7 gives || R_a I_a v − v ||_{L^2} → 0 and E_a[I_a v] → E[v].
-Lemma 4.2 (Liminf inequality) If u_a ⇀ u in L^2, then liminf E_a[u_a] ≥ E[u].
-Theorem 4.3 (Mosco) E_a ⇢_M E.
-Theorem 4.4 (Strong resolvent/semigroup) (A_a + λ I)^{−1} → (A + λ I)^{−1} and e^{−t A_a} → e^{−t A} strongly.
-	5.	OS reflection positivity and its preservation
-Lemma 5.1 (Discrete OS) For f supported on the positive side,
-⟨ f, A_a^{−1} Θ_a f ⟩ = || Π_+ L_a^{−1} (f + Θ_a f) ||2^2 ≥ 0.
-Sketch. Block-decompose under reflection: A_a = [ X Y ; Y^T Z ]. By §12, Z ⪰ 0. The Schur complement
-X − Y Z^† Y^T = (Π+ L_a)^T (Π_+ L_a) ⪰ 0,
-yields positivity of the OS bilinear form. □
-Theorem 5.2 (Limit OS) By Theorem 4.4, ⟨ f, A^{−1} Θ f ⟩ = lim_a ⟨ f, A_a^{−1} Θ_a f ⟩ ≥ 0.
-Markov/symmetry properties propagate by contractivity of closed forms.
-	6.	Mass gap is preserved
-Proposition 6.1  λ_min(A_a) ≥ c0 (Theorem 2.3).
-Theorem 6.2  λ_min(A) ≥ limsup_a λ_min(A_a) ≥ c0.
-Corollary 6.3 (Gap)  Δ := inf(σ(A) \ {0}) = λ_min(A) ≥ c0.
-	7.	Urn constraints and subspaces
-Lemma 7.1 Let P_a be the orthogonal projection onto M_a = ker C_a. Then E_{a,M}[v] := E_a[P_a v] is closed.
-Proposition 7.2  λ_min(A_{a,M}) ≥ λ_min(A_a).
-Theorem 7.3 (Mosco on subspaces) If P_a → P strongly, then E_{a,M} ⇢_M E_M. OS positivity and the gap persist.
+Lemma 4.1 (Recovery sequence) From H7,
+|| WhtRec_a Samp_a v − v ||_{L^2} -> 0,   E_a[Samp_a v] -> E[v].
+
+Lemma 4.2 (Liminf) If u_a weakly converges to u in L^2, then liminf E_a[u_a] >= E[u].
+
+Theorem 4.3 (Mosco)  E_a ->_M E.
+
+Theorem 4.4 (Strong resolvent/semigroup)
+(A_a + lambda I)^{-1} -> (A + lambda I)^{-1} strongly for lambda > 0, and e^{−t A_a} -> e^{−t A} strongly for t >= 0.
+	5.	OS reflection positivity and preservation
+Let theta be the reflection, Pi_+ the projection to the positive side. Block-decompose under reflection:
+A_a = [ X  Y ; Y^T  Z ].
+Lemma 5.1 (Discrete OS)
+( f, A_a^{-1} Theta_a f ) = || Pi_+ L_a^{-1} (f + Theta_a f) ||2^2 >= 0  for f supported on the positive side.
+Sketch. Sec. 12 ensures Z >= 0. The Schur complement
+X − Y Z^{dagger} Y^T = (Pi+ L_a)^T (Pi_+ L_a) >= 0
+yields the claim.
+
+Theorem 5.2 (Limit OS)
+( f, A^{-1} Theta f ) = lim_a ( f, A_a^{-1} Theta_a f ) >= 0,
+by Theorem 4.4 and lower semicontinuity of closed forms. Markov/symmetry properties propagate by contractivity.
+	6.	Mass gap in the limit
+Proposition 6.1  lambda_min(A_a) >= c0 by Theorem 2.3.
+Theorem 6.2  lambda_min(A) >= limsup_a lambda_min(A_a) >= c0.
+Corollary 6.3 (Gap)  Delta := inf( spectrum(A) \ {0} ) = lambda_min(A) >= c0.
+	7.	Subspace (Urn) constraints
+Let C_a be a constraint and P_a the orthogonal projector onto M_a := ker C_a.
+Lemma 7.1  E_{a,M}[v] := E_a[P_a v] is closed.
+Proposition 7.2  lambda_min(A_{a,M}) >= lambda_min(A_a).
+Theorem 7.3 (Mosco on subspaces) If P_a -> P strongly, then E_{a,M} ->_M E_M. OS positivity and the gap persist.
 	8.	Square-sum (bosonic) structure and exponential clustering
-Definition 8.1  Cov(O_x,O_y) := ⟨ O_x O_y ⟩ − ⟨ O_x ⟩ ⟨ O_y ⟩.
-Theorem 8.2 (Gap ⇒ exponential clustering) If c0 > 0, then |Cov(O_x,O_y)| ≤ C e^{−c0 |x−y|}.
-Proof. Spectral theorem for A = L^T L with gap c0 gives ||e^{−tA}|| = e^{−t λ_min} ≤ e^{−t c0}; transfer via Laplace representation of two-point functions for gauge-invariant observables yields exponential decay with rate c0. □
-Theorem 8.3 (Clustering ⇒ gap) Uniform exponential decay implies ||e^{−tA}|| = e^{−t λ_min} and hence λ_min ≥ c0.
-Corollary 8.4 (Equivalence) Mass gap c0 > 0 ⇔ exponential clustering rate c0.
-	9.	SU(3) and IR Cartan–Kähler preservation
-Setting SU(3) with Lie algebra decomposition su(3) = h ⊕ ⊕_{α∈Δ} g_α. Introduce projections P_H, P_α for gauge-invariant observables.
-Theorem 9.1 (IR Cartan–Kähler preservation) Under c0 > 0,
-|| P_α Cov(O; r) || ≤ C e^{−c0 r} for all roots α, and lim_{r→∞} P_H Cov(O; r) exists.
-Therefore only Cartan components on the Weyl quotient T/W survive in the IR. No claim of spontaneous symmetry breaking.
-Threshold 9.2 If c0 ↓ 0, root-channel suppression vanishes; Cartan projection purity fails. Threshold is c0.
-	10.	Linearized gravity (applicability)
-For linearized gravity, the gauge-invariant quadratic form is of the type L_grav^T L_grav. Hence the chain “gap = clustering rate = square-sum lower bound” holds verbatim on gauge-invariant observables.
-	11.	Lattice diagnostics (minimal verification protocol)
-Cartan current two-point Γ_H(r): effective mass m_eff(r) := log( Γ_H(r)/Γ_H(r+1) ) → c0.
-Root-channel suppression: Γ_α(r) ≤ C e^{−c0 r} with the same rate.
-Weyl-invariant reconstruction is unique on T/W.
-Mesh uniformity: extracted c0 stable as a → 0 (by §3, §4).
-Boundary invariance: mirror/Robin equivalent (by §1, §12).
-Practical estimator: use a plateau finder on m_eff(r) with automatic monotonicity veto, then a constrained exponential fit with common rate across root channels; report c0 with a jackknife across PoU blocks.
+Definition 8.1  Cov(O_x,O_y) := <O_x O_y> − <O_x><O_y> for gauge-invariant observables.
+Theorem 8.2 (Gap => exponential clustering)
+If lambda_min(A) >= c0 > 0, then |Cov(O_x,O_y)| <= C exp(−c0 * dist(x,y)).
+Sketch. Spectral theorem for A = L^T L and Laplace representation of two-point functions imply ||e^{−tA}|| = exp(−t lambda_min) <= exp(−t c0). Transfer to spatial decay by finite-propagation/elliptic locality of gauge-invariant observables.
+
+Theorem 8.3 (Clustering => gap)
+Uniform exponential clustering with rate c0 implies ||e^{−tA}|| = exp(−t lambda_min) and hence lambda_min >= c0.
+
+Corollary 8.4 (Equivalence)  Mass gap c0 > 0 <=> exponential clustering rate c0.
+	9.	SU(3) and IR Cartan–Kahler preservation
+Let su(3) = h (Cartan) direct-sum (sum over roots alpha of g_alpha). Let P_H, P_alpha be the projections acting on gauge-invariant observables.
+Theorem 9.1 (IR Cartan–Kahler preservation)
+If c0 > 0, then for r -> infinity:
+|| P_alpha Cov(O; r) || <= C exp(−c0 r) for all roots alpha, and  lim_{r->infty} P_H Cov(O; r) exists.
+Thus in the IR only Cartan data on T/W persist. No claim of spontaneous symmetry breaking.
+
+Threshold 9.2  As c0 -> 0+, root-channel suppression vanishes; Cartan projection purity fails. The threshold is c0.
+	10.	Linearized gravity
+For linearized gravity the gauge-invariant quadratic form has the type A_grav = L_grav^T L_grav. Hence “gap = clustering rate = square-sum lower bound” transfers to gauge-invariant observables.
+	11.	Lattice diagnostics (minimal verification)
+
+	1.	Cartan current two-point Gamma_H(r): effective mass m_eff(r) := log( Gamma_H(r) / Gamma_H(r+1) ) -> c0.
+	2.	Root channels: Gamma_alpha(r) <= C exp(−c0 r) with the same rate.
+	3.	Weyl-invariant reconstruction is unique on T/W.
+	4.	Mesh stability: extracted c0 stable as a -> 0 by Secs. 3–4.
+	5.	Boundary invariance: mirror/Robin equivalence by Secs. 1 and 12.
+	6.	Practical fit: plateau finder on m_eff(r) with monotonicity veto, then constrained multi-channel exponential fit sharing a common rate c0; report c0 with jackknife over PoU blocks.
+
 	12.	Robin coefficient (exact square completion)
-For each boundary face with outward normal edge ν = (x→x_ν),
-beta_a(ν) := ({1,a}){νν} / ( ({0,a}){xx} h_ν )  > 0  (h_ν: edge length in physical metric).
-Then the boundary flux term is exactly absorbed by completing the square:
-|| W_a^{1/2} B_{Σ,a} u ||2^2 reproduces β_a(ν) (*{0,a})_{xx} u(x)^2, and F_∂ ≡ 0.
-Shape regularity plus H4 give uniform bounds on {β_a}; hence c0 is invariant under Robin vs mirror.
+For each boundary face with outward normal edge nu = (x -> x_nu) and physical length h_nu, set
+beta_a(nu) := (({1,a}){nu,nu}) / ( ({0,a}){x,x} * h_nu )  > 0.
+Then the boundary flux term cancels exactly upon completing the square, i.e., the contribution of || W_a^{1/2} B_{Sigma,a} u ||_2^2 equals the Robin penalty and F_boundary(u) = 0. By shape-regularity and H4, beta_a(nu) admits uniform positive upper/lower bounds; hence c0 is invariant under choosing mirror vs Robin.
 	13.	Model-independence (AGM sandwich)
-Let A,B ≻ 0 with ellipticity m I ⪯ A,B ⪯ M I (m,M depend only on shape regularity and H4). For the Kubo–Ando geometric mean A#B,
-m I ⪯ A#B ⪯ (A+B)/2 ⪯ (M/m) B and symmetrically (M/m) A.
-Consequently, different Hodge scalings, Robin normalizations, and averaging schemes change constants only by a factor γ = M/m, leaving c0 and Mosco limits invariant up to γ.
+Let A,B be SPD with m I <= A,B <= M I, where m,M depend only on shape-regularity and H4. For the Kubo–Ando geometric mean A#B,
+m I <= A#B <= (A+B)/2 <= (M/m) B,
+and symmetrically with A,B swapped. Consequently, differing Hodge scalings, Robin normalizations, or averaging schemes change constants only by gamma := M/m; c0 and Mosco limits are invariant up to gamma.
 
 Appendix A (Whitney–DEC commuting construction)
-Take I_a as vertex averaging and R_a as cellwise first-order Whitney interpolation. Shape-regularity yields
-|| R_a I_a v − v ||{L^2} ≤ C δ_a ||v||{H^1},   || d R_a − R_a d_a || ≤ C δ_a.
-Combining with the continuous Poincaré inequality establishes a-independent C_PF.
+Choose Samp_a as vertex averaging and WhtRec_a as first-order Whitney interpolation on cells. Shape-regularity yields
+|| WhtRec_a Samp_a v − v ||{L^2} <= C delta_a ||v||{H^1},   || d WhtRec_a − WhtRec_a d_a || <= C delta_a.
+Together with the continuous Poincare inequality, this gives an a-independent discrete C_PF.
 
 Appendix B (Schur complement for the Robin block)
-With reflection splitting, write
-A_a = [ X  Y ; Y^T  Z ].
-By §12, Z ⪰ 0. The Schur complement
-X − Y Z^† Y^T = (Π_+ L_a)^T (Π_+ L_a) ⪰ 0
-implies OS positivity: ⟨ f, A_a^{−1} Θ_a f ⟩ = || Π_+ L_a^{−1} (f + Θ_a f) ||_2^2 ≥ 0.
+Under reflection,
+A_a = [ X  Y ; Y^T  Z ] with Z >= 0 by Sec. 12.
+Then
+X − Y Z^{dagger} Y^T = (Pi_+ L_a)^T (Pi_+ L_a) >= 0,
+so for any f supported on the positive side,
+( f, A_a^{-1} Theta_a f ) = || Pi_+ L_a^{-1} (f + Theta_a f) ||_2^2 >= 0.
 
 Appendix C (Heat-kernel trace pinching)
-For finite-dimensional subspaces P_a V_a,
-e^{−τ λ_min(A_a)} ≤ Tr( e^{−τ A_a} |_{P_a V_a} ) ≤ N(a) e^{−τ λ_min(A_a)}.
-Thus for τ ≥ (log N(a))/ε,
-| −(1/τ) log Tr − λ_min(A_a) | ≤ ε,
-yielding a stable numerical lower bound for the gap.
+For a finite-dimensional subspace P_a V_a,
+exp(−tau lambda_min(A_a)) <= Tr( exp(−tau A_a) |_{P_a V_a} ) <= N(a) exp(−tau lambda_min(A_a)).
+Hence for tau >= (log N(a))/epsilon,
+| −(1/tau) log Tr − lambda_min(A_a) | <= epsilon,
+giving a stable numerical lower bound on the gap.
 
-Reviewer’s dependency quick-path
-Gap: λ_min(A) ≥ c0 from Thm. 2.3 + Thm. 4.4 + Thm. 6.2.
-OS preservation: Lem. 5.1 → Thm. 5.2 (Robin via §12 + App. B).
-IR Cartan–Kähler: Cor. 8.4 → Thm. 9.1 (gauge-invariant projections; PoU in §3).
-Constant dependence: only on α, β, w_min, κ, C_PF (H4–H7, Thm. 2.3).
+Constant-dependence summary
+All final bounds depend only on (alpha, beta_up, w_min, kappa, C_PF) and shape-regularity parameters; PoU overlap and DEC commuting contribute o(1) in a.
 
-Scope and limits (misread prevention)
-IR “Abelianization” here means persistence of Cartan components on T/W; it does not assert spontaneous symmetry breaking.
-OS positivity is asserted for gauge-invariant observables; gauge-fixing subtleties are outside this scope.
-Gravity applicability is restricted to linearized, gauge-invariant quadratic forms.
-
-Notes on implementation and checks (hacky but rigorous)
-	1.	Computing C_PF a-independently: enforce one-pin or mean-zero; check ||u||{0,a} ≤ C_PF ||d_a u||{1,a} by solving a least-squares Poisson on three nested meshes and verifying stability of the fitted C_PF.
-	2.	Robin normalization: verify β_a(ν) by measuring the exact cancellation of the boundary residual in the discrete Green identity to machine precision on planar patches.
-	3.	AGM sandwich: estimate γ = M/m directly from diagonal ranges of *_{k,a} and W_a; report c0 along with γ to make “model-independence” explicit.
-	4.	IR sector test: fit a common rate across all root-channel correlators; fail the test if any root channel exhibits a statistically significant slower rate than the Cartan channel.
+Minimal “hackable” numerical recipe (deterministic)
+	1.	Enforce one-pin or mean-zero so that ||u||{0,a} <= C_PF ||d_a u||{1,a}; estimate C_PF on 3 nested meshes and check stability.
+	2.	Compute beta_a(nu) by Sec. 12; verify machine-precision cancellation of the boundary residual in the discrete Green identity on planar patches.
+	3.	Estimate c0 by two routes and cross-check:
+(i) Joint exponential fit with a common rate across all root-channel correlators Gamma_alpha(r).
+(ii) Heat-kernel pinching of Tr(exp(−tau A_a)|_{P_a V_a}) for moderate tau; increase tau until the bound stabilizes.
+	4.	Report (c0_hat, gamma_hat) where gamma_hat := M/m from diagonal ranges of *_{k,a} and W_a; this makes “model-independence up to gamma” explicit.
 
