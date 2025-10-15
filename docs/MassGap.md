@@ -205,5 +205,4 @@ Identifying *{k,a} with M^{lmp}_{k,a} up to scaling gives Lemma 0.1.
 Appendix E (Boundary closedness and Kahler closed 2-form)
 The Robin normalization of Sec. 12 ensures exact square completion of boundary fluxes and preserves discrete closedness. Under Mosco convergence, d_a -> d in the commuting sense, hence the continuous 2-form omega remains closed (d omega = 0) and nondegenerate by Corollary 2.4.
 
-End of document.
 
