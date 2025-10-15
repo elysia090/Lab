@@ -232,5 +232,3 @@ ans ← num / (max(den, β_floor) + λ)
 
 Appendix C. Practical defaults and knobs
 τ=√d; inputs L2-normalized. λ=1%..5% of rolling median den on a calibration set. r=128..512 typical; increase if r^{-1/2} noise dominates. c=30..50 targeting π_c≤1%. γ∈{0.99,0.995,0.999} per desired L_eff. ORF/SRHT features preferred for variance reduction. Monitors M1–M4 must be wired with alarms that trigger recovery policies F1–F4.
-
-End of memo
