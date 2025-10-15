@@ -1,56 +1,47 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-LARCH-δRAG (refined) — grid L1 harness with receipts and bitset hubs
-- O(1) query via 2-hop hub factorization with lattice cover / Čech nerve portals
-- O(0) via urn dictionary (hysteresis + TTL)
-- Exact on 2D L1 grid with axis portals; optional diagonal portals
-- Deterministic, auditable, reproducible
-
-Python >= 3.10
-"""
+# larch_deltarag_o01.py
+# O(0)/(1) 強制版 — 2D L1 グリッド実証ハーネス（決定論・監査可能）
 
 from __future__ import annotations
 from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Tuple, Set, Optional, Iterable
 from collections import defaultdict, Counter
-import argparse, json, math, random, sys, time, csv, hashlib
+import argparse, json, math, random, sys, time, hashlib
 
 Coord = Tuple[int, int]
 
-# ------------ basic L1 metric ------------
-
 def manhattan(a: Coord, b: Coord) -> int:
-    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+    return abs(a[0]-b[0]) + abs(a[1]-b[1])
 
-# ------------ config / receipts / stats ------------
+# ===================== Config / Receipts / Stats =====================
 
 @dataclass(frozen=True)
 class Config:
     n: int = 32
-    scales: Tuple[int, ...] = (3, 6, 10)              # radii R_ℓ
-    add_diagonal_portal: bool = False                 # add (±2R,±2R) portals
-    urn_topk: int = 2000
-    urn_hyst_up: int = 5                              # promote threshold
-    urn_hyst_down: int = 2                            # evict threshold
-    urn_ttl: int = 200000                             # forget if not used
+    scales: Tuple[int, ...] = (3, 6, 10)    # 半径群 Rℓ
+    add_diag: bool = False                  # 対角ポータルも置く
     seed: int = 42
+
+    # URN(O(0))
+    urn_topk: int = 2000
+    urn_up: int = 5
+    urn_down: int = 2
+    urn_ttl: int = 200000
+
+    # O(1) 強制（ハブ上限）
+    kappa_cap: int = 128                    # |H(v)| のハード上限（定数）
+    crop: float = 1.0                       # 中央領域サンプリング（境界バイアス低減）
+
+    # 実験
     pairs: int = 8000
     skewed: bool = False
     hot_k: int = 200
     frac_hot: float = 0.85
     total: int = 20000
-    crop: float = 1.0                                 # 0<crop<=1.0 sample only central crop*n
-    audit_frac: float = 0.0                           # 0..1 dump receipts for this fraction
-    zorder_layout: bool = True                        # improve cache locality
+
+    # 監査
+    audit_frac: float = 0.0
     export_jsonl: Optional[str] = None
-    export_csv: Optional[str] = None
-    runs: int = 1                                     # repeat uniform runs
-    n_list: Optional[Tuple[int, ...]] = None          # override n with a list to sweep
-    diag_portal_first: bool = False                   # diagonal portal priority
-    # sanity bounds (debugging / invariants)
-    max_scales: int = 8
-    max_incident_clusters_per_vertex: int = 16
 
 @dataclass
 class Receipt:
@@ -62,23 +53,23 @@ class Receipt:
 class Stats:
     n: int
     scales: Tuple[int, ...]
-    kappa_design: int
-    max_hubs_per_vertex: int
+    kappa_cap: int
     avg_hubs_per_vertex: float
+    max_hubs_per_vertex: int
     avg_candidates: float
-    p50_candidates: float
+    p50_candidates: int
     p95_candidates: int
     p99_candidates: int
+    fallback_rate: float
+    empty_intersection_rate: float
     exact_rate: float
     mean_stretch: float
     p99_stretch: float
     cache_hit_rate: float
-    Δ_empirical_max: int
-    κ_empirical_p99: int
     pairs: int
     elapsed_ms: float
 
-# ------------ cover / clusters / portals ------------
+# ===================== Cover / Portals =====================
 
 @dataclass(frozen=True)
 class Cluster:
@@ -91,33 +82,29 @@ class CoverScale:
     R: int
     centers: List[Coord]
     clusters: Dict[Coord, Cluster]
-    # portals between centers, keyed by frozenset({cA, cB}) -> portal Coord
     portals: Dict[frozenset, Coord] = field(default_factory=dict)
+    portals_by_center: Dict[Coord, List[Coord]] = field(default_factory=lambda: defaultdict(list))
+    owner_center: Dict[Coord, Coord] = field(default_factory=dict)
 
 class CoverBuilder:
-    """
-    Four-phase shifted lattice of L1 balls, stride 2R (correct).
-    """
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.cover: List[CoverScale] = []
 
     def _grid_l1_ball(self, c: Coord, R: int, n: int) -> Tuple[Coord, ...]:
-        x0, y0 = c
+        x0,y0 = c
         vs: List[Coord] = []
-        for dx in range(-R, R + 1):
-            rem = R - abs(dx)
+        for dx in range(-R, R+1):
             x = x0 + dx
-            if x < 0 or x >= n: 
-                continue
-            for dy in range(-rem, rem + 1):
+            if x < 0 or x >= n: continue
+            rem = R - abs(dx)
+            for dy in range(-rem, rem+1):
                 y = y0 + dy
                 if 0 <= y < n:
-                    vs.append((x, y))
+                    vs.append((x,y))
         return tuple(vs)
 
     def _place_centers(self, R: int, n: int) -> List[Coord]:
-        step = max(2 * R, 2)   # correct stride
+        step = max(2*R, 2)  # 正：±2R
         centers = set()
         for ox in (0, R):
             for oy in (0, R):
@@ -125,168 +112,148 @@ class CoverBuilder:
                 while x < n:
                     y = oy
                     while y < n:
-                        centers.add((x, y))
+                        centers.add((x,y))
                         y += step
                     x += step
         return sorted(centers)
 
     def build(self, n: int) -> List[CoverScale]:
-        assert len(self.cfg.scales) <= self.cfg.max_scales
-        self.cover = []
+        cover: List[CoverScale] = []
         for R in self.cfg.scales:
             centers = self._place_centers(R, n)
-            clusters = {c: Cluster(R=R, center=c, vertices=self._grid_l1_ball(c, R, n)) for c in centers}
-            self.cover.append(CoverScale(R=R, centers=centers, clusters=clusters))
-        return self.cover
-
-class PortalBuilder:
-    """
-    Axis-neighbor centers at ±(2R,0),(0,2R); diagonals optional ±(2R,±2R).
-    """
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-
-    @staticmethod
-    def _intersection_portal(cA: Cluster, cB: Cluster) -> Optional[Coord]:
-        inter = set(cA.vertices).intersection(cB.vertices)
-        if not inter:
-            return None
-        mx = (cA.center[0] + cB.center[0]) // 2
-        my = (cA.center[1] + cB.center[1]) // 2
-        # pick L1-closest to midpoint; break ties lexicographically (deterministic)
-        return min(inter, key=lambda p: (abs(p[0]-mx) + abs(p[1]-my), p[0], p[1]))
-
-    def add_portals(self, cover: List[CoverScale]) -> None:
+            clusters = {c: Cluster(R=R, center=c, vertices=self._grid_l1_ball(c,R,n)) for c in centers}
+            cs = CoverScale(R=R, centers=centers, clusters=clusters)
+            # owner_center（各点→属する中心）
+            for clu in clusters.values():
+                for v in clu.vertices:
+                    cs.owner_center[v] = clu.center
+            cover.append(cs)
+        # portals
         for cs in cover:
-            cs.portals = {}
             R = cs.R
-            deltas_axis = [(2*R,0), (-2*R,0), (0,2*R), (0,-2*R)]
-            deltas_diag = [(2*R,2*R), (-2*R,-2*R), (2*R,-2*R), (-2*R,2*R)] if self.cfg.add_diagonal_portal else []
-            # deterministic order; optional diagonal priority control
-            deltas = (deltas_diag + deltas_axis) if self.cfg.diag_portal_first else (deltas_axis + deltas_diag)
+            # 軸隣接 ±(2R,0),(0,2R)
+            deltas = [(2*R,0),(-2*R,0),(0,2*R),(0,-2*R)]
+            if self.cfg.add_diag:
+                deltas += [(2*R,2*R),(-2*R,-2*R),(2*R,-2*R),(-2*R,2*R)]
             centers_set = set(cs.centers)
-            for (cx, cy) in cs.centers:
-                for dx, dy in deltas:
-                    nx, ny = (cx + dx, cy + dy)
-                    if (nx, ny) not in centers_set:
-                        continue
-                    cA, cB = cs.clusters[(cx, cy)], cs.clusters[(nx, ny)]
-                    p = self._intersection_portal(cA, cB)
-                    if p is not None:
-                        key = frozenset(((cx, cy), (nx, ny)))
-                        cs.portals.setdefault(key, p)
+            for (cx,cy) in cs.centers:
+                for dx,dy in deltas:
+                    nx,ny = cx+dx, cy+dy
+                    if (nx,ny) not in centers_set: continue
+                    A,B = cs.clusters[(cx,cy)], cs.clusters[(nx,ny)]
+                    inter = set(A.vertices).intersection(B.vertices)
+                    if not inter: continue
+                    mx,my = (cx+nx)//2, (cy+ny)//2
+                    p = min(inter, key=lambda t:(abs(t[0]-mx)+abs(t[1]-my), t[0],t[1]))
+                    key = frozenset(((cx,cy),(nx,ny)))
+                    if key not in cs.portals:
+                        cs.portals[key] = p
+                        cs.portals_by_center[(cx,cy)].append(p)
+                        cs.portals_by_center[(nx,ny)].append(p)
+        return cover
 
-# ------------ hubs: build + bitset encoding ------------
+# ===================== Hubs (bounded) =====================
 
 class HubBuilder:
     def __init__(self, cfg: Config):
         self.cfg = cfg
 
-    @staticmethod
-    def _invert(cover: List[CoverScale], n: int) -> List[Dict[Coord, List[Cluster]]]:
+    def build_sets(self, cover: List[CoverScale], n: int) -> Dict[Coord, List[Coord]]:
+        # v -> small list (<= κ_cap) of hubs
+        H: Dict[Coord, List[Coord]] = defaultdict(list)
+        # 逆引き：v -> 属するクラスタ列（Δ は定数）
         inv_per_scale: List[Dict[Coord, List[Cluster]]] = []
         for cs in cover:
             inv: Dict[Coord, List[Cluster]] = defaultdict(list)
-            for c in cs.clusters.values():
-                for v in c.vertices:
-                    inv[v].append(c)
+            for clu in cs.clusters.values():
+                for v in clu.vertices:
+                    inv[v].append(clu)
             inv_per_scale.append(inv)
-        return inv_per_scale
 
-    def build_sets(self, cover: List[CoverScale], n: int) -> Dict[Coord, Set[Coord]]:
-        H: Dict[Coord, Set[Coord]] = defaultdict(set)
-        inv_per_scale = self._invert(cover, n)
+        cap = int(self.cfg.kappa_cap)
         for cs, inv in zip(cover, inv_per_scale):
             for v, clus in inv.items():
-                if len(clus) > self.cfg.max_incident_clusters_per_vertex:
-                    # still include; we only warn if desired
-                    pass
+                work: List[Coord] = []
                 for clu in clus:
-                    H[v].add(clu.center)
-                    # portals on edges incident to this cluster
-                    for key, portal in cs.portals.items():
-                        if clu.center in key:
-                            H[v].add(portal)
+                    work.append(clu.center)
+                    work.extend(cs.portals_by_center.get(clu.center, ()))
+                # 決定論的ソート・重複除去
+                work = sorted(set(work), key=lambda p:(p[0],p[1]))
+                # ハードキャップ（中心優先→ポータル）
+                if len(work) > cap:
+                    # 中心を先に、残りを先頭から詰める
+                    centers = [c.center for c in clus]
+                    centers = sorted(set(centers), key=lambda p:(p[0],p[1]))
+                    rest = [w for w in work if w not in centers]
+                    clipped = (centers + rest)[:cap]
+                    H[v] = clipped
+                else:
+                    H[v] = work
         return H
 
     @staticmethod
-    def _zorder_key(p: Coord) -> int:
-        # 16-bit interleave (for n<=65535) — enough here
-        x, y = p
-        def spread(k: int) -> int:
-            k = (k | (k << 8)) & 0x00FF00FF
-            k = (k | (k << 4)) & 0x0F0F0F0F
-            k = (k | (k << 2)) & 0x33333333
-            k = (k | (k << 1)) & 0x55555555
-            return k
-        return (spread(x) << 1) | spread(y)
+    def make_fingerprint(hubs: List[Coord]) -> Tuple[int,int]:
+        # 128bit 固定（2x64bit）：3ハッシュにするなら 192bit に拡張可
+        A = B = 0
+        for h in hubs:
+            # タブレーション擬似：座標で2本
+            a = (hash((h[0]<<16) ^ h[1]) & 0xFFFFFFFFFFFFFFFF)
+            b = (hash((h[1]<<16) ^ h[0]) & 0xFFFFFFFFFFFFFFFF)
+            A |= 1 << (a & 63)
+            B |= 1 << (b & 63)
+        return (A,B)
 
-    def encode_bitsets(self, H_sets: Dict[Coord, Set[Coord]], zorder: bool = True):
-        # global hub id mapping
-        hubs: List[Coord] = sorted({h for s in H_sets.values() for h in s},
-                                   key=(self._zorder_key if zorder else lambda p: (p[0], p[1])))
-        hub_to_idx: Dict[Coord, int] = {h:i for i,h in enumerate(hubs)}
-        # per-vertex bitset
-        bitset: Dict[Coord, int] = {}
-        for v, s in H_sets.items():
-            m = 0
-            for h in s:
-                m |= (1 << hub_to_idx[h])
-            bitset[v] = m
-        return hubs, hub_to_idx, bitset
+    def encode(self, H_sets: Dict[Coord, List[Coord]]):
+        # 小配列（≤κ_cap）＋ 128bit フィンガープリント
+        small: Dict[Coord, Tuple[Coord,...]] = {}
+        fp: Dict[Coord, Tuple[int,int]] = {}
+        for v, arr in H_sets.items():
+            t = tuple(arr[:self.cfg.kappa_cap])
+            small[v] = t
+            fp[v] = self.make_fingerprint(list(t))
+        return small, fp
 
-# ------------ URN dictionary (O(0)) ------------
+# ===================== URN (O(0)) =====================
 
 class UrnCache:
-    """
-    Pólya-like reinforcement with hysteresis + TTL.
-    """
     def __init__(self, topk: int, up: int, down: int, ttl: int):
-        self.topk = int(topk)
-        self.up = max(1, int(up))
-        self.down = max(0, int(down))
-        self.ttl = int(ttl)
+        self.topk = int(topk); self.up = int(up); self.down = int(down); self.ttl = int(ttl)
         self.counts: Counter = Counter()
-        self.cache: Dict[Tuple[Coord, Coord], Tuple[int,int]] = {}  # key -> (value, last_seen_tick)
+        self.cache: Dict[Tuple[Coord,Coord], Tuple[int,int]] = {}  # key -> (value, last_seen_clock)
         self.clock = 0
 
     @staticmethod
-    def _key(u: Coord, v: Coord) -> Tuple[Coord, Coord]:
-        return (u, v) if u <= v else (v, u)
+    def _key(u: Coord, v: Coord) -> Tuple[Coord,Coord]:
+        return (u,v) if u <= v else (v,u)
 
     def get(self, u: Coord, v: Coord) -> Optional[int]:
         self.clock += 1
-        k = self._key(u, v)
+        k = self._key(u,v)
         if k in self.cache:
-            val, _ = self.cache[k]
+            val,_ = self.cache[k]
             self.cache[k] = (val, self.clock)
             return val
         return None
 
     def observe_and_promote(self, u: Coord, v: Coord, value: int) -> None:
         self.clock += 1
-        k = self._key(u, v)
+        k = self._key(u,v)
         self.counts[k] += 1
-        # TTL decay
-        if self.ttl and (self.clock & 0x3FF) == 0:  # periodic sweep
-            dead = [kk for kk,(val,last) in self.cache.items() if self.clock - last > self.ttl]
-            for kk in dead:
-                del self.cache[kk]
-        # already cached
-        if k in self.cache:
-            return
-        # promote only if count passes up-threshold, or free slots
+        # TTL スイープ（疎）
+        if self.ttl and (self.clock & 0x3FF) == 0:
+            stale = [kk for kk,(_,last) in self.cache.items() if self.clock - last > self.ttl]
+            for kk in stale: del self.cache[kk]
+        if k in self.cache: return
         if len(self.cache) < self.topk or self.counts[k] >= self.up:
-            # if full, evict the min-count entry whose count <= down
             if len(self.cache) >= self.topk:
-                least = min(self.cache.keys(), key=lambda t: (self.counts[t], self.cache[t][1]))
+                least = min(self.cache.keys(), key=lambda t:(self.counts[t], self.cache[t][1]))
                 if self.counts[least] <= self.down:
                     del self.cache[least]
                 else:
                     return
             self.cache[k] = (value, self.clock)
 
-# ------------ query engine with receipts ------------
+# ===================== Query Engine (O(1) enforced) =====================
 
 @dataclass
 class Witness:
@@ -296,320 +263,251 @@ class Witness:
     truth: int
     chosen_hub: Optional[Coord]
     candidates: int
-    cand_hubs: List[Coord]
+    used_fallback: bool
+    cand_sample: List[Coord]
 
 class QueryEngine:
     def __init__(self, cfg: Config, cover: List[CoverScale],
-                 hubs: List[Coord], hub_to_idx: Dict[Coord,int],
-                 bitset: Dict[Coord,int], urn: UrnCache):
+                 H_small: Dict[Coord, Tuple[Coord,...]],
+                 H_fp: Dict[Coord, Tuple[int,int]],
+                 urn: UrnCache):
         self.cfg = cfg
         self.cover = cover
-        self.hubs = hubs
-        self.hub_to_idx = hub_to_idx
-        self.bitset = bitset
+        self.small = H_small
+        self.fp = H_fp
         self.urn = urn
-
-    def _coarsest_fallback(self, u: Coord, v: Coord) -> List[int]:
-        """
-        Fallback hubs: coarsest centers of the clusters containing u and v.
-        """
-        cs = self.cover[-1]
-        cu = next((c.center for c in cs.clusters.values() if u in c.vertices), None)
-        cv = next((c.center for c in cs.clusters.values() if v in c.vertices), None)
-        idxs: List[int] = []
-        if cu is not None and cu in self.hub_to_idx:
-            idxs.append(self.hub_to_idx[cu])
-        if cv is not None and cv in self.hub_to_idx:
-            idxs.append(self.hub_to_idx[cv])
-        return idxs
+        # 最も粗い層の owner_center を参照（fallback O(1)）
+        self.owner_coarse = cover[-1].owner_center
+        self.portals_by_center_coarse = cover[-1].portals_by_center
 
     @staticmethod
-    def _iter_bits(mask: int):
-        while mask:
-            lsb = mask & -mask
-            idx = (lsb.bit_length() - 1)
-            yield idx
-            mask ^= lsb
+    def _intersect_small(a: Tuple[Coord,...], b: Tuple[Coord,...]) -> List[Coord]:
+        # 両方 ≤ κ_cap（定数）。二重ループでも O(1)。
+        out: List[Coord] = []
+        for x in a:
+            for y in b:
+                if x == y:
+                    out.append(x)
+        return out
 
-    def query(self, u: Coord, v: Coord, audit: bool = False) -> Tuple[int, int, bool, Optional[Witness]]:
+    def _fallback_candidates(self, u: Coord, v: Coord) -> List[Coord]:
+        # 定数個（≤6）だけ返す
+        cu = self.owner_coarse.get(u); cv = self.owner_coarse.get(v)
+        cand: List[Coord] = []
+        if cu: cand.append(cu)
+        if cv and cv != cu: cand.append(cv)
+        # 代表ポータル各 1〜2
+        pu = self.portals_by_center_coarse.get(cu, []) if cu else []
+        pv = self.portals_by_center_coarse.get(cv, []) if cv else []
+        if pu: cand.append(pu[0])
+        if pv: cand.append(pv[0])
+        # ここまでで <=4。対角を足すなら各2つ目を条件付きで
+        if len(pu) > 1: cand.append(pu[1])
+        if len(pv) > 1 and len(cand) < 6: cand.append(pv[1])
+        # 決定論のため重複排除
+        uniq = []
+        seen = set()
+        for c in cand:
+            if c not in seen:
+                seen.add(c); uniq.append(c)
+        return uniq[:6]
+
+    def query(self, u: Coord, v: Coord, audit: bool=False) -> Tuple[int,int,bool,Optional[Witness]]:
         if u == v:
-            w = Witness(u, v, 0, 0, None, 1, [])
+            w = Witness(u,v,0,0,None,1,False,[])
             return 0, 1, False, (w if audit else None)
-        cached = self.urn.get(u, v)
+
+        cached = self.urn.get(u,v)
         if cached is not None:
             if audit:
-                w = Witness(u, v, cached, manhattan(u,v), None, 0, [])
+                w = Witness(u,v,cached,manhattan(u,v),None,0,False,[])
                 return cached, 0, True, w
             return cached, 0, True, None
 
-        bs_u = self.bitset[u]
-        bs_v = self.bitset[v]
-        inter_mask = bs_u & bs_v
-        cand_idx: List[int] = list(self._iter_bits(inter_mask))
-        if not cand_idx:
-            cand_idx = self._coarsest_fallback(u, v)
+        Au,Bu = self.fp[u]; Av,Bv = self.fp[v]
+        used_fallback = False
+        if (Au & Av) and (Bu & Bv):
+            inter = self._intersect_small(self.small[u], self.small[v])
+        else:
+            inter = []
 
-        best = math.inf
-        chosen = None
-        for i in cand_idx:
-            h = self.hubs[i]
-            d = manhattan(u, h) + manhattan(h, v)
+        cand: List[Coord]
+        if inter:
+            cand = inter
+        else:
+            cand = self._fallback_candidates(u,v)
+            used_fallback = True
+
+        best = math.inf; chosen = None
+        for h in cand:
+            d = manhattan(u,h) + manhattan(h,v)
             if d < best:
-                best = d
-                chosen = h
+                best = d; chosen = h
         best = 0 if not math.isfinite(best) else int(best)
-        self.urn.observe_and_promote(u, v, best)
-        if audit:
-            w = Witness(u, v, best, manhattan(u, v), chosen, len(cand_idx), [self.hubs[i] for i in cand_idx][:32])
-            return best, len(cand_idx), False, w
-        return best, len(cand_idx), False, None
+        self.urn.observe_and_promote(u,v,best)
 
-# ------------ evaluator / runners ------------
+        if audit:
+            w = Witness(u,v,best,manhattan(u,v),chosen,len(cand),used_fallback,cand[:8])
+            return best, len(cand), False, w
+        return best, len(cand), False, None
+
+# ===================== Evaluator =====================
 
 class Evaluator:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.rng = random.Random(cfg.seed)
-        self._build_all()
-
-    def _build_all(self):
-        n = self.cfg.n
-        cover = CoverBuilder(self.cfg).build(n)
-        PortalBuilder(self.cfg).add_portals(cover)
-        H_sets = HubBuilder(self.cfg).build_sets(cover, n)
-        hubs, hub_to_idx, bitset = HubBuilder(self.cfg).encode_bitsets(H_sets, zorder=self.cfg.zorder_layout)
-        urn = UrnCache(self.cfg.urn_topk, self.cfg.urn_hyst_up, self.cfg.urn_hyst_down, self.cfg.urn_ttl)
+        self.cover = CoverBuilder(cfg).build(cfg.n)
+        H_sets = HubBuilder(cfg).build_sets(self.cover, cfg.n)
+        self.avg_hubs = sum(len(s) for s in H_sets.values())/len(H_sets)
+        self.max_hubs = max(len(s) for s in H_sets.values())
+        self.H_small, self.H_fp = HubBuilder(cfg).encode(H_sets)
+        self.urn = UrnCache(cfg.urn_topk, cfg.urn_up, cfg.urn_down, cfg.urn_ttl)
         # receipts
-        conf_sha = hashlib.sha256(json.dumps(asdict(self.cfg), sort_keys=True).encode()).hexdigest()
+        conf_sha = hashlib.sha256(json.dumps(asdict(cfg), sort_keys=True).encode()).hexdigest()
         cover_digest = hashlib.sha256()
-        for cs in cover:
-            cover_digest.update(str((cs.R, tuple(cs.centers))).encode())
-            # only counts to keep stable
-            cover_digest.update(str(len(cs.portals)).encode())
-        hubs_sha = hashlib.sha256(str(len(hubs)).encode() + b"|" + str(sum(len(s) for s in H_sets.values())).encode()).hexdigest()
+        for cs in self.cover:
+            cover_digest.update(str((cs.R, len(cs.centers), len(cs.portals))).encode())
+        hubs_sha = hashlib.sha256(str(sum(len(v) for v in self.H_small.values())).encode()).hexdigest()
         self.receipt = Receipt(conf_sha, cover_digest.hexdigest(), hubs_sha)
 
-        self.cover = cover
-        self.H_sets = H_sets
-        self.hubs = hubs
-        self.hub_to_idx = hub_to_idx
-        self.bitset = bitset
-        self.urn = urn
-
-        self.max_hubs = max(len(H_sets[v]) for v in H_sets)
-        self.avg_hubs = sum(len(H_sets[v]) for v in H_sets) / len(H_sets)
-        # Δ empirical max per scale
-        self.delta_max = self._empirical_delta_max()
-
-    def _empirical_delta_max(self) -> int:
-        # maximum number of clusters covering a vertex across all scales
-        invs = []
-        for cs in self.cover:
-            inv: Dict[Coord, int] = defaultdict(int)
-            for clu in cs.clusters.values():
-                for v in clu.vertices:
-                    inv[v] += 1
-            invs.append(max(inv.values() or [0]))
-        return max(invs or [0])
-
     def _pairs_uniform(self, num_pairs: int) -> Iterable[Tuple[Coord,Coord]]:
-        n = self.cfg.n
-        # central crop
-        crop = max(0.0, min(1.0, float(self.cfg.crop)))
-        x0 = y0 = int((1.0 - crop) * n / 2)
-        x1 = y1 = n - x0
+        n = self.cfg.n; crop = max(0.0, min(1.0, self.cfg.crop))
+        x0 = y0 = int((1.0 - crop) * n / 2); x1 = y1 = n - x0
         for _ in range(num_pairs):
-            yield (self.rng.randrange(x0, x1), self.rng.randrange(y0, y1)), \
-                  (self.rng.randrange(x0, x1), self.rng.randrange(y0, y1))
+            yield (self.rng.randrange(x0,x1), self.rng.randrange(y0,y1)), \
+                  (self.rng.randrange(x0,x1), self.rng.randrange(y0,y1))
 
     def _pairs_skewed(self, total: int, hot_k: int, frac_hot: float):
-        n = self.cfg.n
-        crop = max(0.0, min(1.0, float(self.cfg.crop)))
-        x0 = y0 = int((1.0 - crop) * n / 2)
-        x1 = y1 = n - x0
-        verts = [(self.rng.randrange(x0, x1), self.rng.randrange(y0, y1)) for _ in range(2 * hot_k)]
-        hot_pairs = [(verts[2*i], verts[2*i+1]) for i in range(hot_k)]
+        n = self.cfg.n; crop = max(0.0, min(1.0, self.cfg.crop))
+        x0 = y0 = int((1.0 - crop) * n / 2); x1 = y1 = n - x0
+        verts = [(self.rng.randrange(x0,x1), self.rng.randrange(y0,y1)) for _ in range(2*hot_k)]
+        hot = [(verts[2*i], verts[2*i+1]) for i in range(hot_k)]
         for _ in range(total):
             if self.rng.random() < frac_hot:
-                yield hot_pairs[self.rng.randrange(hot_k)]
+                yield hot[self.rng.randrange(hot_k)]
             else:
-                yield (self.rng.randrange(x0, x1), self.rng.randrange(y0, y1)), \
-                      (self.rng.randrange(x0, x1), self.rng.randrange(y0, y1))
+                yield (self.rng.randrange(x0,x1), self.rng.randrange(y0,y1)), \
+                      (self.rng.randrange(x0,x1), self.rng.randrange(y0,y1))
 
-    def run_uniform(self, num_pairs: int, audit_frac: float = 0.0,
-                    jsonl: Optional[str] = None) -> Stats:
-        engine = QueryEngine(self.cfg, self.cover, self.hubs, self.hub_to_idx, self.bitset, self.urn)
+    def run_uniform(self, num_pairs: int, audit_frac: float=0.0, jsonl: Optional[str]=None) -> Stats:
+        eng = QueryEngine(self.cfg, self.cover, self.H_small, self.H_fp, self.urn)
         t0 = time.perf_counter()
-        exact = 0
-        total = 0
+        exact=tot=hits=0
         stretches: List[float] = []
         cand_sizes: List[int] = []
-        cache_hits = 0
-        κ_empirical: List[int] = []
-        dump_audit = jsonl is not None and audit_frac > 0.0
-        f = open(jsonl, "a", encoding="utf-8") if dump_audit else None
+        empty_intersections = 0
+        fallbacks = 0
+        dump = jsonl and audit_frac>0
+        f = open(jsonl,"a",encoding="utf-8") if dump else None
 
-        for u, v in self._pairs_uniform(num_pairs):
-            audit = (dump_audit and (self.rng.random() < audit_frac))
-            est, k, hit, w = engine.query(u, v, audit=audit)
-            truth = manhattan(u, v)
-            exact += int(est == truth)
-            total += 1
+        for u,v in self._pairs_uniform(num_pairs):
+            audit = dump and (self.rng.random() < audit_frac)
+            est, k, hit, w = eng.query(u,v,audit=audit)
+            truth = manhattan(u,v)
+            exact += int(est==truth)
+            tot += 1
             if est != truth:
-                stretches.append(est / max(truth, 1))
+                stretches.append(est/max(truth,1))
             cand_sizes.append(k)
-            κ_empirical.append(k)
-            cache_hits += int(hit)
-            if w and f:
-                record = {
-                    "u": w.u, "v": w.v, "best": w.best, "truth": w.truth,
-                    "chosen_hub": w.chosen_hub, "candidates": w.candidates,
-                    "cand_hubs_sample": w.cand_hubs, "receipt": asdict(self.receipt)
-                }
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            hits += int(hit)
+            if w:
+                fallbacks += int(w.used_fallback)
+                empty_intersections += int(w.candidates>0 and w.used_fallback)  # 近似 proxy
+                f.write(json.dumps({
+                    "u":w.u,"v":w.v,"best":w.best,"truth":w.truth,
+                    "chosen_hub":w.chosen_hub,"candidates":w.candidates,
+                    "used_fallback":w.used_fallback,"cand_sample":w.cand_sample,
+                    "receipt":asdict(self.receipt)
+                }, ensure_ascii=False) + "\n")
 
-        if f:
-            f.close()
+        if f: f.close()
 
         cand_sorted = sorted(cand_sizes)
-        def pctl(arr, p):
-            if not arr: return 0
-            idx = min(len(arr)-1, max(0, int(p * len(arr))))
-            return arr[idx]
-        p50 = pctl(cand_sorted, 0.50)
-        p95 = pctl(cand_sorted, 0.95)
-        p99 = pctl(cand_sorted, 0.99)
-
-        mean_stretch = (sum(stretches) / len(stretches)) if stretches else 1.0
-        p99_stretch = (sorted(stretches)[min(len(stretches)-1, int(0.99*len(stretches)))] if stretches else 1.0)
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        # κ p99
-        κ_p99 = sorted(κ_empirical)[min(len(κ_empirical)-1, int(0.99*len(κ_empirical)))] if κ_empirical else 0
-
-        # design κ (upper bound) = L · Δ · (1 + d_port)
-        L = len(self.cfg.scales)
-        Δ = self.delta_max
-        d_port = 4 + (1 if self.cfg.add_diagonal_portal else 0)
-        kappa_design = L * Δ * (1 + d_port)
-
+        def pct(a,p):
+            if not a: return 0
+            i = min(len(a)-1, max(0,int(p*len(a))))
+            return a[i]
+        elapsed_ms = (time.perf_counter()-t0)*1000.0
         return Stats(
             n=self.cfg.n,
             scales=self.cfg.scales,
-            kappa_design=kappa_design,
-            max_hubs_per_vertex=self.max_hubs,
+            kappa_cap=self.cfg.kappa_cap,
             avg_hubs_per_vertex=self.avg_hubs,
-            avg_candidates=sum(cand_sizes) / len(cand_sizes) if cand_sizes else 0.0,
-            p50_candidates=p50,
-            p95_candidates=p95,
-            p99_candidates=p99,
-            exact_rate=exact / total if total else 1.0,
-            mean_stretch=mean_stretch,
-            p99_stretch=p99_stretch,
-            cache_hit_rate=cache_hits / total if total else 0.0,
-            Δ_empirical_max=self.delta_max,
-            κ_empirical_p99=κ_p99,
-            pairs=total,
+            max_hubs_per_vertex=self.max_hubs,
+            avg_candidates=sum(cand_sizes)/len(cand_sizes) if cand_sizes else 0.0,
+            p50_candidates=pct(cand_sorted,0.50),
+            p95_candidates=pct(cand_sorted,0.95),
+            p99_candidates=pct(cand_sorted,0.99),
+            fallback_rate=fallbacks/max(tot,1),
+            empty_intersection_rate=empty_intersections/max(tot,1),
+            exact_rate=exact/max(tot,1),
+            mean_stretch=(sum(stretches)/len(stretches) if stretches else 1.0),
+            p99_stretch=(sorted(stretches)[min(len(stretches)-1,int(0.99*len(stretches)))] if stretches else 1.0),
+            cache_hit_rate=hits/max(tot,1),
+            pairs=tot,
             elapsed_ms=elapsed_ms,
         )
 
     def run_skewed(self, total: int, hot_k: int, frac_hot: float) -> Dict[str, float|int]:
-        engine = QueryEngine(self.cfg, self.cover, self.hubs, self.hub_to_idx, self.bitset, self.urn)
-        cand_total = 0
-        hits = 0
-        for u, v in self._pairs_skewed(total, hot_k, frac_hot):
-            est, k, hit, _ = engine.query(u, v, audit=False)
-            cand_total += k
-            hits += int(hit)
+        eng = QueryEngine(self.cfg, self.cover, self.H_small, self.H_fp, self.urn)
+        total_cand=0; hits=0
+        for u,v in self._pairs_skewed(total, hot_k, frac_hot):
+            est, k, hit, _ = eng.query(u,v,audit=False)
+            total_cand += k; hits += int(hit)
         return {
             "n": self.cfg.n,
-            "avg_candidates_overall": cand_total / max(total, 1),
-            "cache_hit_rate_overall": hits / max(total, 1),
-            "urn_cache_size": len(engine.urn.cache),
-            "hot_k": hot_k,
-            "frac_hot": frac_hot,
-            "total": total,
+            "avg_candidates_overall": total_cand/max(total,1),
+            "cache_hit_rate_overall": hits/max(total,1),
+            "urn_cache_size": len(self.urn.cache),
+            "hot_k": hot_k, "frac_hot": frac_hot, "total": total,
         }
 
-# ------------ CLI / IO ------------
+# ===================== CLI =====================
 
-def _parse_args(argv: List[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="LARCH-δRAG refined harness (grids, receipts, bitsets).")
+def parse_args(argv: List[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="LARCH-δRAG O(0)/(1) enforced harness (grid L1).")
     p.add_argument("--n", type=int, default=32)
-    p.add_argument("--n-list", type=int, nargs="+", help="sweep over multiple n; overrides --n")
     p.add_argument("--scales", type=int, nargs="+", default=[3,6,10])
-    p.add_argument("--diagonal", action="store_true")
-    p.add_argument("--diag-first", action="store_true")
+    p.add_argument("--diag", action="store_true")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--kappa-cap", type=int, default=128)
     p.add_argument("--pairs", type=int, default=8000)
-    p.add_argument("--skewed", action="store_true")
-    p.add_argument("--hot-k", type=int, default=200)
-    p.add_argument("--frac-hot", type=float, default=0.85)
-    p.add_argument("--total", type=int, default=20000)
+    p.add_argument("--crop", type=float, default=1.0)
+    # URN
     p.add_argument("--urn-topk", type=int, default=2000)
     p.add_argument("--urn-up", type=int, default=5)
     p.add_argument("--urn-down", type=int, default=2)
     p.add_argument("--urn-ttl", type=int, default=200000)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--crop", type=float, default=1.0)
+    # skewed
+    p.add_argument("--skewed", action="store_true")
+    p.add_argument("--hot-k", type=int, default=200)
+    p.add_argument("--frac-hot", type=float, default=0.85)
+    p.add_argument("--total", type=int, default=20000)
+    # audit
     p.add_argument("--audit-frac", type=float, default=0.0)
     p.add_argument("--export-jsonl", type=str)
-    p.add_argument("--export-csv", type=str)
-    p.add_argument("--runs", type=int, default=1)
-    p.add_argument("--no-zorder", action="store_true")
     return p.parse_args(argv)
 
-def _cfg_from_args(args: argparse.Namespace, n_override: Optional[int] = None) -> Config:
+def cfg_from_args(a: argparse.Namespace) -> Config:
     return Config(
-        n=int(n_override if n_override is not None else args.n),
-        scales=tuple(sorted(set(int(x) for x in args.scales))),
-        add_diagonal_portal=bool(args.diagonal),
-        diag_portal_first=bool(args.diag_first),
-        urn_topk=int(args.urn_topk),
-        urn_hyst_up=int(args.urn_up),
-        urn_hyst_down=int(args.urn_down),
-        urn_ttl=int(args.urn_ttl),
-        seed=int(args.seed),
-        pairs=int(args.pairs),
-        skewed=bool(args.skewed),
-        hot_k=int(args.hot_k),
-        frac_hot=float(args.frac_hot),
-        total=int(args.total),
-        crop=float(args.crop),
-        audit_frac=float(args.audit_frac),
-        zorder_layout=not bool(args.no_zorder),
-        export_jsonl=args.export_jsonl,
-        export_csv=args.export_csv,
-        runs=int(args.runs),
-        n_list=tuple(args.n_list) if args.n_list else None,
+        n=int(a.n), scales=tuple(sorted(set(int(x) for x in a.scales))),
+        add_diag=bool(a.diag), seed=int(a.seed), kappa_cap=int(a.kappa_cap),
+        pairs=int(a.pairs), crop=float(a.crop),
+        urn_topk=int(a.urn_topk), urn_up=int(a.urn_up), urn_down=int(a.urn_down), urn_ttl=int(a.urn_ttl),
+        skewed=bool(a.skewed), hot_k=int(a.hot_k), frac_hot=float(a.frac_hot), total=int(a.total),
+        audit_frac=float(a.audit_frac), export_jsonl=a.export_jsonl
     )
 
-def _write_csv(path: str, rows: List[Stats]) -> None:
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(list(asdict(rows[0]).keys()))
-        for r in rows:
-            w.writerow(list(asdict(r).values()))
-
 def main(argv: List[str]) -> int:
-    args = _parse_args(argv)
-    cfg0 = _cfg_from_args(args)
-    results: List[Stats] = []
-    json_out = {}
-    n_list = cfg0.n_list if cfg0.n_list else (cfg0.n,)
-    for n in n_list:
-        # repeated runs per n for stability
-        for run in range(cfg0.runs):
-            cfg = cfg0 if n == cfg0.n else _cfg_from_args(args, n_override=n)
-            ev = Evaluator(cfg)
-            stats = ev.run_uniform(num_pairs=cfg.pairs, audit_frac=cfg.audit_frac, jsonl=cfg.export_jsonl)
-            json_out_key = f"n={cfg.n}/run={run+1}"
-            json_out[json_out_key] = {"uniform": asdict(stats), "receipt": asdict(ev.receipt)}
-            if cfg.skewed:
-                json_out[json_out_key]["skewed"] = ev.run_skewed(total=cfg.total, hot_k=cfg.hot_k, frac_hot=cfg.frac_hot)
-            results.append(stats)
-
-    print(json.dumps(json_out, ensure_ascii=False, indent=2))
-    if cfg0.export_csv:
-        _write_csv(cfg0.export_csv, results)
+    args = parse_args(argv)
+    cfg = cfg_from_args(args)
+    ev = Evaluator(cfg)
+    stats = ev.run_uniform(num_pairs=cfg.pairs, audit_frac=cfg.audit_frac, jsonl=cfg.export_jsonl)
+    out = {"uniform": asdict(stats), "receipt": asdict(ev.receipt)}
+    if cfg.skewed:
+        out["skewed"] = ev.run_skewed(total=cfg.total, hot_k=cfg.hot_k, frac_hot=cfg.frac_hot)
+    print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
 if __name__ == "__main__":
