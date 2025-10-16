@@ -260,6 +260,14 @@ def _load_json_file(path: Path) -> Dict[str, Any]:
         raise IOError(f"Failed to read JSON file {path}: {exc}") from exc
 
 
+def _load_validated_config_from_path(path: Union[str, Path]) -> Dict[str, Any]:
+    """Resolve ``path`` safely and return a validated configuration mapping."""
+
+    safe_path = _ensure_safe_path(path, must_exist=True)
+    config_data = _load_json_file(safe_path)
+    return _validate_config_data(config_data)
+
+
 def _write_json_atomic(path: Path, data: Dict[str, Any]) -> None:
     """Persist ``data`` to ``path`` using an atomic replace strategy."""
 
@@ -918,10 +926,22 @@ class SymPLONK:
             json.dump(self.metadata, f, indent=2)
         logger.info("Metadata exported to %s", path)
 
+
+def _create_system_from_config(config: Dict[str, Any]) -> SymPLONK:
+    """Instantiate :class:`SymPLONK` using a validated configuration mapping."""
+
+    return SymPLONK(
+        n=config["n"],
+        p=config["p"],
+        epsilon=config.get("epsilon", 1e-10),
+        use_gpu=config.get("use_gpu", False),
+    )
+
+
 def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments for SymPLONK."""
     parser = argparse.ArgumentParser(description="SymPLONK Zero-Knowledge Proof System")
-    subparsers = parser.add_subparsers(dest="command", help="Command to execute")
+    subparsers = parser.add_subparsers(dest="command", required=True, help="Command to execute")
     
     # Setup command
     setup_parser = subparsers.add_parser("setup", help="Setup the prover/verifier environment")
@@ -967,8 +987,7 @@ def main() -> None:
         if args.command == "setup":
             config_data: Dict[str, Any] = {}
             if args.config:
-                config_path = _ensure_safe_path(args.config, must_exist=True)
-                config_data = _validate_config_data(_load_json_file(config_path))
+                config_data = _load_validated_config_from_path(args.config)
 
             merged_config = dict(config_data)
             if args.n is not None:
@@ -983,12 +1002,7 @@ def main() -> None:
                 merged_config["use_gpu"] = True
 
             validated = _validate_config_data(merged_config)
-            symplonk = SymPLONK(
-                n=validated["n"],
-                p=validated["p"],
-                epsilon=validated["epsilon"],
-                use_gpu=validated["use_gpu"],
-            )
+            symplonk = _create_system_from_config(validated)
 
             if args.export_config:
                 export_path = _ensure_safe_path(args.export_config)
@@ -1010,18 +1024,12 @@ def main() -> None:
             return
 
         if args.command == "prove":
-            config_path = _ensure_safe_path(args.config, must_exist=True)
-            config = _validate_config_data(_load_json_file(config_path))
+            config = _load_validated_config_from_path(args.config)
 
             secret_path = _ensure_safe_path(args.secret, must_exist=True)
             secret_coeffs = _validate_secret_data(_load_json_file(secret_path))
 
-            symplonk = SymPLONK(
-                n=config["n"],
-                p=config["p"],
-                epsilon=config.get("epsilon", 1e-10),
-                use_gpu=config.get("use_gpu", False),
-            )
+            symplonk = _create_system_from_config(config)
 
             flow_time = float(args.flow_time if args.flow_time is not None else config.get("flow_time", math.pi / 4))
             if flow_time <= 0:
@@ -1031,30 +1039,18 @@ def main() -> None:
             return
 
         if args.command == "verify":
-            config_path = _ensure_safe_path(args.config, must_exist=True)
-            config = _validate_config_data(_load_json_file(config_path))
+            config = _load_validated_config_from_path(args.config)
 
-            symplonk = SymPLONK(
-                n=config["n"],
-                p=config["p"],
-                epsilon=config.get("epsilon", 1e-10),
-                use_gpu=config.get("use_gpu", False),
-            )
+            symplonk = _create_system_from_config(config)
 
             commitment = symplonk.load_commitment(args.commitment)
             verified = symplonk.bob_verify(commitment)
             return verified
 
         if args.command == "metadata":
-            config_path = _ensure_safe_path(args.config, must_exist=True)
-            config = _validate_config_data(_load_json_file(config_path))
+            config = _load_validated_config_from_path(args.config)
 
-            symplonk = SymPLONK(
-                n=config["n"],
-                p=config["p"],
-                epsilon=config.get("epsilon", 1e-10),
-                use_gpu=config.get("use_gpu", False),
-            )
+            symplonk = _create_system_from_config(config)
 
             symplonk.export_metadata(args.output)
             return
