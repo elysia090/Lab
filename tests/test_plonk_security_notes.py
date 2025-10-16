@@ -151,3 +151,35 @@ def test_save_commitment_cleans_up_temporary_files(tmp_path: Path, monkeypatch: 
     assert created, "temporary file should have been created"
     assert not target.exists()
     assert all(not path.exists() for path in created)
+
+
+def test_load_validated_config_from_path(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_payload = {"n": 4, "p": 17}
+    config_path.write_text(json.dumps(config_payload), encoding="utf-8")
+
+    config = plonk._load_validated_config_from_path(config_path)
+
+    assert config["n"] == 4
+    assert config["p"] == 17
+    assert config["epsilon"] == 1e-10
+    assert config["use_gpu"] is False
+
+
+def test_create_system_from_config_uses_defaults() -> None:
+    system = plonk._create_system_from_config({"n": 2, "p": 3})
+
+    assert system.n == 2
+    assert system.p == 3
+    assert np.isclose(system.epsilon, 1e-10)
+    assert system.using_gpu is False
+
+
+def test_create_system_from_config_accepts_overrides() -> None:
+    config = {"n": 8, "p": 17, "epsilon": 1e-6, "use_gpu": False}
+    system = plonk._create_system_from_config(config)
+
+    assert system.n == 8
+    assert system.p == 17
+    assert np.isclose(system.epsilon, 1e-6)
+    assert system.using_gpu is False
