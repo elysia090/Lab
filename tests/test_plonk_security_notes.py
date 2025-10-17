@@ -66,6 +66,29 @@ def test_commitment_from_dict_requires_complete_consistent_data() -> None:
         plonk.Commitment.from_dict(payload)
 
 
+def test_commitment_from_dict_rejects_invalid_complex_payloads() -> None:
+    """Complex payload components must be well-formed and finite."""
+
+    commitment = plonk.Commitment(
+        transformed_evaluations=np.array([1.0 + 0.5j, 0.25 - 0.25j]),
+        flow_time=0.5,
+        secret_original_evaluations=np.array([1.0 + 0.5j, 0.25 - 0.25j]),
+        r=complex(0.1, -0.2),
+        mask=np.array([0.5 - 0.1j, -0.3 + 0.4j]),
+    )
+
+    payload = commitment.to_dict()
+
+    payload["mask"] = {"real": [0.0, 1.0], "imag": [0.0]}  # mismatched length
+    with pytest.raises(ValueError):
+        plonk.Commitment.from_dict(payload)
+
+    payload = commitment.to_dict()
+    payload["mask"]["real"][0] = math.nan
+    with pytest.raises(ValueError):
+        plonk.Commitment.from_dict(payload)
+
+
 def test_symplonk_round_trip_with_persistence(tmp_path: Path) -> None:
     """End-to-end SymPLONK workflow should succeed on CPU and persist commitments."""
 
