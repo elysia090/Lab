@@ -10,7 +10,9 @@ chasing ad-hoc filenames.
 | File | Purpose |
 | --- | --- |
 | [`template.md`](./template.md) | The master reference describing the Cartan–Čech–Robin transfer template, its algebraic invariants, and the offline/online split that delivers constant-time evaluation. |
+| [`cartan-glue.md`](./cartan-glue.md) | Formalizes the Cartan–Čech gluing calculus and the O(1) patching operators used in the constant-time template. |
 | [`differentiation.md`](./differentiation.md) | A practical restatement of the template focused on differentiation workflows and implementation notes for constant-size kernels. |
+| [`constant-fft.md`](./constant-fft.md) | Derives the fixed-bandwidth convolution scheme with constant per-index cost and its forward/reverse derivatives. |
 
 Both notes share the same structural assumptions (finite good cover, sign-stable
 total differential, Robin perturbation with bounded norms, and a convergent
