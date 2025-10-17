@@ -268,6 +268,50 @@ def _load_validated_config_from_path(path: Union[str, Path]) -> Dict[str, Any]:
     return _validate_config_data(config_data)
 
 
+def _coerce_complex_array(value: Any, field_name: str) -> np.ndarray:
+    """Normalise a value into a 1-D ``complex128`` NumPy array."""
+
+    if isinstance(value, dict):
+        if "real" not in value or "imag" not in value:
+            raise ValueError(f"{field_name} must provide 'real' and 'imag' components.")
+        real_component = np.asarray(value["real"], dtype=np.float64)
+        imag_component = np.asarray(value["imag"], dtype=np.float64)
+        if real_component.shape != imag_component.shape:
+            raise ValueError(
+                f"{field_name} real and imag components must have identical shapes."
+            )
+        array = real_component + 1j * imag_component
+    elif isinstance(value, np.ndarray):
+        array = value.astype(np.complex128, copy=False)
+    elif isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
+        array = np.asarray(tuple(value), dtype=np.complex128)
+    else:
+        raise ValueError(f"Unsupported value for {field_name}.")
+
+    if array.ndim != 1:
+        raise ValueError(f"{field_name} must be a one-dimensional sequence of complex values.")
+    if not np.isfinite(array.real).all() or not np.isfinite(array.imag).all():
+        raise ValueError(f"{field_name} must not contain NaN or infinite values.")
+    return array
+
+
+def _coerce_complex_scalar(value: Any, field_name: str) -> complex:
+    """Coerce ``value`` into a finite complex scalar."""
+
+    if isinstance(value, dict) and "real" in value and "imag" in value:
+        scalar = complex(value["real"], value["imag"])
+    elif isinstance(value, complex):
+        scalar = value
+    elif isinstance(value, (int, float)):
+        scalar = complex(value)
+    else:
+        raise ValueError(f"Unsupported value for {field_name}.")
+
+    if not math.isfinite(scalar.real) or not math.isfinite(scalar.imag):
+        raise ValueError(f"{field_name} must have finite real and imaginary parts.")
+    return scalar
+
+
 def _write_json_atomic(path: Path, data: Dict[str, Any]) -> None:
     """Persist ``data`` to ``path`` using an atomic replace strategy."""
 
@@ -337,41 +381,19 @@ class Commitment:
         if missing:
             raise ValueError(f"Commitment data missing fields: {sorted(missing)}")
 
-        def _complex_array(value: Any, field_name: str) -> np.ndarray:
-            if isinstance(value, dict) and "real" in value and "imag" in value:
-                real, imag = value["real"], value["imag"]
-                if isinstance(real, (str, bytes)) or isinstance(imag, (str, bytes)):
-                    raise ValueError(f"{field_name} must contain numeric iterables.")
-                if not isinstance(real, Iterable) or not isinstance(imag, Iterable):
-                    raise ValueError(f"{field_name} must contain iterable real/imag components.")
-                real_arr = np.asarray(real, dtype=np.float64)
-                imag_arr = np.asarray(imag, dtype=np.float64)
-                return real_arr + 1j * imag_arr
-            if isinstance(value, np.ndarray):
-                return value.astype(np.complex128, copy=False)
-            if isinstance(value, list):
-                arr = np.array(value)
-                return arr.astype(np.complex128)
-            raise ValueError(f"Unsupported value for {field_name}.")
-
-        def _complex_scalar(value: Any, field_name: str) -> complex:
-            if isinstance(value, dict) and "real" in value and "imag" in value:
-                return complex(value["real"], value["imag"])
-            if isinstance(value, complex):
-                return value
-            if isinstance(value, (int, float)):
-                return complex(value)
-            raise ValueError(f"Unsupported value for {field_name}.")
-
-        transformed = _complex_array(data["transformed_evaluations"], "transformed_evaluations")
-        original = _complex_array(data["secret_original_evaluations"], "secret_original_evaluations")
-        mask = _complex_array(data["mask"], "mask")
+        transformed = _coerce_complex_array(
+            data["transformed_evaluations"], "transformed_evaluations"
+        )
+        original = _coerce_complex_array(
+            data["secret_original_evaluations"], "secret_original_evaluations"
+        )
+        mask = _coerce_complex_array(data["mask"], "mask")
 
         if transformed.shape != original.shape or transformed.shape != mask.shape:
             raise ValueError("Commitment arrays must have identical shapes.")
 
         flow_time = float(data["flow_time"])
-        r_value = _complex_scalar(data["r"], "r")
+        r_value = _coerce_complex_scalar(data["r"], "r")
 
         return cls(
             transformed_evaluations=transformed,
