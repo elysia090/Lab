@@ -1,24 +1,40 @@
 # Constant-Time Algorithm Notes
 
-This directory consolidates the constant-time algorithm material that was
-previously scattered across `docs/`.  The goal is to make it easy to locate the
-theoretical template and the pragmatic differentiation walkthrough without
-chasing ad-hoc filenames.
+This directory collects the Cartan–Čech–Robin (CCR) constant-time algorithm
+material that used to be scattered across `docs/`. The goal is to offer a
+single landing page that points to the mathematical template, the pragmatic
+implementation guide, and specialized kernels that reuse the same offline / online
+split.
 
-## Contents
+## Document Map
 
-| File | Purpose |
+| File | Scope |
 | --- | --- |
-| [`template.md`](./template.md) | The master reference describing the Cartan–Čech–Robin transfer template, its algebraic invariants, and the offline/online split that delivers constant-time evaluation. |
-| [`differentiation.md`](./differentiation.md) | A practical restatement of the template focused on differentiation workflows and implementation notes for constant-size kernels. |
+| [`template.md`](./template.md) | Master reference for the CCR template: algebraic setup, perturbation lemmas, certification, and complexity theorems. |
+| [`differentiation.md`](./differentiation.md) | Implementation-oriented walkthrough of the CCR differentiation pipeline with explicit operator recipes. |
+| [`rank-k.md`](./rank-k.md) | Constant-time rank-$k$ update kernel that plugs into the CCR template as a reusable block. |
 
-Both notes share the same structural assumptions (finite good cover, sign-stable
-total differential, Robin perturbation with bounded norms, and a convergent
-homological contraction).  `template.md` carries the full formal development;
-`differentiation.md` distills the pieces that matter when implementing the
-runtime operators in `src/utilities/constant_time_differentiation.py`.
+All notes share the same hypotheses: a finite good cover, a sign-stable total
+differential, a Robin perturbation with bounded norms, and a convergent
+homological contraction. The documents differ only in emphasis—`template.md`
+supplies the full theory, `differentiation.md` translates it into runtime steps,
+and `rank-k.md` shows how to encapsulate specialized kernels inside the same
+structure.
 
-For navigation from the wider documentation tree, link to this directory rather
-than to the individual files directly.  Doing so keeps future additions (for
-example, constant-time attention or constant-memory market primitives) grouped
-under a single entry point.
+## Related Code
+
+* `src/utilities/constant_time_differentiation.py` — end-to-end runtime
+  operators derived from the CCR template.
+* `src/utilities/constantdiff.py` — minimal NumPy implementation mirroring the
+  documentation's certification and curvature checks.
+
+Refer to these modules when looking for executable counterparts to the
+documentation.
+
+## Linking Guidance
+
+When referencing this material from elsewhere in the repository, link to this
+directory rather than to individual files. The structure here is stable and is
+the canonical entry point for any additional constant-time kernels that may be
+added in the future (for example, constant-time attention or constant-memory
+market primitives).
