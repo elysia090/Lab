@@ -1,114 +1,144 @@
-Title: Constant-Time Rendering on a Fixed Tile Cover via Cartan–Cech–Robin Twisting
-— Formal specification, certified caps, and O(1)/tile execution with differentiable support
+Title: Constant-Time Tile-Local Differentiation and Gluing for Real-Time Rendering via Cartan-Cech-Robin Transfer on the Total Complex
 
 Abstract.
-A rendering pipeline is specified in which every per-tile pass—direct lighting under many lights, shadow filtering, screen-space reflections, spatio-temporal reuse with reservoir width one, probe-based indirect light, denoising, and temporal reconstruction—executes in O(1) time and memory per tile, independent of the number of lights, primitives, and pixels. Gluing across space–time tiles is encoded by a graded-derivation “Robin” operator R on the Čech–de Rham total complex. We prove nilpotency of the twisted differential D_R:=D+R (Maurer–Cartan), preservation of Cartan identities, a degree-0 BCH factorization for commuting actions, and existence of a norm-controlled homological contraction. These statements yield finite offline tables (linear blocks, adjoints, and derivative tables) and constant-size online templates. We give explicit certification inequalities, operation budgets, error bounds, and a verification protocol.
+We instantiate a differential-geometric gluing framework for real-time rendering with fixed-size, tile-local operator templates. On a finite good cover we use a sign-stable total differential D := d + delta_tot, define a graded-derivation Robin transmission R, and show that D_R := D + R is square-zero under an explicit compatibility condition. A homological-perturbation certification produces quantitative bounds (gamma, m, epsilon_tail) and a constant-size runtime template for forward, reverse, and mixed-mode differentials. We specialize to graphics: deterministic screen-space reflections (SSR) with fixed step budget, an edge-aware 5x5 shadow filter (EAW) followed by an MSM-like LUT correction, two-level Robin fusion gated by tile metrics, quantized TAA with an 8-bin clamp LUT, and probe-based GI with fixed sample count. With fixed offline caps (K_light, K_ssr, K_bin, K_nb, M_probe, svgf_passes, tile size), latency and memory are O(1) per tile, independent of scene size and expression depth. We provide an autotuner over a small cap grid and a miss-only env-LUT retraining with closed-form per-bin solutions. All formal properties (Maurer-Cartan flatness, Cartan identities, BCH factorization, quasi-isomorphism) persist under these specializations.
 
-Keywords: constant-time; O(1)/tile; tile cover; Robin operator; Čech–de Rham; Maurer–Cartan; BCH; homological perturbation; ReSTIR; PCF/MSM; SSR; SVGF; TAA; probe GI; differentiable rendering.
-	1.	Model and notation.
-Let U={U_i} be a fixed finite good cover of the image plane by tiles; ν is the maximal number of neighbors per tile in space–time (e.g., 4 or 8 spatial plus 1 temporal). For p,q≥0 set
-C^q(U;Ω^p):=∏_{|S|=q+1} Ω^p(U_S), U_S:=⋂_{i∈S}U_i, Tot^{p,q}:=C^q(U;Ω^p), Tot^N:=⊕_{p+q=N}Tot^{p,q}.
-Define δ_tot:=(-1)^p δ on Tot^{p,q} and D:=d+δ_tot; then D^2=0. For a homogeneous endomorphism A of Tot write |A| for its total-degree shift and [A,B]:=AB−(−1)^{|A||B|}BA.
+Keywords: constant-time rendering, Cech-de Rham, Maurer-Cartan, homological perturbation, Robin transmission, BCH, SSR, EAW, MSM LUT, TAA, probe GI.
 
-Per-tile state (constant size):
-ψ_i:=( L̂_i, N_i, Z_i, ρ_i, σ_i^2, r_i, g_i ),
-with radiance estimate L̂, normal N, depth Z, material parameters ρ, variance proxy σ^2, reservoir r (one candidate, weight, PDF), and probe cache vector g.
-	2.	Operators (derivations, transports, and actions).
-Edge derivations (degree +1 on Čech): on q=0, (Eψ){ij}:=ψ_i−ψ_j, (Sψ){ij}:=ψ_i+ψ_j. Each extends uniquely to a graded derivation commuting with restrictions.
-Vector-field operators on forms: ι_X, L_X:=[d,ι_X] with |ι_X|=−1, |L_X|=0; [δ_tot,ι_X]=0 ⇒ [D,ι_X]=L_X and [D,L_X]=0.
-Incidence actions: for a in the incidence algebra of the nerve, J_a acts by left convolution on Čech indices; degree-0 incidence (vertex weights) is commutative.
+Setting and basic notation.
+Let M be a smooth paracompact manifold and U = {U_i}*{i=1}^P a finite good cover with bounded overlap multiplicity nu. For p,q >= 0 set C^q(U; Omega^p) := product over |S|=q+1 of Omega^p(U_S), where U_S := intersection*{i in S} U_i. Let Tot^{p,q} := C^q(U; Omega^p) and Tot^N := direct sum over p+q=N of Tot^{p,q}. On Tot^{p,q} define the sign-stable lift delta_tot := (-1)^p * delta. The total differential is D := d + delta_tot : Tot^N -> Tot^{N+1}. All brackets are graded commutators [A,B] := A B - (-1)^{|A||B|} B A with |.| the shift in total degree N. For a vector field X, let iota_X: Omega^p -> Omega^{p-1} and L_X := [d, iota_X], so |iota_X|=-1, |L_X|=0 and [delta_tot,iota_X]=0, hence [D,iota_X]=L_X and [D,L_X]=0.
 
-Band-limited transports (fixed stencils; constant taps):
-X_shad: shadow filtering (PCF K_shad taps or MSM 4-moment),
-X_ssr: screen-space reflection stepping (K_ssr steps + K_bin binary refinements),
-X_taa: temporal reprojection and blend,
-X_svgf: A-trous/guide-aware denoising with a fixed number of passes,
-X_vol: capped stochastic volume steps against a majorant grid.
-Each L_X is a constant-size matrix on a local basis; adjoints L_X^ share the same memory with transposed addressing.
+Incidence algebra and derivations.
+Let Nerve(U) be the nerve and I(Nerve) its incidence algebra. For a in I(Nerve), let J_a denote left convolution on Cech indices; |J_a| equals the Cech degree, J_a preserves form degree, and [delta, J_a] = J_{partial_inc a}. Degree-0 incidence elements commute and act as vertex scalings. On C^0(U;Omega^p) define edge extractors E,S by (E psi)*{ij} := psi_i - psi_j and (S psi)*{ij} := psi_i + psi_j on U_{ij}. Each of E,S extends uniquely to a graded derivation of degree +1 commuting with restrictions (unique derivation extension by the Leibniz rule in total degree).
 
-Degree-0 actions (commute with L_X):
-J_light: per-tile alias/hierarchy for top-K_light lights;
-J_probe: fixed M_probe neighbors per query;
-J_update: bounded per-frame refresh schedules;
-all satisfy |J_c|=0 and [J_c,L_X]=0 by construction.
+Graphics specialization (tile-local view).
+Partition the screen into square tiles T_{xy} of fixed side tau (e.g., 16). Regard each tile as a 0-Cech cell; its 4- or 6-neighborhoods form degree-1 overlaps. The per-tile data are G-buffer fields (unit normal N, depth Z, albedo rho) and fixed-cap operator tables. Compile-time caps bound all loop counts and table sizes:
+K_light (per-tile lights), K_ssr (SSR steps), K_bin (SSR bin/blur steps), K_nb (neighbor tiles for fusion), M_probe (GI probes), svgf_passes, and tile size tau. All caps are independent of scene size.
 
-Pointwise nonlinearities Φ_k (bounded derivatives on a fixed parameter box): BRDF/LUT evaluation, MIS weights, clamps, acceptance tests, tone mapping, sharpening. Store Φ′_k and adjoints Φ_k^ offline.
-	3.	Robin transmission, nilpotency, and contraction.
-Define on q=0 the degree +1 “Robin” derivation
-(Rψ){ij}:=α(ψ_i−ψ_j)+β{ij} L_{X_scr}(ψ_i+ψ_j),
-extend derivationally, and set D_R:=D+R. Choose a vertex-scaling gauge for β so that [E,J_c]=[S,J_c]=[R,J_c]=0 (degree-0 J-compatibility).
+Robin transmission and gating.
+Fix positive scalars alpha_low, beta_low and alpha_high, beta_high. On q=0 define
+R_low psi := alpha_low E psi + beta_low L_X S psi,
+R_high psi := alpha_high E psi + beta_high L_X S psi,
+and extend each as a graded derivation to Tot. A binary gate g(T_{xy}) in {low,high} is chosen per tile by two fixed thresholds tau_v, tau_z applied to (i) a temporal difference metric and (ii) an average depth disagreement with the 4-neighborhood; set R := R_{g(T_{xy})} on that tile. Choose a vertex-scaling gauge so that [E,J_c]=[S,J_c]=0 on q=0 and thus [R,J_c]=0; we call this J-compatibility. Define D_R := D + R.
 
-Lemma (commutators). On q=0, [d,R]=[L_X,αE+βS] and [ι_X,R]=0; by derivation these identities hold on Tot. Consequently [D_R,ι_X]=L_X and [D_R,L_X]=0.
+Basic commutators and determinism.
+R has degree +1 and [iota_X, R] = 0. On q=0,
+[d, R] = [L_X, alpha E + beta S] (with alpha,beta evaluated at the active gate),
+and by derivation this extends to all bidegrees. Deterministic SSR is modeled as a fixed-length derivation on image indices: each pixel uses a step direction obtained from a hash of integer coordinates; no RNG appears. Therefore SSR commutes with restrictions, has degree 0, and preserves Cartan relations together with iota_X and L_X.
 
-Theorem (Maurer–Cartan). D_R^2=0 ⇔ [D,R]+R^2=0 ⇔ ∂R+(1/2)[R,R]=0 with ∂:=ad_D.
-Proof sketch: expand (D+R)^2 and use |R|=1 so [R,R]=2R^2. Writing K:=(1/2)[D_R,D_R], note K is a degree +2 derivation; Tot is generated by q=0 entries and restrictions, hence vanishing on generators implies K≡0.
+Maurer-Cartan curvature.
+Equivalently:
+(1) D_R^2 = 0,
+(2) [D, R] + R^2 = 0,
+(3) ad_D R + (1/2)[R,R] = 0 in the dgLA (End(Tot),[,],ad_D).
+Proof: expand (D+R)^2, use D^2=0 and degree bookkeeping; since |R|=1 we have [R,R]=2 R^2. Let K := (1/2)[D_R,D_R]. K is a derivation of degree +2. Tot is generated by q=0 entries under cup and restrictions; vanishing of K on q=0 generators implies K=0 on Tot (derivation vanishing principle). Thus an explicit q:0->2 edge identity that cancels delta_tot(R psi) + R(delta_tot psi) + [d,R] psi suffices to certify D_R^2=0 in general.
 
-Proposition (degree-0 BCH). The degree-0 subalgebra generated by {L_X, J_c: |c|=0} factorizes:
-exp(g^0)≅exp⟨L_X⟩×exp⟨J_c (|c|=0)⟩ with exp(Θ)=exp(∑λ_i L_{X_i})·exp(∑κ_j J_{c_j}).
+Energy-curvature equivalence and EAW/MSM.
+Define the Robin energy on overlaps by
+E_{alpha,beta}(psi) := sum_{i<j} int_{U_{ij}} [ alpha ||psi_i - psi_j||^2 + beta_{ij} || L_X(psi_i + psi_j) ||^2 ].
+Under standard boundary assumptions (compact support, X tangent at boundaries, or a cutoff), the first variation equals the q:0->2 curvature identity above. For edge-aware shadows, introduce a 5x5 stencil with weights
+w ~ exp( - (||Delta N||/sigma_n + |Delta Z|/sigma_z + ||Delta x||^2/sigma_s) ),
+which defines a convex energy E_shadow whose Euler-Lagrange is the EAW update. Append a monotone MSM-like LUT correction phi(x) = m x^p + (1-m) x with fixed (m,p) in a compact set; phi is 1-Lipschitz on [0,1] and preserves strong convexity up to absorbed constants. Hence E_{alpha,beta} + E_shadow has unique tile-local minimizers modulo constants, and its stationary points coincide with the flatness condition for D_R.
 
-Functional-analytic scale and smallness. Fix Sobolev level s≫0 and measure operator norms b_E:=‖E‖, b_S:=‖S‖, b_L:=‖L_X‖, b_β:=‖β‖, b_h:=‖h‖.
-Certification inequality:
-γ:= b_h( α b_E + b_β b_S b_L ) < 1.                         (3.1)
+Homological perturbation and certification.
+Let (iota, pi, h) be the standard Cech-de Rham contraction between (Omega^*(M), d) and (Tot, D), with bounded operator norms on a fixed Sobolev level. Define the smallness parameter
+gamma := ||h|| * ( alpha_eff ||E|| + ||beta|| ||S|| ||L_X|| * beta_eff ),
+where alpha_eff and beta_eff are the averages of the low/high gate parameters. If gamma < 1, the perturbed homotopy
+h_R := h * sum_{m>=0} (- R h)^m
+converges in operator norm and (iota, pi, h_R) is a contraction between (Omega^*, d) and (Tot, D_R). Thus H^*(Tot, D_R) is canonically isomorphic to de Rham cohomology, and all differentials transfer. A certified truncation with order
+m := ceil( log( epsilon * (1 - gamma) ) / log( gamma ) ) - 1
+has tail bound epsilon_tail := gamma^{m+1} / (1 - gamma). The runtime certification reports (gamma_bound, m, epsilon_tail); if gamma_bound >= 1, fall back to low-gate parameters and re-check, without introducing a global solve.
 
-Homological contraction (HPL). The Neumann series h_R:=h ∑_{m≥0} (−Rh)^m converges in operator norm. Truncation after m terms satisfies the certified tail
-‖ h_R − h ∑_{k=0}^m (−Rh)^k ‖ ≤ γ^{m+1}/(1−γ).            (3.2)
-	4.	Offline data (finite, immutable at runtime).
-T1 Linear blocks: matrices for E,S, restrictions, each L_X, and all adjoints; SSR step maps; neighbor maps.
-T2 Incidence: per-tile J_light alias/hierarchy (top-K_light), J_probe neighborhoods, J_update schedules; BCH tables.
-T3 Contraction: (ι,π,h), truncated h_R, receipts (b_E,b_S,b_L,b_β,b_h), γ, chosen Neumann order m, ε_tail:=γ^{m+1}/(1−γ).
-T4 Nonlinear tables: BRDF/visibility LUTs and derivatives; clamp/acceptance/tone/sharpen derivatives and adjoints.
-	5.	Online pipeline (O(1)/tile; fixed caps).
-F0 G-buffer. Populate ψ_i (degree-0 writes).
-F1 Direct lighting. J_light (K_light candidates), Φ_brdf, L_{X_shad} (K_shad taps), MIS via LUT weights.
-F2 SSR. L_{X_ssr} (K_ssr+K_bin). On mismatch, branch to environment Φ_env.
-F3 Spatio-temporal reuse. Spatial E/S on K_nb neighbors; temporal edge to t−1; fuse by R. Update reservoir r_i with a fixed-width reduction (size 1).
-F4 Indirect light. Probe query on M_probe neighbors with bounded refresh via J_update, or ReSTIR-GI with the same caps.
-F5 Denoise and reconstruct. L_{X_svgf} for svgf_passes with guide-aware clamps Φ_gate; then L_{X_taa}+Φ_clamp+Φ_sharpen.
-All F0–F5 are constant-length compositions of constant-size blocks; no loop bound depends on lights L, primitives N, or pixels P.
-	6.	Certified caps (safe defaults; adjust offline only).
-K_light=32; K_shad=25 (PCF 5×5) or MSM 4-moment; K_ssr=32; K_bin=4;
-K_nb=6 (4 orthogonal + 2 diagonal); M_probe=12; svgf_passes=3;
-taa_half_life=8 frames (EMA); reservoir_size=1.
-Pick α,β so that (3.1) holds with margin (e.g., γ≤0.9). Choose m by (3.2) so ε_tail is below the visual threshold.
-	7.	Complexity and operation budget.
-Definition (O(1)/tile). A pass is O(1)/tile if its time and memory per tile are bounded by a constant depending only on (ν, caps, receipts), not on L,N,P, or expression depth.
-Let C_lin be the worst-case multiply-adds for one fixed linear block and C_nl for one Φ_k. One F0–F5 sweep uses at most
-C_tot ≤ C_lin·(K_shad + K_ssr + K_bin + K_nb + M_probe + svgf_passes + c_0) + C_nl·c_1,
-with small constants c_0,c_1 for degree-0 and LUT lookups. C_tot does not scale with L,N,P.
-	8.	Differentiable rendering templates.
-Forward JVP: apply derivation rules with D_R; commute degree-0 blocks via BCH; evaluate constant-size matrices and Φ′_k from T4.
-Reverse VJP: replace each block by its adjoint (E^,S^,L_X^,J_c^,Φ_k^); use h_R^ with truncation error ≤ε_tail.
-HVP: compose JVP with VJP; remains O(1)/tile.
-Theorem (JVP/VJP/HVP O(1)/tile). Under γ<1, fixed caps, and bounded Φ′_k, all three products for F0–F5 are O(1)/tile; operation counts obey the bound above.
-	9.	Bias and error accounting (module-wise).
-Robin truncation: reverse-mode error ≤ ε_tail from (3.2).
-SSR: truncation bias bounded by ε_ssr ≤ Pr_miss · Δ_env, where Δ_env is a tabulated bound on environment variance.
-Reuse: with reservoir width 1 and fixed K_nb, bias arises only from fixed acceptance thresholds; pre-tabulate their effect on MSE and freeze.
-Probes: bounded refresh induces lag ε_probe ≤ λ_max·Δ_update, where λ_max is the operator norm of the fixed transfer, Δ_update the worst per-interval irradiance change (both measured offline).
-Shadows: MSM moment fit error ε_msm is bounded by a residual cap recorded at build; PCF smoothing bias is controlled by K_shad.
-	10.	GPU mapping (deterministic footprints).
-Fixed workgroup shape (e.g., 16×16). Neighbor fetches use bit-packed indices (K_nb fixed).
-Alias tables fit in shared memory; J_light/J_probe indices are compact integers.
-Stencils for L_X are stored in constant/readonly memory; adjoints reuse storage.
-Reservoir r_i is a fixed 32–48 byte struct; updates are warp-local; no dynamic allocation.
-No global scans scale with L or N; scene updates are throttled by J_update.
-	11.	Verification protocol.
-V1 Freeze caps and receipts (Section 6; T3).
-V2 Instrument to log block counts per tile; verify they match constants under stress (L,N→large).
-V3 Measure wall-time per tile across stress scenes; accept if within ±δ of baseline (δ from hardware jitter).
-V4 Perturb animation; confirm no dynamic escalation path is taken (SSR miss → Φ_env; updates follow J_update).
-V5 Recompute receipts periodically or when assets change; enforce γ<1; update m and ε_tail if needed.
-	12.	Limitations.
-O(1)/tile requires: fixed tile cover; fixed taps K_* for each L_X; bounded Φ′_k on a fixed parameter box; (3.1); reservoir width 1; bounded per-frame probe refresh.
-Full path tracing with unbounded bounces is outside scope; visibility walkers must be hard-capped with an analytic fallback to preserve O(1) with an explicit bias term.
+DGLA closure and BCH factorization.
+Let g be the sub-dgLA generated by D_R, iota_X, L_X, and {J_a}. Degrees: |D_R|=+1, |iota_X|=-1, |L_X|=0, |J_a|=Cech degree. Relations:
+[D_R,D_R]=0, [D_R,iota_X]=L_X, [D_R,L_X]=0,
+[iota_X,iota_Y]=0, [L_X,iota_Y]=iota_[X,Y], [L_X,L_Y]=L_[X,Y],
+[J_a,J_b]=J_{[a,b]*conv}, [iota_X,J_a]=0, [L_X,J_a]=0, [D_R,J_a]=J*{partial_inc a}.
+Degree-0 actions generated by {L_X, J_c with |c|=0} commute, hence
+exp(g^0) ~= exp<L_X> x exp<J_c (|c|=0)>,
+and in practice we enforce the order exp(sum lambda_i L_{X_i}) then exp(sum kappa_j J_{c_j}) to fix a unique evaluation ABI.
 
-Appendix A (proof details).
-A.1 Commutators. On q=0, R=αE+β L_X S. Since L_X=[d,ι_X] and [ι_X, restrictions]=0, [d,αE]=0 and [d,β L_X S]=[L_X,β S], giving [d,R]=[L_X,αE+βS]. Also [ι_X,R]=0 by degree and locality.
-A.2 MC equivalence. (D+R)^2=D^2+[D,R]+R^2; D^2=0; |R|=1 ⇒ [R,R]=2R^2; hence MC. Let K:=(1/2)[D_R,D_R]. K is a derivation; Tot is generated by q=0 entries and restrictions; if K=0 on generators, K≡0.
-A.3 HPL tail. With ‖Rh‖=γ<1, h_R:=h∑_{m≥0}(−Rh)^m converges and the truncation tail is γ^{m+1}/(1−γ). Standard Neumann series estimate.
+Graphics operators and constant template.
+The runtime consists of bounded, tile-local operators of degree 0 or derivations of degree +/-1 that close under the above algebra. We instantiate:
+(1) Per-tile direct lighting with K_light contributions using vectorized evaluation over a fixed tile grid.
+(2) EAW 5x5 filter driven by (Delta N, Delta Z, spatial distance).
+(3) MSM-like LUT correction with 16 bins.
+(4) Deterministic SSR with K_ssr fixed steps and K_bin fixed iterations for a binary accumulation; misses fall back to an environment gradient blended with an 8-bin specular highlight LUT indexed by normal.z.
+(5) Two-level Robin fusion over a 6-neighborhood; a single comparison (tau_v, tau_z) selects (alpha,beta).
+(6) Temporal EMA with half-life H and an 8-bin quantized TAA clamp selected by local image gradient magnitude.
+(7) Probe GI using M_probe samples on a fixed downsampled grid; mix with weight 0.2.
+(8) A-trous denoise with svgf_passes in {2,3}.
+All steps operate in a constant number of constant-size blocks per tile.
 
-Appendix B (adjoint template).
-Fix inner products on overlaps; store adjoints E^,S^,L_X^,J_a^ and h^. Then h_R^=∑_{m≥0}(−h^ R^)^m h^ truncated at m with the same ε_tail. Reverse templates swap the BCH order inside degree-0.
+Algorithmic recipe (tile-local constant template).
+Input: tile T_{xy}, G-buffer (N,Z,rho), fixed caps and tables.
+
+1. direct = Shade_Klight(P,N; tables)                 # vectorized, size K_light
+2. direct = EAW_5x5(direct; sigma_n, sigma_z, sigma_s)
+3. direct = MSM_LUT(direct; bins=16)
+4. color  = SSR_Kssr(direct) with K_bin post steps; on miss use env/spec LUT
+5. color  = Robin_g(color; alpha,beta; 6-neigh, 1 pass)
+6. color  = EMA(half_life) then TAA_8bin_clamp(color)
+7. GI     = Probe_Mprobe(color); color = 0.8*color + 0.2*GI
+8. color  = Atrous(svgf_passes)
+   Output: color and its differentials by replacing d with D_R and using degree-0 BCH order. Reverse and Hessian use adjoints of the same blocks.
+
+Complexity and cost model.
+Let T := tau x tau be the pixel count per tile. A static cost model is
+ops_per_tile =
+T * [ K_light*c_L + K_ssr*c_R + K_bin*c_B + K_nb*c_N + M_probe*c_P + svgf_passes*c_A + c_EAW + c_MSM ] + c_misc,
+where all c_* are implementation-fixed constants. Therefore time and memory are O(1) per tile and do not depend on global scene size or expression depth. The number and size of blocks are constants determined by (nu, caps, operator norms).
+
+Determinism and reproducibility.
+SSR uses directions hashed from integer pixel indices; no RNG is used. For identical inputs two consecutive renders are bitwise equal before EMA/TAA. We recommend shipping seeds, table dumps (CSV), cap sets, and reporting a determinism metric defined as mean-abs-diff between two runs being 0 prior to temporal filtering.
+
+Evaluation protocol.
+Datasets: synthetic tileable scenes with analytic G-buffer; lights sampled from a bounded box. Resolution and caps are fixed per run. Metrics: PSNR to a strong-cap reference, SSR hit rate, measured time-per-tile, and ops_per_tile from the static model. SKU presets: mobile (K_light=16, K_ssr=16, M_probe=8, svgf_passes=2), baseline (24,24,12,2), hi_end (32,32,16,3). The autotuner evaluates a small grid over {K_light, K_ssr, M_probe} with score
+score = alpha*PSNR + beta*SSR_hit_rate - delta*time_per_tile,
+where alpha, beta, delta are deployment-fixed. Since the grid is finite and small, tuning is O(1) per device class.
+
+Miss-only env-LUT retraining.
+Let bins=8 and index each pixel by b in {0,...,7} from normal.z. On SSR misses (hit==0), fit a per-bin scalar a_b in [0,1] minimizing
+||(1-a_b)*env + a_b*spec - ref||_2^2
+over RGB, where env is the environment color and spec is the LUT highlight. The closed-form solution is
+a_b = clip( <S-E, R-E> / <S-E, S-E>, 0, 1 ),
+applied independently per bin. This updates a degree-0 table; all MC/HPL statements remain valid. Report PSNR gain at unchanged hit rate and unchanged complexity.
+
+Limits and refresh policy.
+O(1) guarantees require: finite good cover; fixed caps; bounded overlap multiplicity; bounded operator norms for E,S,L_X and restrictions on a chosen scale; a contraction with gamma<1; and a finite band-limit for local bases. If caps or operator norms change so that gamma_bound>=1, refresh offline tables or reduce caps and re-certify. The approach does not assume complex or Kahler structures and does not rely on Hodge theory.
+
+Appendix: precise statements (ASCII versions).
+
+Definition (total complex).
+Tot^{p,q} := C^q(U; Omega^p), Tot^N := direct sum_{p+q=N} Tot^{p,q}, delta_tot := (-1)^p * delta, D := d + delta_tot.
+
+Lemma (unique derivation extension).
+Any linear A_0: C^0(U;Omega^p) -> C^1(U;Omega^p) commuting with restrictions extends uniquely to a graded derivation A: Tot^* -> Tot^{*+1} commuting with restrictions.
+
+Lemma (Cartan on Tot).
+[delta_tot, iota_X] = 0, so [D, iota_X] = L_X and [D, L_X] = 0.
+
+Lemma (basic commutators for R).
+R has degree +1, [iota_X, R]=0, and on q=0: [d, R] = [L_X, alpha E + beta S]. By derivation this holds on all bidegrees.
+
+Theorem (Maurer-Cartan).
+D_R^2 = 0 iff [D, R] + R^2 = 0 iff ad_D R + (1/2)[R,R] = 0.
+
+Theorem (HPL transfer).
+If gamma := ||h|| ( alpha_eff ||E|| + ||beta|| ||S|| ||L_X|| beta_eff ) < 1, then h_R := h sum_{m>=0} (-R h)^m converges and (iota, pi, h_R) is a contraction between (Omega^*, d) and (Tot, D_R). Consequently H^*(Tot, D_R) ~= H^*_{dR}(M). The truncated series at order m has tail bound epsilon_tail := gamma^{m+1}/(1-gamma).
+
+Theorem (DGLA closure and BCH).
+With degrees |D_R|=+1, |iota_X|=-1, |L_X|=0, |J_a|=Cech degree,
+[D_R,D_R]=0, [D_R,iota_X]=L_X, [D_R,L_X]=0, [iota_X,iota_Y]=0,
+[L_X,iota_Y]=iota_[X,Y], [L_X,L_Y]=L_[X,Y],
+[J_a,J_b]=J_{[a,b]*conv}, [iota_X,J_a]=0, [L_X,J_a]=0, [D_R,J_a]=J*{partial_inc a}.
+Degree-0 actions factor: exp(g^0) ~= exp<L_X> x exp<J_c (|c|=0)>, and we fix the order "Lie flows then degree-0 incidence".
+
+Corollary (constant-time differentials).
+Under the fixed caps and the above closure, forward-mode JVP, reverse-mode VJP, and Hessian-vector products compose a constant number of constant-size blocks per tile, hence are O(1) per tile in time and memory.
+
+Implementation ABI summary.
+All LUTs (EAW weights, MSM correction, env highlight, TAA thresholds) have fixed bin counts; retraining updates only values, not structure. All evaluation orders obey the degree-0 BCH split. Adjoint kernels reuse the same block sizes and orders. The offline certification API returns (gamma_bound, m, epsilon_tail). The static cost model reports ops_per_tile, which correlates with measured time per tile monotonically under constant memory bandwidth.
 
 Conclusion.
-A graded-derivation Robin twist yields a nilpotent D_R that preserves Cartan identities and admits a degree-0 BCH ordering. With a certified contraction and fixed stencils, the rendering loop F0–F5—and its first- and second-order derivatives—executed per tile uses a constant number of constant-size blocks. Runtime and memory per tile are independent of scene lights, primitives, and pixels; only the fixed caps and receipts determine cost and error.
+Encoding tile-overlap transmission by a graded-derivation Robin operator inside the sign-stable total complex, enforcing Maurer-Cartan flatness, and certifying a homological contraction collapses global coupling to a fixed constant-size runtime template. With deterministic SSR, EAW+MSM correction, two-level Robin fusion, quantized TAA, and probe GI, the rendering pipeline achieves O(1) latency and memory per tile while preserving cohomological invariants. The autotuner and miss-only env-LUT retraining adjust quality-cost tradeoffs entirely within degree-0 tables, leaving the formal guarantees intact.
