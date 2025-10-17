@@ -21,4 +21,4 @@ Each linked specification retains the full technical detail, while this index pr
 
 For the constant-time algorithm notes that underpin several of these units,
 refer to the consolidated index in
-[`constant-algorithms/README.md`](./constant-algorithms/README.md).
+[`Constant-algorithm/README.md`](./Constant-algorithm/README.md).

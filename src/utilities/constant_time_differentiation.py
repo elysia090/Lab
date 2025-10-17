@@ -1,6 +1,6 @@
 """Constant-time differentiation templates based on the project notes.
 
-The documentation in ``docs/constant-algorithms/template.md`` describes a
+The documentation in ``docs/Constant-algorithm/template.md`` describes a
 constant-size runtime kernel for differentiation over the total complex with a
 Robin perturbation.  The implementation below mirrors that architecture using
 plain Python data structures so that it is lightweight and dependency free.
