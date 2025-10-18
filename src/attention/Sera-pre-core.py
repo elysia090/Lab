@@ -1,5 +1,5 @@
 # Sera-pre-core.py
-# Sera v2.0 pre-core (strict CCR) 
+# Sera v2.1 pre-core (strict CCR) 
 # Dependencies: numpy.
 #
 # Provides
@@ -8,6 +8,7 @@
 # - Selector with optional quantile-based theta (online P^2 estimator).
 # - Tokenizer: byte-level BPE with training, encode/decode, and stateful streaming encoder.
 #
+
 
 from __future__ import annotations
 
@@ -893,3 +894,201 @@ def _tok_encode_unigram(self, text: str, max_tok_bytes: int = 16) -> list:
 # Bind
 Tokenizer.train_unigram_from_bpe = _tok_train_unigram_from_bpe
 Tokenizer.encode_unigram = _tok_encode_unigram
+
+
+# =============================
+# Sera v2.1: CCR-optimized Safe-Z and Auto-k
+# =============================
+
+class SafeZCCR:
+    """CCR-optimized Safe-Z utilities.
+    exact_ccr computes exact tail mass per tile (tight Rhat).
+    plan_eps_ccr picks per-tile keep counts to meet a global eps target in expectation.
+    """
+
+    @staticmethod
+    def exact_ccr(scores: np.ndarray, chunks, keep_counts: list) -> SafeZResult:
+        ms = []
+        Zc_list = []
+        R_list = []  # exact tail mass (sum of exp for pruned)
+        for ch, k_keep in zip(chunks, keep_counts):
+            s = scores[ch]
+            n = len(s)
+            k_keep = max(1, min(int(k_keep), n))
+            m_i = float(np.max(s))
+            if k_keep < n:
+                # get top-k and compute exact tail sum via argpartition
+                idx_top = np.argpartition(s, n - k_keep)[n - k_keep:]
+                idx_pruned = np.setdiff1d(np.arange(n), idx_top, assume_unique=False)
+                Zc_i = float(np.sum(np.exp(s[idx_top] - m_i)))
+                R_i = float(np.sum(np.exp(s[idx_pruned] - m_i)))
+            else:
+                Zc_i = float(np.sum(np.exp(s - m_i)))
+                R_i = 0.0
+            ms.append(m_i); Zc_list.append(Zc_i); R_list.append(R_i)
+
+        m_hat, Z_hat = CCR.combine_many(ms, [a + b for a, b in zip(Zc_list, R_list)])
+        # global ratio and L1 bound using exact tail mass
+        R_ratio = (sum(R_list)) / max(1e-12, sum(Zc_list))
+        L1_bound = 2.0 * R_ratio / (1.0 + R_ratio)
+        return SafeZResult(m_hat=m_hat, Z_hat=Z_hat, Rhat_global=R_ratio, L1_bound=L1_bound)
+
+    @staticmethod
+    def plan_eps_ccr(scores: np.ndarray, chunks, eps: float, init_prune_frac: float = 0.3, iters: int = 2) -> list:
+        """Plan per-tile keep counts to hit target eps via the global ratio R target.
+        We invert L1<=2R/(1+R) giving R_target = eps/(2-eps). We allocate per-tile tail budgets
+        proportional to current Zc_i, iterate 1-2 times.
+        Returns a list of keep_counts per tile.
+        """
+        assert 0.0 < eps < 1.0
+        R_target = eps / (2.0 - eps)
+        # initial keep by prune_frac
+        keep = []
+        tiles = []
+        for ch in chunks:
+            n = len(ch)
+            k0 = max(1, int(n * (1.0 - init_prune_frac)))
+            keep.append(k0); tiles.append(n)
+        # iterate: compute Zc_i with current keep, allocate tail budgets, adjust keep by threshold
+        for _ in range(max(1, iters)):
+            # compute current per-tile Zc_i and R_i
+            ms = []; Zc = []; R = []
+            for (ch, k_keep) in zip(chunks, keep):
+                s = scores[ch]; n=len(s); k_keep = max(1, min(k_keep, n))
+                m_i = float(np.max(s)); ms.append(m_i)
+                if k_keep < n:
+                    idx_top = np.argpartition(s, n - k_keep)[n - k_keep:]
+                    idx_pruned = np.setdiff1d(np.arange(n), idx_top, assume_unique=False)
+                    Zc_i = float(np.sum(np.exp(s[idx_top] - m_i)))
+                    R_i = float(np.sum(np.exp(s[idx_pruned] - m_i)))
+                else:
+                    Zc_i = float(np.sum(np.exp(s - m_i)))
+                    R_i = 0.0
+                Zc.append(Zc_i); R.append(R_i)
+            Zc_sum = sum(Zc) + 1e-12
+            # allocate target R_i* s.t. sum R_i* = R_target * Zc_sum
+            R_total_target = R_target * Zc_sum
+            # new keep by shrinking tail until R_i <= R_i*
+            keep_new = []
+            for (ch, m_i, Zc_i) in zip(chunks, ms, Zc):
+                s = scores[ch]; n=len(s)
+                # binary search threshold on k to satisfy R_i <= R_i_star
+                R_i_star = R_total_target * (Zc_i / Zc_sum)
+                # pre-sort ascending by s for tail sums cumulative
+                idx = np.argsort(s)  # ascending => tail first
+                e = np.exp(s[idx] - m_i)  # tail masses ascending in s, but e ascending too
+                # prefix sums for tail from smallest
+                prefix = np.cumsum(e)  # R at pruning count t = prefix[t]
+                # map k_keep = n - t  s.t. prefix[t] <= R_i_star
+                # find largest t with prefix[t] <= R_i_star
+                t = int(np.searchsorted(prefix, R_i_star, side="right") - 1)
+                t = max(0, min(t, n-1))
+                k_keep = n - t
+                k_keep = max(1, min(k_keep, n))
+                keep_new.append(k_keep)
+            keep = keep_new
+        return keep
+
+
+class AutoKCCR:
+    """CCR-aware Auto-k returning selected global indices and epsilon certificate."""
+
+    @staticmethod
+    def run_heap_indices(scores: np.ndarray, chunks, eps: float):
+        """Return (selected_idx, eps_eff, head_sum, Z_c, m_c, scales)."""
+        # prepare heads
+        ms = []; Zs = []; heads = []
+        for ch in chunks:
+            s = scores[ch]; m_i = float(np.max(s)); ms.append(m_i)
+            a_i = np.exp(s - m_i)
+            idx = np.argsort(a_i)[::-1]
+            a_sorted = a_i[idx]
+            heads.append((ch, idx, a_sorted))
+            Zs.append(float(np.sum(a_i)))
+        m_c, Z_c = CCR.combine_many(ms, Zs)
+        scales = [math.exp(m_i - m_c) for m_i in ms]
+        # heap greedy
+        import heapq
+        heap = []
+        K = [0] * len(chunks)
+        for i, (_, _, a_sorted) in enumerate(heads):
+            if len(a_sorted)>0:
+                gain = scales[i]*float(a_sorted[0])
+                heapq.heappush(heap, (-gain, i, 0))
+        head_sum = 0.0
+        selected = []
+        total_len = sum(len(a) for (_,_,a) in heads)
+        while heap:
+            R = (Z_c - head_sum)/Z_c
+            if 2*R/(1+R) <= eps or len(selected) == total_len:
+                break
+            ngain, i, k = heapq.heappop(heap)
+            gain = -ngain
+            head_sum += gain
+            ch, idx, a_sorted = heads[i]
+            selected.append( ch[idx[k]] )  # global index
+            K[i] += 1
+            if K[i] < len(a_sorted):
+                gain2 = scales[i]*float(a_sorted[K[i]])
+                heapq.heappush(heap, (-gain2, i, K[i]))
+        eps_eff = 2*(Z_c - head_sum)/Z_c
+        return np.array(selected, dtype=int), float(eps_eff), float(head_sum), float(Z_c), float(m_c), scales
+
+
+class CCRNormV21:
+    """Integrated CCR-aware normalization: Safe-Z exact + Auto-k heap with certificates."""
+
+    @staticmethod
+    def normalize_safe_auto(scores: np.ndarray, chunks, eps: float, init_prune_frac: float = 0.3, iters: int = 2):
+        """Two-stage:
+        1) Per-tile CCR exact Safe-Z to tighten the tail bound and shrink candidate set.
+        2) Auto-k heap on kept items to meet eps; return indices kept and global certificates.
+        """
+        # plan per-tile keep
+        keep_counts = SafeZCCR.plan_eps_ccr(scores, chunks, eps=eps, init_prune_frac=init_prune_frac, iters=iters)
+        # exact per-tile bound and Z_hat
+        sz = SafeZCCR.exact_ccr(scores, chunks, keep_counts)
+        # build "kept" mask to feed Auto-k only on kept
+        kept_mask = np.zeros(scores.shape[0], dtype=bool)
+        for ch, k in zip(chunks, keep_counts):
+            s = scores[ch]; n=len(s); k = max(1, min(int(k), n))
+            idx_top = np.argpartition(s, n - k)[n - k:]
+            kept_mask[ch[idx_top]] = True
+        # run Auto-k on kept subset only
+        kept_idx = np.where(kept_mask)[0]
+        sub_order = np.argsort(kept_idx)  # stable
+        invmap = {g:i for i,g in enumerate(kept_idx)}
+        # build sub-chunks
+        sub_chunks = []
+        for ch in chunks:
+            sub = [invmap[g] for g in ch if kept_mask[g]]
+            sub_chunks.append(np.array(sub, dtype=int))
+        sub_scores = scores[kept_idx]
+        sel_local, eps_eff, head_sum, Z_c, m_c, scales = AutoKCCR.run_heap_indices(sub_scores, sub_chunks, eps=eps)
+        selected_global = kept_idx[sel_local]
+        # final certificate: combine Safe-Z exact R and Auto-k residual wrt kept mass
+        # R_exact = sum_pruned_exp / sum_kept_exp (per SafeZCCR exact)
+        R_exact = sz.Rhat_global
+        # residual over kept part after Auto-k:
+        # Compute kept partition CCR base
+        ms=[]; Zs=[]
+        for ch in sub_chunks:
+            if len(ch)==0:
+                ms.append(-1e300); Zs.append(0.0)
+                continue
+            s = sub_scores[ch]
+            m_i = float(np.max(s)); ms.append(m_i)
+            Zs.append(float(np.sum(np.exp(s - m_i))))
+        m_keep, Z_keep = CCR.combine_many(ms, Zs)
+        # eps_keep from Auto-k on kept: eps_keep = 2*(Z_keep - head_sum)/Z_keep
+        eps_keep = 2.0 * (Z_keep - head_sum) / max(1e-12, Z_keep)
+        # Compose bound as in earlier note
+        L1_final_bound = 2.0 * ( R_exact + (Z_keep - head_sum)/max(1e-12, Z_keep) ) / ( 1.0 + R_exact + (Z_keep - head_sum)/max(1e-12, Z_keep) )
+        return {
+            "keep_counts": keep_counts,
+            "safez_exact": sz,
+            "selected_idx": selected_global,
+            "eps_eff_keep": float(eps_keep),
+            "eps_eff_all": float( 2.0 * ( (Z_keep + sz.Rhat_global*Z_keep) - head_sum ) / max(1e-12, (Z_keep + sz.Rhat_global*Z_keep)) ),
+            "L1_bound_final": float(L1_final_bound),
+        }
