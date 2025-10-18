@@ -1,5 +1,5 @@
 # Sera-pre-core.py
-# Sera v2.0 pre-core (strict CCR) — High-quality build
+# Sera v2.0 pre-core (strict CCR) 
 # Dependencies: numpy.
 #
 # Provides
