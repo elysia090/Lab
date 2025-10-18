@@ -1,6 +1,6 @@
 # Sera-pre-core.py
 # Sera v2.0 pre-core (strict CCR) — High-quality build
-# ASCII only, English only. Dependencies: numpy.
+# Dependencies: numpy.
 #
 # Provides
 # - Stable streaming ratio estimator (PRF + EWVar + Kahan) with overlays.
@@ -8,7 +8,6 @@
 # - Selector with optional quantile-based theta (online P^2 estimator).
 # - Tokenizer: byte-level BPE with training, encode/decode, and stateful streaming encoder.
 #
-# Author: Sera v2.0
 
 from __future__ import annotations
 
