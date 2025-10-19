@@ -1,4 +1,4 @@
-Title: Sera v2.1 — Model-Centric Integrated Specification (peer-review ready)
+Title: Sera v2.1 — Model-Centric Integrated Specification 
 Subtitle: Constant-time streaming model with PRF attention, injective-addressed sparse linear learning, finite rational memory, algebraic overlays, CCR corrector, and an O(1) tokenizer
 (Plain ASCII, English)
 
