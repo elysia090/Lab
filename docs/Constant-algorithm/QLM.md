@@ -126,5 +126,235 @@ Proof sketches for key identities
 	2.	[d, mu] on q=0: d is a derivation and L_X = [d, iota_X] gives [d, alpha E] = 0, [d, beta L_X S] = [L_X, beta S]; extend derivationally to all q. The MC equation ad_D mu + (1/2)[mu,mu] = 0 expands to the edge identity written above.
 	3.	Filtered HPL: with gamma < 1, S = sum_{m>=0} (- mu h)^m converges in ||·||_F; define h_mu = h S and verify the contraction identities by formal power series, then bound the truncation tail by the geometric series.
 
+
+
+Appendix X: Band-limited scalar fields on S^2 (Riemann sphere) with point impulses, in ASCII
+
+Purpose
+	•	Define an exact, implementation-ready recipe to visualize band-limited scalar fields on S^2 together with point-like impulses.
+	•	Keep all notation ASCII. Tie the construction to the QMS-256 front end and constant-size updates.
+
+A. Coordinates and maps
+
+A1. S^2 basics
+	•	Use unit vectors n = (nx, ny, nz) with ||n|| = 1.
+	•	Spherical angles: theta in [0, pi], phi in [0, 2*pi).
+nx = sin(theta) * cos(phi)
+ny = sin(theta) * sin(phi)
+nz = cos(theta)
+
+A2. Riemann sphere (stereographic from north pole)
+	•	Complex plane coordinate z in C union {inf}.
+	•	Map z -> n:
+let r2 = |z|^2
+nx = 2Re(z) / (1 + r2)
+ny = 2Im(z) / (1 + r2)
+nz = (r2 - 1) / (1 + r2)
+	•	Inverse n -> z (excluding south pole):
+z = (nx + i*ny) / (1 + nz)
+
+A3. Hopf map from normalized spinor psi to S^2
+	•	Let psi = (u, v) in C^2 with |u|^2 + |v|^2 = 1.
+	•	Unit vector n = (nx, ny, nz) given by:
+nx = 2Re(uconj(v))
+ny = 2Im(uconj(v))
+nz = |u|^2 - |v|^2
+	•	This ties QMS-256 state psi to a point on S^2.
+
+B. Band-limited scalar fields via spherical harmonics
+
+B1. Basis Y_lm
+	•	Use real or complex spherical harmonics. Here: complex Y_lm:
+Y_lm(theta, phi) = N_lm * P_l^|m|(cos(theta)) * exp(imphi)
+N_lm = sqrt( (2l+1)/(4pi) * ( (l-|m|)! / (l+|m|)! ) )
+l = 0..L, m = -l..l
+	•	P_l^m are associated Legendre functions. Precompute them on a theta grid.
+
+B2. Expansion and band-limit
+	•	A band-limited scalar field f: S^2 -> R (or C) with limit L:
+f(n) = sum_{l=0..L} sum_{m=-l..l} a_{l m} * Y_lm(theta, phi)
+	•	Coefficients a_{l m} define the field. Store as a packed vector.
+
+B3. Rotation action (for degree-0 flows)
+	•	A rotation R in SO(3) acts on coefficients by Wigner-D blocks:
+a’{l m} = sum{m’=-l..l} D^l_{m m’}(R) * a_{l m’}
+	•	With QMS-256, SU(2) matrix U induces R = Ad(U). Precompute D^l(R) for l=0..L or tabulate small-angle generators and use BCH if needed.
+
+C. Point impulses and kernels
+
+C1. Band-limited delta at n0
+	•	The ideal delta on S^2 at n0 is not band-limited. Its best L-bandlimited proxy uses the addition theorem:
+Let gamma be the geodesic angle between n and n0, i.e. cos(gamma) = n dot n0.
+Define
+delta_L(n, n0) = sum_{l=0..L} (2l+1)/(4pi) * P_l( cos(gamma) )
+	•	Properties:
+	•	Integral over S^2 is 1 (exact for all L).
+	•	As L increases, delta_L concentrates around n0 with main-lobe width ~ pi/L.
+
+C2. Heat kernel (spherical Gaussian) for smoothing
+	•	Coefficients multiplier:
+g_l(t) = exp( - t * l * (l+1) ) , t > 0
+	•	Smoothed field:
+a_{l m}^{(t)} = g_l(t) * a_{l m}
+	•	This preserves band-limit and damps high l.
+
+C3. Building impulses in coefficient space
+	•	Given location n0 with angles (theta0, phi0):
+a_{l m}^{impulse} = (2l+1)/(4pi) * Y_lm^*(theta0, phi0)
+	•	Then f(n) = sum_{l,m} a_{l m}^{impulse} * Y_lm(theta, phi) equals delta_L(n, n0).
+
+D. Grids, sampling, and offline tables
+
+D1. Grids
+	•	Use an O(L^2) grid. Two common choices:
+	•	Equiangular: theta_i = pi*(i+0.5)/N_theta, phi_j = 2pij/N_phi, with N_theta,N_phi ~ 2*L.
+	•	Gauss-Legendre in theta with N_theta ~ L+1, and uniform phi with N_phi ~ 2*L+1.
+
+D2. Offline precomputation
+	•	Precompute and store:
+	•	Y_lm(theta_i, phi_j) for all l<=L, m in [-l..l], grid points (i,j).
+	•	P_l(c) for c in a fine grid on [-1,1] (for impulse via P_l(cos gamma)).
+	•	Wigner D^l blocks for rotations induced by QMS SU(2) steps you actually use.
+	•	Heat multipliers g_l(t) for t in a small certified set.
+
+E. Coupling to QMS-256
+
+E1. From psi to a moving impulse
+	•	Convert psi -> n0 via Hopf map (A3).
+	•	Add a weighted impulse centered at n0:
+a_{l m} += w * (2l+1)/(4pi) * Y_lm^*(theta0, phi0)
+	•	If a spike S_ell fires, use its gate s in [0,1] for amplitude or for a short blur with g_l(t_s).
+
+E2. Rotating a field by a byte
+	•	Each token b applies U(q_b) in SU(2) to psi and induces an SO(3) rotation R_b on the field:
+for each l: a_l <- D^l(R_b) * a_l
+	•	This keeps the band-limit fixed and is constant-size once D^l are small and pretabulated up to L.
+
+E3. Constant-size pattern
+	•	L is fixed offline. For small L (e.g., L <= 8 or 16), all Wigner D^l are tiny blocks.
+	•	Per token: a handful of  (2l+1)x(2l+1) multiplies for l=0..L, plus optional impulse add (rank-1 update), plus optional heat kernel scaling. This stays constant-time for fixed L.
+
+F. Rendering to ASCII
+
+F1. Scalar to ASCII shade
+	•	Choose intensity mapping s -> char:
+map s_norm in [0,1] to “ .:-=+*#%@”
+	•	Normalize per-frame or globally:
+s_norm = (s - s_min) / (s_max - s_min + eps)
+
+F2. Lat-long raster (rows by theta, cols by phi)
+	•	For i in 0..N_theta-1:
+theta = pi*(i+0.5)/N_theta
+row = “”
+for j in 0..N_phi-1:
+phi = 2pij/N_phi
+s = sum_{l,m} a_{l m} * Y_lm(theta, phi)   ; or use precomputed table dot a
+row += shade(s)
+print(row)
+
+F3. Minimal pseudocode (Python-like, ASCII only)
+
+def ylm_table(L, theta_grid, phi_grid):
+    # returns dict[(l,m)] -> 2D array Y_lm(theta_i, phi_j)
+    # precompute associated Legendre and exp(i m phi)
+    ...
+
+def impulse_coeffs(L, theta0, phi0):
+    # a_{l m} = (2l+1)/(4*pi) * conj(Y_lm(theta0,phi0))
+    a = {}
+    for l in range(L+1):
+        for m in range(-l, l+1):
+            a[(l,m)] = (2*l+1)/(4.0*pi) * conj(Y_lm_scalar(l,m,theta0,phi0))
+    return a
+
+def rotate_coeffs(a, D_blocks):  # D_blocks: dict[l] -> (2l+1)x(2l+1) matrix
+    a_rot = {}
+    for l, D in D_blocks.items():
+        vec = [a.get((l,m),0.0+0.0j) for m in range(-l,l+1)]
+        vec2 = D @ vec
+        for idx,m in enumerate(range(-l,l+1)):
+            a_rot[(l,m)] = vec2[idx]
+    return a_rot
+
+def heat_filter(a, t):
+    a2 = {}
+    for (l,m), c in a.items():
+        a2[(l,m)] = exp(-t*l*(l+1))*c
+    return a2
+
+def render_ascii(a, Y_table, N_theta, N_phi, chars=" .:-=+*#%@"):
+    import numpy as np
+    S = np.zeros((N_theta, N_phi), dtype=float)
+    for (l,m), Ylm in Y_table.items():
+        S += (a.get((l,m),0.0+0.0j)).real * Ylm.real - (a.get((l,m),0.0+0.0j)).imag * Ylm.imag
+    smin, smax = S.min(), S.max()
+    out = []
+    for i in range(N_theta):
+        row = ""
+        for j in range(N_phi):
+            x = (S[i,j]-smin)/max(1e-12, smax-smin)
+            k = min(len(chars)-1, int(x*(len(chars)-1)+0.5))
+            row += chars[k]
+        out.append(row)
+    return "\n".join(out)
+
+G. Sanity checks
+
+G1. Energy and orthogonality
+	•	With complex Y_lm normalized as in B1:
+Integral_{S^2} Y_lm * conj(Y_l’m’) dOmega = delta_{l l’} delta_{m m’}
+Then ||f||^2 = sum_{l,m} |a_{l m}|^2.
+
+G2. Impulse at the north pole
+	•	For n0 = (0,0,1), theta0 = 0:
+Y_lm(theta0,phi0) = 0 for m != 0; Y_l0(theta0,phi0) = sqrt((2l+1)/(4pi))
+Hence a_{l0} = (2l+1)/(4pi) * sqrt((2l+1)/(4pi)), and rendering should show a circularly symmetric peak.
+
+G3. Rotation consistency
+	•	Apply a rotation R to coefficients via Wigner D. Rendering should equal rotating the image on the sphere. Numerically test by sampling f(R^{-1} n) vs rendered f’(n).
+
+H. Numerical notes
+
+H1. Band-limit vs grid
+	•	Use N_theta ~ 2L and N_phi ~ 2L to avoid aliasing on equiangular grids. For higher accuracy in integration, increase N_phi.
+
+H2. Stability near poles
+	•	Use dual charts for stereographic or just stay in (theta, phi). For impulses, use the Legendre sum delta_L; do not sample a true delta.
+
+H3. Fixed-size execution
+	•	For a fixed L, all blocks (Wigner D^l, Y_lm tables, heat multipliers) are fixed-size. Adding a single impulse is a rank-1 update in coefficient space.
+
+I. Minimal QMS-driven visualization loop (constant-size per token)
+
+# Offline (fixed size for chosen L)
+Y_table = ylm_table(L, theta_grid, phi_grid)
+D_blocks = precompute_wigner_D_blocks(L, set_of_R_from_QMS)
+a = zeros_like_coeffs(L)
+
+# Online per token b
+psi = normalize( U(q_b) @ psi )
+if spike_flag:
+    (theta0, phi0) = hopf_to_angles(psi)
+    a += w * impulse_coeffs(L, theta0, phi0)     # rank-1 add
+if apply_rotation_to_field:
+    Rb = so3_from_su2(U(q_b))
+    a = rotate_coeffs(a, D_blocks[Rb])           # block-wise multiply
+if apply_heat:
+    a = heat_filter(a, t_step)
+
+# Render occasionally
+ascii_frame = render_ascii(a, Y_table, N_theta, N_phi)
+print(ascii_frame)
+
+J. Compact reference
+	•	Stereographic map (A2)
+	•	Hopf map (A3)
+	•	Spherical harmonics basis (B1)
+	•	Band-limited delta kernel (C1)
+	•	Heat kernel multiplier (C2)
+	•	Rotation in coefficient space via Wigner D (B3)
+	•	ASCII renderer (F2/F3)
+
+
 Summary
 The stack uses a filtered complete dgLA to make square-zero structure and differentiation first-class invariants, and QMS-256 to supply a constant-size, exact, and bounded front end. With explicit envelopes and filtered control, all online passes are O(1), algebraically closed, and numerically stable. This formulation isolates assumptions, quantifies errors, and exposes a minimal ABI suitable for independent verification.
