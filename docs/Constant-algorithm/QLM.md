@@ -326,12 +326,12 @@ H3. Fixed-size execution
 
 I. Minimal QMS-driven visualization loop (constant-size per token)
 
-# Offline (fixed size for chosen L)
+ Offline (fixed size for chosen L)
 Y_table = ylm_table(L, theta_grid, phi_grid)
 D_blocks = precompute_wigner_D_blocks(L, set_of_R_from_QMS)
 a = zeros_like_coeffs(L)
 
-# Online per token b
+ Online per token b
 psi = normalize( U(q_b) @ psi )
 if spike_flag:
     (theta0, phi0) = hopf_to_angles(psi)
