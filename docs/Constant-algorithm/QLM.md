@@ -342,7 +342,7 @@ if apply_rotation_to_field:
 if apply_heat:
     a = heat_filter(a, t_step)
 
-# Render occasionally
+ Render occasionally
 ascii_frame = render_ascii(a, Y_table, N_theta, N_phi)
 print(ascii_frame)
 
