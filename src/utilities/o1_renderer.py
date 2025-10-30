@@ -429,3 +429,4 @@ print(f"Image dimensions: {image.shape[1]}x{image.shape[0]}")
 print(f"Channels: {image.shape[2]}")
 print()
 print("=" * 70)
+```
