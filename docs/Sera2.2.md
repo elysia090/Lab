@@ -396,3 +396,149 @@ Slack>=margin at each rebuild; otherwise freeze and republish updated (C, tau_lo
 
 Summary
 Sera v2.2 retains the v2.1 core and extends it with a constant-time bridge and a bounded one-step search, both respecting the O(1)/token constraint. The bridge supplies dictionary O(0) hits and a two-hop evaluator under a constant-time guard, then gates branchlessly via a fixed projection moderated by peer scoring. All additions share the same concurrency, capacity, FP, audit, and determinism contracts, enabling portable modules and predictable latency without quality degradation.
+
+
+Version: v2.2 Appendix
+Title: Counterfactual Replay Module (CFR) with One-Step Tree Search Coupling
+(Plain ASCII, English)
+	1.	Purpose
+Provide an O(1) per-event counterfactual generator that runs without external input, reuses the v2.2 core state, couples to the bounded one-step tree search, and outputs a fixed-size counterfactual vector cf_t and optional token proposals. CFR does not degrade the hot path. All loops are bounded by compile-time constants.
+	2.	Operating modes
+Mode OFF: regular Step with external inputs only.
+Mode CFR-REPLAY: Step executes with input gating disabled and internal sources enabled.
+Mode CFR-MIX: Step executes with both external inputs and CFR proposals; fusion is gated.
+	3.	Fixed assumptions
+A0 Fixed configuration and generation pinning hold as in v2.2.
+A1 Floors, whitening ridge, CCR smallness, store capacities obey v2.2 bounds.
+A2 Learning is disabled in CFR-REPLAY to prevent drift; exact linear updates are skipped.
+A3 Per-event budgets: sim<=1, expand<=1, rollout H_roll<=4, backup depth H_sel<=4.
+	4.	State (reused and added)
+Reused: PRF parameters, R_t, s_t, whitening moments; exact linear store; finite memory; CCR tuple; bridge store; search store.
+Added CFR state (fixed size):
+
+	•	Replay seeds: seed_attn, seed_mem, seed_sched (64-bit each)
+	•	Noise LUT for PRF drift: LUT_d in R^{r} with bounded entries in [−eps_phi, +eps_phi]
+	•	CFR policy table P_cfr over a fixed action set A_cfr (size A_cfr<=8)
+	•	CFR gating weights w_cfr (fixed) and beta caps beta_cfr_max<=beta_max
+	•	CFR manifest block documenting constants and digests
+
+	5.	Internal sources and synthesis
+5.1 PRF counterfactual query
+phi_cfr(q) := whiten( PRF(q) + LUT_d ) with LUT_d indexed by seed_attn and event id.
+Denominator floor and whitening bounds unchanged.
+
+5.2 Memory replay
+u_cfr := memory_step on latent coordinates with deterministic small-amplitude excitation e_mem generated from seed_mem and a fixed sparse pattern of size T_phi_cfr<=T_phi.
+
+5.3 Bridge backfeed
+When promoted(ctx, token) and guard_ok, read F_VAL in O(0) as a counterfactual anchor; else run two-hop K candidates to produce a bounded surrogate anchor.
+	6.	Action set for CFR
+A_cfr = {Hold, Route, Rebind, PromoteHint, OverlayHint, DenFloorBump, MemExcite, TokenProposal}. Each action has a constant-cost effect realized via existing v2.2 APIs (no dynamic allocation).
+	7.	CFR outputs
+cf_t is a fixed-size vector formed by concatenating {y_att,cfr, u_cfr, bridge_anchor, small diagnostics}. Optional token proposal set C_cfr of size P_cfr<=P_gen is produced by a constant table indexed by seed_sched and local cache.
+	8.	Fusion with main output
+Let y_base be the v2.2 fused output before CCR. Let s_wit := clamp01(min(IQ_witness, HON_witness)). CFR gating:
+beta_cfr := g_cfr * (beta_min + (beta_cfr_max − beta_min) * s_wit)
+y_cfr := Proj_cfr(cf_t)      // fixed projection, manifest-recorded
+y_mix := (1 − beta_cfr)y_base + beta_cfry_cfr
+y_out := ccr_correct(y_mix, overlaps, m)
+
+Gate bit g_cfr is true only if CFR health checks pass (Section 11).
+	9.	Coupling to one-step tree search
+9.1 Selection policy
+Use the existing one-step tree search with P-UCT scoring; add a CFR-specific prior P_cfr[a] from the CFR policy table. Score:
+S_a = Q_a[a] + c_puct * P_mix[a] * sqrt(N_parent) * inv(1 + N_a[a])
+P_mix[a] := clamp01( alpha_p * P[a] + (1 − alpha_p) * P_cfr[a] ), alpha_p in [0,1] (fixed)
+
+9.2 Rollout context
+During CFR-REPLAY, rollouts evaluate actions on cf_t and anchors only; during CFR-MIX, rollouts may query both cf_t and external features but must respect the fixed budgets. Backup and expansion limits are unchanged.
+
+9.3 Token proposals
+If action TokenProposal is selected, merge C_cfr into the generator proposal set C_t with a fixed cap and stable tie-breakers.
+	10.	Scheduling and determinism
+CFR seeds are deterministic from (gen_id, event, module_id). LUT_d, P_cfr, Proj_cfr are immutable in a generation; digests recorded in the manifest. No data-dependent reseeding. CFR work is inserted after y_fus and before CCR, keeping the hot path O(1).
+	11.	Health checks (constant time)
+H1 PRF drift bound: ||LUT_d||_inf <= eps_phi; den>=beta_floor.
+H2 Memory bound: |e_mem|_1 <= e_mem_max; pole radius < 1.
+H3 Bridge guard_ok if dictionary O(0) is used.
+H4 Search budgets honored: sim<=1, expand<=1, path_len<=H_sel, roll_len<=H_roll.
+H5 Capacity: store_load_p99<=load_max, kick_len_p99<=kick_max.
+If any check fails on an event, set g_cfr := false and beta_cfr := 0.
+	12.	Diagnostics additions
+Diagnostics() extends with {mode_cfr in {OFF,REPLAY,MIX}, beta_cfr_eff, prf_drift_inf, e_mem_l1, cfr_guard_used, cfr_token_merge, cfr_sim, cfr_expand}. All fields are fixed-size and appended to the v2.2 record.
+	13.	API additions
+Enable_CFR(mode, params) -> void       // publication-time only
+Disable_CFR() -> void                   // publication-time only
+CFR_Status() -> fixed-size record       // current counters and last health bits
+	14.	Complexity
+All CFR work is constant per event: one PRF drift add, one Proj_cfr GEMV of fixed shape, one memory excitation of fixed sparsity, at most one dictionary read or K-candidate two-hop, optional merge of at most P_cfr token ids, at most one selection/expansion/rollout/backup.
+	15.	Default constants (example)
+eps_phi in [1e−4, 5e−3]
+T_phi_cfr <= 8
+P_cfr <= 32
+alpha_p in [0.25, 0.75]
+beta_cfr_max <= 0.35
+A_cfr size <= 8
+	16.	Pseudocode (fixed loops only)
+
+function Step_CFR_Inject(ctx, y_fus):
+// Mode check and seeds
+if mode_cfr == OFF: return {y_fus, g_cfr=false, cf_t=ZERO}
+phi_q = have_q ? PRF(q) : PRF(last_q)
+phi_w = whiten(phi_q + LUT_d)              // bounded drift
+den = dot(phi_w, s) + lambda_star(t)
+num = phi_w^T R
+y_att_cfr = apply_overlays(num, den)
+u_cfr = memory_step_cfr(M, seed_mem)       // fixed sparsity excitation
+anc, ok = Bridge_CFR_Anchor(ctx, token_id_if_available)
+cf_t = pack_fixed(y_att_cfr, u_cfr, anc, small_diag)
+g_cfr = (ok AND health_bounds_ok())
+return {y_fus, g_cfr, cf_t}
+
+function Bridge_CFR_Anchor(ctx, token):
+if token != NONE and is_promoted(ctx, token):
+if guard_ok(ctx, token): return {dict_read_F_VAL(ctx, token), true}
+// fallback: O(1) two-hop with K<=4
+mask = hub_bits(ctx) & hub_bits(token_or_ctx_default)
+S = enumerate_first_K_setbits(mask)
+best = +INF
+for h in S:
+cand = qDout(ctx,h) + qDin(h,token_or_ctx_default)
+if cand < best: best = cand
+return {Proj_input_from(best), true}
+
+function Step(…):
+// v2.2 hot path until y_fus computed
+y_fus = fuse(y_att?, y_lin?, aux?, diagnostics)
+ctx = make_ctx(t)
+// CFR injection
+y_fus, g_cfr, cf_t = Step_CFR_Inject(ctx, y_fus)
+s_wit = clamp01(min(IQ_witness(ctx), HON_witness(ctx)))
+beta_cfr = g_cfr ? LUT_beta_cfr(s_wit) : 0.0
+y_mix = (1 - beta_cfr) * y_fus + beta_cfr * Proj_cfr(cf_t)
+// Optional one-step search with CFR priors
+Maybe_Selection_OneStep_CFR(ctx)
+y_out = ccr_correct(y_mix, overlaps, m)
+emit_audit()
+return y_out
+
+function Maybe_Selection_OneStep_CFR(ctx):
+if budgets.sim == 0: return
+node = select_node_with_Pmix(ctx)     // adds P_cfr prior
+if can_expand(node): expand_one(node)
+r = rollout(node, H_roll)             // fixed actions including CFR actions
+backup(node, r, H_sel)
+	17.	Proof obligations
+P1 Drift safety: eps_phi and beta_floor ensure den>=beta_floor; ratio Lipschitz remains 1/beta_floor.
+P2 Memory safety: excitation l1-norm and poles enforce bounded outputs; compensation bounds hold.
+P3 Guard correctness: dictionary O(0) used only when guard_ok.
+P4 Budget safety: per-event budgets are never exceeded; on violation, CFR gating disables contributions for the event.
+P5 Determinism: seeds and LUT indices are functions of (gen_id, event, module_id); replay is bitwise reproducible.
+	18.	Failure handling
+On any health check failure or capacity breach during an event set beta_cfr:=0 and proceed with y_fus. No state mutation occurs in CFR-REPLAY; no learning updates are applied.
+	19.	Manifest additions
+cfr: {eps_phi, T_phi_cfr, P_cfr, alpha_p, beta_cfr_max, Proj_cfr_shape, Proj_cfr_digest, LUT_d_digest, policy_digest, seed_policy}
+budget: {sim:1, expand:1, H_sel, H_roll}
+
+Summary
+CFR adds an O(1) counterfactual generator that reuses v2.2 components, couples to the bounded one-step tree search via a fixed prior, and fuses branchlessly under a constant-time health-guarded gate. It preserves all v2.2 invariants, determinism, and auditability.
