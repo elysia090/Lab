@@ -230,3 +230,111 @@ emit_audit(); return y_lin?
 	15.	Summary
 
 Sera v2.1 is a deterministic, audit-ready streaming model with strictly bounded hot-path loops. PRF attention is controlled uniformly in time via r and clipping, stabilized by a predictable floor and whitening; the sparse linear learner is exact with injective addressing and strict O(1) bounds; the finite rational memory realizes its class exactly with fixed operations and state; the tokenizer is O(1) per byte with unique decode, no backtracking, and bounded retokenization under local edits; overlays add constrained algebraic flexibility; the CCR corrector admits a certified tail. Concurrency, capacity scheduling, floating-point behavior, and certificates are explicit and verifiable. 
+
+
+Version: v2.1 Appendix
+Title: Constant-time external reference bridge and bounded tree search (ASCII)
+	16.	Constant-time external reference bridge (read, guard, gate)
+
+16.1 Purpose
+Provide an O(1) external-reference read path with dictionary O(0) hits, a two-hop distance evaluator with a constant candidate bound, and constant-time audits. The bridge returns a fixed-size vector r_t and a boolean guard g used to gate the fused output. All loops are bounded by compile-time constants.
+
+16.2 Keying and store reuse
+Reuse the injective-addressed two-level store from Section 4. Keys are partitioned by a type field.
+
+Key64 layout (shared):
+type:8 | layer:8 | ctx:16 | token:16 | salt:16
+
+Types used by the bridge:
+BIND, SRC, IQ, HON, ROUTE_DIN, ROUTE_DOUT, F_VAL, OVR
+
+The L1/L2 parameters and relocation budgets are identical to Section 4. Load control, stash, ring, and generation invariants are unchanged. No pointers are exported.
+
+16.3 Two-hop distance and O(0) hits
+Each context maintains a fixed-size hub bitset hub_bits[W] (total hubs H <= 64*W).
+For a pair (ctx, token):
+mask := hub_bits(ctx) & hub_bits(token)
+enumerate up to K set bits -> candidates S
+best := min_h ( qDout[ctx,h] + qDin[h,token] )
+
+Dictionary O(0): promoted pairs read F_VAL by a single store probe if and only if the guard in 16.4 passes. Otherwise fall back to the O(1) two-hop compute.
+
+16.4 Guard (constant-time)
+Let m be the stored margin between the best hub h* and the second best.
+Let U, V be per-leg update bounds and C_h be a competitor bound, all computed from overlap-local budgets with finite support. With quantization compensation eps_row := 0.5*(s_in + s_out),
+
+Guard condition:
+(U + V < m/2 + eps_row) AND (for all h != h*: C_h < m/2 + eps_row)
+
+If false, dictionary reads are disabled for this pair during this event.
+
+16.5 Peer scoring (competence and honesty)
+Per neighbor per cell keep IQ[src], HON[src] in Q8.8. Update by constant-size games:
+CHAL/RESP for competence on XOR/NAND tasks; COM/SETTLE for honesty on local propositions with fixed TTL. Scores add to binding and selection. Low HON sources are deprioritized at receive under pressure.
+
+16.6 Gating rule (branchless)
+Given base output y_base (attention/linear/fusion) and bridge vector r_t:
+s := clamp01( min(IQ_witness, HON_witness) )
+beta := g * ( beta_min + (beta_max - beta_min) * s )   // g from 16.4
+alpha := 1 - beta
+y_gate := alpha * y_base + beta * Proj(r_t)
+
+Proj is a fixed projection matrix recorded in the manifest. No learning occurs inside the bridge. Arithmetic follows Section 9.
+
+16.7 Audits (fixed fields)
+Diagnostics() is extended with:
+{ o0_hits, o0_guard_fail, hub_cap_K, hub_and_p99, store_load_p99, stash_occ_p99, kick_len_p99, iq_auc, hon_auc, route_proof_digest }
+
+route_proof_digest is a 64B record for the last guarded read:
+{ hub_star, m, U, V, eps_row, ids, crc }
+
+16.8 Failure handling
+If any store bound or guard check fails during an event, set beta := 0 for this event and continue with the base outputs. Generational rebuild proceeds by fixed-size chunks only.
+
+16.9 Constants (recommended)
+W = 2, H <= 128, K = 4, beta_min = 0.0, beta_max = 0.5. Store limits are identical to Section 4.
+	17.	Bounded selection and one-step tree search (optional)
+
+17.1 Purpose
+Allow one bounded improvement step per event without violating O(1)/token. All budgets are 1 per event.
+
+17.2 Node key and statistics
+NodeKey64: type = MCTS_NODE:8 | slot:8 | state_fp:24 | salt:24
+Per node keep N, W, Q and per-action arrays N_a, W_a, Q_a for A_max actions (A_max <= 8). Arrays reside in the shared two-level store.
+
+17.3 Selection and widening
+Score per action (P-UCT style):
+U_a = c_puct * P[a] * sqrt(N_parent) * inv(1 + N_a[a])   // sqrt, inv via LUT
+S_a = Q_a[a] + U_a
+Pick by repeated best-of-two over A_max (constant repeats).
+Progressive widening: allowed_children = 1 + (N >= 2) + (N >= 4), cap A_cap <= 4.
+
+17.4 Rollout and backup
+Rollout length H_roll <= 4 using existing local actions {Route, Rebind/Flip, Promote, Overlay}. Reward r in [-1,1] is a fixed linear combination of {delta accuracy, dictionary hit, guard_ok, cost}. Backup along a path of length H_sel <= 4. At most one simulation and one expansion per event.
+
+17.5 Audits and failure
+Record {sim_per_event, expand_per_event, path_len, roll_len}. On any bound violation, disable selection for this event and continue.
+	18.	API additions
+
+18.1 New call
+Bridge_Read(ctx, token) -> { r_t (fixed-size vector), guard_ok (bool), proof64B }
+
+18.2 Diagnostics extension
+Diagnostics() includes the fields listed in 16.7.
+
+18.3 Manifest additions
+Add a bridge block documenting:
+{ K, W, Proj_digest, beta_min, beta_max, guard_params, store_limits, selection_params (if enabled), route_proof_schema }
+	19.	Hot-path pseudocode patch (fixed loops only)
+
+Patch to Section 14 Step(…):
+
+ctx = make_ctx(t)                     // fixed hash of local context
+ret, guard_ok, proof = Bridge_Read(ctx, token_id_if_available)   // O(1) store probes
+beta = guard_ok ? LUT_beta( min(IQ_witness, HON_witness) ) : 0.0
+alpha = 1.0 - beta
+y_gate = alpha * y_fus + beta * Proj(ret)
+emit_audit_field(proof)
+Maybe_Selection_OneStep()             // at most one bounded simulation
+y_out = ccr_correct(y_gate, overlaps, m)
+return y_out
