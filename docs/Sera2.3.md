@@ -1,0 +1,388 @@
+Title
+Sera v2.3 — Model-Centric Integrated Specification
+
+Subtitle
+Constant-time streaming model with PRF attention, injective-addressed sparse linear learning, finite rational memory, algebraic overlays, CCR overlap corrector, O(1) tokenizer, constant-time external reference bridge with guard-gated fusion, a constant-overhead trust gate, and bounded one-step tree search
+	0.	Assumptions, terms, notation
+0.1 Fixed configuration. All array sizes, loop trip counts, probe counts, salts, and per-event budgets are compile-time constants. Reconfiguration is an atomic publication of a new immutable generation. Already-processed events are never reinterpreted.
+0.2 Terms
+token: atomic unit from the tokenizer
+event: time index t in N
+hot path: O(1) work and O(1) working set per event
+floor: nonnegative increment to attention denominator
+overlay: fixed-budget algebraic correction at readout
+publication: single-pointer install of a new generation
+generation pinning: readers load generation id on entry and use only that generation until exit
+bridge: external read/guard/gate module with O(1) work
+dictionary O(0): table read with zero arithmetic on the query path
+trust gate: O(1) Bayesian-logical decider over fixed-dimension vectors, returning {True, False, Unknown}
+0.3 Symbols and constants
+q in R^d, k_t in R^d, v_t in R^{d_v}
+gamma in (0,1), tau>0, r in N (PRF count), eps>0
+beta_floor>0; lambda_star(t) predictable from logs up to t−1
+overlay caps: P (count), k_max (rank), r_v (value rank)
+sparse linear capacity C; thresholds 0<tau_low<tau_high<1; cuckoo params d,b,S,L_cuckoo; ring Q
+finite memory: T_phi (lift sparsity), K (lags); SOS sections L or ARMA orders (p,q)
+tokenizer: L_tok (max piece length), S_norm (FST states), L_norm<=4 (lookahead), W_edit>=L_tok
+CCR: cover multiplicity nu; truncation order m; smallness gamma_CCR:=||R h||<1
+bridge: hub windows W; candidate bound K; projection Proj
+tree search: A_max, A_cap, H_sel, H_roll
+u: machine epsilon for IEEE-754 double; sigma(x)=1/(1+exp(−x)); default norm l2
+	1.	State, inputs, outputs, API
+1.1 Persistent state (per generation)
+attention: R in R^{r x d_v}, s in R^r; whitening moments mu in R^r, sig2 in R^r
+exact linear: W_base, Keys_base, MPHF h; delta store with bounded cuckoo; bias b; version ids
+finite memory: accumulators M with compensation; DelayBuf[K]; SOS/ARMA states and coefficients
+tokenizer: FST state; rolling hashes RH_1..RH_{L_tok}; window head; pending head
+CCR: tuple (iota, pi, h); certificate {gamma_CCR, m, eps_tail}; generation id; audit hash
+bridge: two-level store metadata; Key64 salts; hub bitsets; qDin/qDout; peer scores IQ, HON; fixed Proj
+trust gate: compile-time profile {M,k,b_bits,p_prime,B_floor,pi0,H,O,psi,rho,d_trust}; per-salt keys Ks[1..M]; per-salt Beta counts {alpha_pos[s],beta_pos[s],alpha_neg[s],beta_neg[s]}; conservative estimates {q_min_hat, eps_pos_hat}; profile_id; audit salts digest
+tree search (optional): node stats (N,W,Q and per-action arrays) in shared store
+1.2 Inputs per event
+bytes (UTF-8), sparse features x_t (<=B_max nonzeros), optional (k_t,v_t), optional q, fixed-dimension trust vector v_t_trust in Q^{d_trust}
+1.3 Outputs per event
+y_att(q), y_lin(x_t), memory readout u_t, fused y_fus, gated y_gate, trust_decision in {True, False, Unknown}, CCR-corrected y_out; emitted token ids
+1.4 API
+Configure(params)->model
+Step(bytes?, x_t?, k_t?, v_t?, q?, v_t_trust?)->outputs
+Bridge_Read(ctx, token?)->{r_t, guard_ok, proof64B}
+TrustGate_Judge(v_vec)->{decision, audit64B}
+Maybe_Selection_OneStep(ctx)->void
+Snapshot()->blob
+Restore(blob)->model
+Diagnostics()->fixed-size record
+	2.	O(1) tokenizer
+2.1 Vocabulary and SP proof
+Vocabulary V is finite bytepieces of length 1..L_tok with unique decode. Either prefix-free or Sardinas-Patterson (SP) proven at build. Store sp_cert_digest in the manifest and verify on load.
+2.2 Normalizer
+Deterministic FST N with <=S_norm states and lookahead L_norm<=4. Reject invalid or overlong UTF-8. Normalize bidi controls, ZWJ, and confusables by table T_unicode. Apply NFC with bounded lookahead.
+2.3 Rolling hashes and tables
+For each n in 1..L_tok, RH_n operates over a sliding window of length n with O(1) update. MPH_n maps RH_n(window) to candidate id or BOT. T_n is a flat table with no chaining.
+2.4 Encoder
+For each normalized byte, update rolling windows; for n=L_tok..1 do:
+id := T_n[RH_n(window,n)]; accept iff Dec[id] bytewise equals window[0:n]; then slide_window(n) and emit id. At end, flush residual <=L_tok−1 bytes as single-byte atoms. Probes per normalized byte <=L_tok. No backtracking. With W_edit>=L_tok, retokenization after local edits is O(1) amortized.
+2.5 Decoder
+Concatenate Dec[id] for each emitted id. Decoding uniqueness follows the prefix or SP condition.
+2.6 Generator proposals
+Maintain constant-size set C_t of size P_gen. Score only C_t. Miss-rate is observed; updates occur only on publication.
+	3.	PRF attention
+3.1 Random features
+For i=1..r, phi_i(x) := r^(−1/2) * exp( w_i^T x / sqrt(tau) − ||x||^2/(2tau) ) with w_i~N(0,I_d). Then E[phi(q)^T phi(k)] = exp(q^T k / tau).
+3.2 Streaming update and whitening
+R := gammaR + phi(k_t)v_t^T (rowwise compensated)
+s := gammas + phi(k_t)
+phi_w(q) := diag(sig2 + eps)^(−1/2) * phi(q)
+Update mu,sig2 by compensated EMA. Bounds on sig2 ensure phi_w is well conditioned.
+3.3 Base readout and floor
+den_base(q) := <phi_w(q), s> + lambda_star(t)
+num_base(q) := phi_w(q)^T R
+y_att,base := num_base / den_base
+Choose beta_floor>0 with den_base(q)>=beta_floor for all q; record lambda_star schedule digest.
+3.4 Overlays
+Type A (numerator): DeltaR = sum_i phi(a_i) u_i^T; deltaA(q) = sum_i <phi_w(q),phi(a_i)> u_i
+Type B (denominator): Deltas = sum_i phi(a_i) beta_i, beta_i>=0; deltaB(q) = sum_i <phi_w(q),phi(a_i)> beta_i
+Type C (value low-rank): fixed H in R^{r x r_v}; core DeltaW rank<=k_max; z(q):=phi_w(q)^T H; deltaC(q):= z(q)^T DeltaW
+Combined: y_att = (num_base + sum_A deltaA + sum_C deltaC) / (den_base + sum_B deltaB)
+3.5 Uniform error and Lipschitz
+With bounded inputs and clipping at level c, with probability 1−delta uniformly in t, PRF kernel error is O(sqrt(log(1/delta)/r)). If den>=beta_floor, the ratio map is 1/beta_floor-Lipschitz. Nonnegative Type-B preserves this bound.
+	4.	Exact sparse linear learning (injective addressing)
+4.1 Prediction and update
+y_lin := b + sum_{(id,val) in x_t} w[id]val using optional compensated summation. Update by SGD+L2 with fixed step schedules; b updated by bias step. Equality with a reference dictionary holds to recorded FP contract ULPs.
+4.2 Addressing
+Base W_base addressed by MPHF h over stabilized key set K_base; Keys_base[h(id)]==id ensures exact membership. Delta dictionary uses bounded cuckoo with parameters (d choices, b slots, stash S, relocation cap L_cuckoo, ring Q, emergency 1). Lookup probes <= db + S + 1. Insert steps <= db + L_cuckoo + S + 1 + c0 where c0 is a compile-time constant.
+4.3 Stable references
+Each live id has a single stable slot (bucket, stash, ring, or emergency) within a generation. External handle = (generation, array_id, index). No raw pointers are exported.
+4.4 Capacity scheduling inequality
+C(tau_high − tau_low) >= lambda_max*T_rb + margin. Here lambda_max is p99.9 new-key rate over window W_lambda; T_rb is rebuild wall time bound. If slack<margin then inserts freeze and a new generation publishes updated (C, tau_low, tau_high).
+	5.	Finite algebraic lift and finite-order rational memory
+5.1 Lift
+Enumerate a finite coordinate set; at most T_phi coordinates fire per event. Accumulate in M with Kahan or Neumaier compensation. DelayBuf[K] advances by index rotation. id_map is dense and static.
+5.2 Rational memory
+SOS mode: L sections in DF-II-T, cost 5 mul + 4 add per section; states {z1,z2}
+ARMA mode: orders (p,q), rings y_hist[p], u_hist[q+1]; per-step cost (p+q+1) mul + (p+q−1) add
+Optional inverse denominator refinement: one Newton iteration using previous seed; a single reduction site converts extended precision back to double.
+	6.	Fusion, trust gate, and decision rules
+6.1 Meta-linear fusion
+y_fus := w1y_att + w2y_lin with exact linear weights from a fixed auxiliary vector.
+6.2 Linear-as-gate
+Gate := sigma(w_g^T z_g) for fixed diagnostic vector z_g. y := Gatey_att + (1−Gate)y_lin.
+6.3 Attention-as-feature
+Append attention readouts and diagnostics to x_t; downstream learning uses the exact linear module.
+6.4 Trust gate
+6.4.1 Input vector
+The trust gate consumes a fixed-dimension vector v_t_trust in Q^{d_trust}. v_t_trust is built in O(1) from fixed diagnostics without inspecting raw text, e.g. a compact set of normalized scalars chosen from {den_min, PRF_clip_rate, lambda_star(t), store_load_p99_clip, kick_len_p99_clip, stash_occ_p99_clip, bridge_guard_ok bit, hub_and_p99_clip, o0_hits_clip, tokenizer_probe_max_clip, tok_emitted_mod, pole_radius_min, eps_tail_clip}. Values are quantized by LUTs to fixed ranges. d_trust is compile-time.
+6.4.2 Per-salt projections and invariants
+For salts s=1..M with fixed per-salt keys Ks[s], compute u_s := Pi_s(v_t_trust) where Pi_s is a total computable constant-arity projection (e.g., small linear map or 2-universal hash projection). Using a keyed PRF h_K and independent keyed PRFs h1,h2 (separate from any 2-universal bucket hashes), define set-semantics finite invariants:
+Ext(S) = ( xor_{x in S} h_K(x), sum_{x in S} h_K(x) mod p_prime, |S| )
+Edge(a->b) = h_K(a) xor rot(h_K(b)) for a fixed nontrivial bit rotation rot
+Choice on pairwise-disjoint {S_i}: chi(S_i) = argmin_lex( h1(x), h2(x) )
+6.4.3 Verifiers and dominance
+Base verifier V_base: finite rational threshold tests on u_s with POS/NEG/NONE outcomes after unit-normalized linear constraints.
+AHL verifier V_ax: NEG if any finite contradiction is detected (self-edge, 2-cycle, chi clash on disjoint family); POS if an extensional, acyclic, choice-defined witness w exists and no NEG; NONE otherwise. POS carries canonical witness tuple {Ext(S_i), chi(S_i)} of constant size.
+Dominance combiner V: NEG if V_base=NEG or V_ax=NEG; POS if neither NEG and at least one POS (with witness); else NONE.
+Consistency Cons on a finite multiset of POS witnesses accepts iff overlapping Ext digests and chi representatives agree (constant-time check).
+6.4.4 Decision (constant-overhead)
+Compute E_s = V(u_s) and collect POS witnesses w_s. If any s has NEG, trust_decision = False. Else let m = |{s:E_s=POS}|. If m<k or Cons({w_s})=False, trust_decision = Unknown. Else compute a conservative Bayes envelope:
+BF_pos := q_min_hat / max(eps_pos_hat, 10^(−B_floor))
+LLR := logit(pi0) + m * log(BF_pos)
+Gamma := log((H+O)/(V+O)) − logit(pi0) + psi
+Choose Gamma so m* := ceil((Gamma − logit(pi0)) / log(BF_pos)) >= k at publication. If LLR>=Gamma, trust_decision=True else Unknown. Per-event work and persistent state are O(1).
+6.4.5 Coupling to fusion and bridge (branchless)
+Map trust_decision to d in {−1,0,+1} for {False,Unknown,True}. Prior to bridge gating, set effective caps using LUTs:
+beta_min_eff := lerp(beta_min, beta_boost, 1{d>0})
+beta_max_eff := lerp(beta_max, alpha_unknown*beta_max, 1{d==0})
+beta_cap := beta_max_eff * 1{d>=0}
+If d<0, set a rollback flag for the event (no structural mutation). The bridge Gate uses beta in [beta_min_eff, beta_cap]. Bridge guard and safety have priority: if the bridge guard fails, beta is forced to 0 for the event regardless of trust_decision.
+	7.	CCR overlap corrector
+7.1 Construction
+Let D be degree-0 total residual. With derivation R and contraction (iota, pi, h), define h_R := h * sum_{j>=0} (−R h)^j. If gamma_CCR:=||R h||<1, truncate at order m; tail eps_tail := gamma_CCR^(m+1)/(1−gamma_CCR).
+7.2 Operation
+Compute residuals r, correction c := −h_R r (truncated). Correct locals y_i^ := y_i + c_i. Combine y := pi({y_i^}). Energy reduces by factor alpha in (0,1) plus eps_tail^2. Certificate stores gamma_CCR, m, eps_tail and operator norm.
+	8.	Concurrency and reclamation
+8.1 Publication
+Single release-store of a generation pointer. Readers acquire the id on entry and dereference only arrays from that generation. Arrays are immutable within a generation.
+8.2 Reclamation
+Epoch-based garbage collection. Shadow indices are not recycled before reclamation. Rebuilds proceed in fixed-size chunks with bounded pauses.
+	9.	Floating-point contract
+9.1 Modes
+IEEE-754 double; round-to-nearest ties-to-even. FMA globally ENABLED or DISABLED and recorded. Denormals PRESERVED or FLUSHED-TO-ZERO and recorded. Optional extended precision for denominators using double-double or long double; reduction to double happens at a single site. Reduction orders are fixed; loops may be unrolled.
+9.2 Compensation bound
+For S_t := sum_{j<=t} gamma^(t−j) x_j with compensated accumulation,
+|fl(S_t) − S_t| <= u * C(gamma) * sum_{j<=t} gamma^(t−j) |x_j|
+with C(gamma) <= (1+gamma)/(1−gamma).
+	10.	Constant-time external reference bridge
+10.1 Purpose
+Provide O(1) external read path with dictionary O(0) hits when safe, two-hop distance with constant candidate bound K otherwise, constant-time guard, and branchless gating. Output is r_t and guard_ok.
+10.2 Keying and store reuse
+Shared store key: Key64 := type:8 | layer:8 | ctx:16 | token:16 | salt:16. Types include BIND, SRC, IQ, HON, ROUTE_DIN, ROUTE_DOUT, F_VAL, OVR.
+10.3 Two-hop evaluator and dictionary O(0)
+Maintain hub bitset hub_bits[W] per context; total hubs H<=64W. For pair (ctx, token): mask := hub_bits(ctx) & hub_bits(token); enumerate first K set bits by de Bruijn method. best := min_h ( qDout[ctx,h] + qDin[h,token] ). If pair is promoted and guard holds, return F_VAL via one store probe; else return Proj_input_from(best).
+10.4 Quantization legs
+qDin and qDout are per-row quantized with scales s_in, s_out; eps_row := 0.5(s_in + s_out) bounds rowwise error.
+10.5 Guard
+Let m be stored margin between best hub h* and runner-up for the promoted pair. Let U,V be per-leg update bounds and C_h competitor bounds computed from overlap-local budgets with finite support. Guard condition:
+(U+V < m/2 + eps_row) AND for all h!=h*: (C_h < m/2 + eps_row)
+If false, dictionary O(0) is disabled for the event; two-hop surrogate is used.
+10.6 Peer scoring and witness quality
+Maintain IQ[src], HON[src] in Q8.8 via constant-size tasks CHAL/RESP (competence) and COM/SETTLE (honesty). Witness quality s := clamp01(min(IQ_witness, HON_witness)).
+10.7 Branchless gating
+Given y_base and r_t and guard bit g in {0,1}, set beta := g*(beta_min + (beta_max − beta_min)s), alpha:=1−beta, y_gate := alphay_base + beta*Proj(r_t). Proj is fixed and stored in the manifest. No learning inside the bridge. If a trust_decision has been computed for the event, beta is further bounded to [beta_min_eff, beta_cap] from Section 6.4.5.
+10.8 Audits and failure
+Diagnostics fields include {o0_hits, o0_guard_fail, hub_cap_K, hub_and_p99, store_load_p99, stash_occ_p99, kick_len_p99, iq_auc, hon_auc, route_proof_digest, trust_decision, trust_m, trust_LLR, trust_Gamma, trust_salts_digest}. Any bound or guard failure forces beta:=0 for the event.
+	11.	Bounded one-step tree search (optional)
+11.1 Node and arrays
+NodeKey64 := type:8 | slot:8 | state_fp:24 | salt:24. Each node stores N,W,Q and per-action arrays of size A_max<=8 in the shared store.
+11.2 Selection and widening
+U_a = c_puct * P[a] * sqrt(N_parent) * inv(1+N_a[a]) using LUTs for sqrt and inverse. S_a = Q_a[a] + U_a. Choose by repeated best-of-two over A_max. Progressive widening: allowed_children = 1 + (N>=2) + (N>=4), capped at A_cap<=4.
+11.3 Rollout and backup
+Rollout length H_roll<=4 using constant-cost actions {Route, Rebind or Flip, Promote, Overlay}. Reward r in [−1,1] is a fixed linear combination of {delta accuracy, dictionary hit, guard_ok, cost} and trust signal {+w_trust1{trust_decision=True} − w_neg1{trust_decision=False}}. Backup along a path of depth H_sel<=4. At most one simulation and one expansion per event. On any bound violation, disable selection for the event.
+	12.	Module ABI and portability
+12.1 ModuleHeader
+abi_version (uint32), module_id in {ATTN_BRIDGE, LINEAR_BRIDGE, MEMORY_BRIDGE, SEARCH_STEP, TRUST_GATE} (uint32), build_gen (uint32), flags (uint32: FMA/FTZ/endianness), cap_K (uint32), budgets (uint32 bitfield for sim/expand/commit/gc), proj_rows (uint32), proj_cols (uint32), proj_digest (uint64), key_salt (uint64).
+12.2 Required functions
+Bridge_Read(ctx, token?)->{r_t, guard_ok, proof64B}
+Gate(base, r_t, guard_ok, iq_min_hon_min)->y_gate
+TrustGate_Judge(v_vec)->{decision, audit64B}
+Search_OneStep(ctx)->void
+12.3 State transport
+Classes fixed/volatile/overlay. Fixed values are write-once and copied across generations; volatile may be dropped; overlays have at most Z entries per key in rotation. Handles are (gen, array_id, index). Salts rotate at publication. Rebuilds are chunked. Trust-gate salts are distinct from bridge salts; manifests record only digests.
+	13.	Determinism, RNG, security
+13.1 RNG
+Counter-based PRNG (e.g., splitmix64) seeded at publication. Draws indexed by (module_id, event, local_counter). No data-dependent reseeding.
+13.2 Salt secrecy
+key_salt rotates per generation; manifests record a digest, not the salt. No raw addresses are exposed. Trust-gate per-salt keys Ks are stored in a hardware-backed keystore or sealed manifest fields and are never exported.
+13.3 Replay
+Fixed reduction order, fixed proposal sets, fixed LUTs, fixed tie-breakers, generation pinning. A fixed log replays bitwise-identical outputs and audit hashes.
+	14.	Diagnostics, windows, thresholds
+14.1 Fields
+Time and tokenizer: {t, tok_bytes_in, tok_emitted, tok_pending_max, tokenizer_probe_max, sp_cert_digest, unicode_policy_version}
+Attention: {PRF_clip_rate, den_min, lambda_star}
+Linear/store: {linear_probe_p100_lookup, linear_probe_p100_insert, ring_occ, stash_occ, emergency_used, store_load_p99, kick_len_p99}
+Memory: {memory_state_absmax, pole_radius_min}
+CCR: {gamma_CCR, m, eps_tail}
+Bridge/search: {o0_hits, o0_guard_fail, hub_cap_K, hub_and_p99, iq_auc, hon_auc, sim_per_event, expand_per_event, path_len, roll_len}
+Trust gate: {tg_decision_hist, tg_m_hist, tg_llr_p50, tg_llr_p95, tg_false_shortcuts, tg_unknown_rate, tg_profile}
+Hashes and FP: {gen_id, prev_hash, curr_hash, fp_contract:{fma,denormals,ext_precision}, compiler_flags_digest}
+14.2 Targets
+Guard pass rate >=0.9; store_load_p99<=0.9; kick_len_p99<=KQ_MAX; hub_and_p99<=K; iq_auc, hon_auc in [0.8,0.95]. tg_false_shortcuts==0; tg_unknown_rate within profile range. Other targets are workload-defined.
+	15.	Manifest content
+fp_contract:{fma_mode, denormals_mode, ext_precision, reductions_digest}
+tokenizer:{L_tok, S_norm, L_norm, P_gen, sp_cert_digest, unicode_policy_version}
+prf:{r, tau, clip_c, whitening_eps}
+denominator:{beta_floor, lambda_star_schedule_digest}
+linear:{C, d, b, S, L_cuckoo, Q, thresholds:{tau_low, tau_high}}
+memory:{mode in {SOS, ARMA}, L or (p,q), T_phi, K, pole_radius_min}
+overlays:{P, k_max, r_v}
+ccr_cert:{gamma_CCR, m, eps_tail, norm_def}
+bridge:{K, W, Proj_shape, Proj_digest, beta_min, beta_max, guard_params:{margin_policy, eps_row_policy}, store_limits:{load_max, stash_max, kick_max}, route_proof_schema_digest}
+trust_gate:{M, k, b_bits, p_prime, B_floor, pi0, H, O, psi, rho, d_trust, salts_digest, profile_id, alpha_unknown, beta_boost}
+search:{A_max, A_cap, H_sel, H_roll, c_puct, epsilon, vloss}
+capacity:{lambda_hat, T_rb_ms, slack, margin}
+salts:{mphf_salt_digest, key_salt_digest}
+	16.	Complexity and fixed budgets
+Tokenizer: <=L_tok probes per normalized byte; pending<=L_tok−1; O(1) amortized retokenization if W_edit>=L_tok
+Attention ingest: O(rd) for PRF features; updates O(rd_v) and O(r); whitening O(r)
+Linear: O(1) probes per nonzero; lookup<=db+S+1; insert<=db+L_cuckoo+S+1+c0
+Bridge: constant L1/L2 probes; two-hop enumerates<=K hubs; guard constant; projection is fixed GEMV of size (proj_rows x proj_cols)
+Trust gate: per event M calls to Pi_s, V_base, V_ax plus one Cons check and constant scalar ops; persistent state O(M) plus constant
+Search: at most one selection and one expansion; H_roll<=4, H_sel<=4
+CCR: O(nu + m) with fixed constants
+	17.	Publication, snapshot, scheduling, audit
+17.1 Publication
+A single pointer swap publishes tokenizer digest, PRF seeds, MPHF and salts, memory coefficients, floor schedule, overlays, heads, bridge constants and Proj digest, trust-gate constants and salts digest, and search constants. Readers pin the generation per event.
+17.2 Snapshot and restore
+Snapshot writes all state enumerated in Sections 1, 10, 11 and trust-gate state plus certificates with sizes and hashes. Restore maps the blob and resumes. Bitwise identity holds modulo declared extended-precision reductions.
+17.3 Capacity scheduling
+Scheduling inequality in Section 4.4 applies to the shared store across namespaces. Logs include lambda_hat, T_rb, slack, load, stash occupancy, kick length. On slack breach, freeze inserts and publish updated capacity or thresholds.
+17.4 Audit
+Each event emits Diagnostics(). Periodic invariant checks enforce: probe_path<=P_MAX, stash<=S_MAX, kick_len<=KQ_MAX, hub_and<=K, guard correctness, unchanged FP contract, trust-gate totality and NEG-dominance.
+	18.	Hot-path pseudocode
+function Tokenize_Encode_Byte(b):
+out=[]
+for nb in N.stream(b):
+push_window(nb)
+for n in L_tok..1:
+id=T_n.lookup(RH_n(window,n))
+if id!=BOT and Dec[id]==window[0:n]:
+out.push(id); slide_window(n); break
+return out
+
+function Bridge_Read(ctx, token?):
+if token?==NONE: return {r_t=ZERO, guard_ok=false, proof64B=ZERO}
+mask = hub_bits(ctx) & hub_bits(token)
+S = enumerate_first_K_setbits(mask)
+best=+INF; h_star=NONE
+for h in S:
+cand = qDout(ctx,h) + qDin(h,token)
+if cand<best: best=cand; h_star=h
+if is_promoted(ctx,token):
+m = stored_margin(ctx,token)
+U,V,Ch = leg_bounds(ctx,h_star,token)
+eps_row = 0.5*(s_in+s_out)
+g = ((U+V) < (m/2 + eps_row))
+for h in S:
+if h!=h_star: g = g AND (Ch[h] < (m/2 + eps_row))
+if g:
+r = dict_read_F_VAL(ctx,token)
+proof = pack64B(h_star,m,U,V,eps_row,ids(ctx,token))
+return {r_t=r, guard_ok=true, proof64B=proof}
+proof = pack64B(h_star,best,U_stub,V_stub,eps_row_stub,ids(ctx,token))
+return {r_t=Proj_input_from(best), guard_ok=false, proof64B=proof}
+
+function TrustGate_Judge(v_vec):
+neg=false; pos_w=[]; m=0
+for s in 1..M:
+u = Pi_s(v_vec)
+rb = V_base(u)
+(ra, w) = V_ax(u)
+if rb==NEG or ra==NEG: neg=true
+if ra==POS and rb!=NEG: pos_w.append(w); m+=1
+if neg: return {decision=False, audit64B=pack_tg(m,NEG)}
+if m<k or not Cons(pos_w): return {decision=Unknown, audit64B=pack_tg(m,CONS_FAIL)}
+BF_pos = q_min_hat / max(eps_pos_hat, 10^(-B_floor))
+LLR = logit(pi0) + m*log(BF_pos)
+Gamma = log((H+O)/(V+O)) - logit(pi0) + psi
+if LLR>=Gamma: return {decision=True, audit64B=pack_tg(m,LLR,Gamma)}
+return {decision=Unknown, audit64B=pack_tg(m,LLR,Gamma)}
+
+function Step(bytes?, x_t?, k_t?, v_t?, q?, v_t_trust?):
+pin_generation()
+while byte_available(): emit_ids(Tokenize_Encode_Byte(next_byte))
+if k_t and v_t:
+phi_k = PRF(k_t)
+R = gammaR + phi_kv_t^T
+s = gammas + phi_k
+update_whitening(phi_k)
+if x_t:
+for id in emit_lift_ids(x_t, DelayBuf) with |.|<=T_phi:
+M[idx(id)] +=_comp contrib(id,x_t,DelayBuf)
+rotate(DelayBuf)
+u_t,aux = memory_step(M,mem_state)
+y_lin = predict_injective(x_t) if x_t else NONE
+if learning: update_injective(x_t,target)
+y_att = NONE
+if q:
+phi_q = PRF(q); phi_w = whiten(phi_q)
+den = dot(phi_w,s) + lambda_star(t)
+num = phi_w^T R
+y_att = apply_overlays(num,den)
+y_fus = fuse(y_att,y_lin,aux,diagnostics)
+v_vec = build_trust_vector_from_fixed_diagnostics() if v_t_trust==NONE else v_t_trust
+(tg_decision, tg_audit) = TrustGate_Judge(v_vec)
+d = (tg_decision==False ? -1 : (tg_decision==True ? 1 : 0))
+beta_min_eff = lerp(beta_min, beta_boost, 1{d>0})
+beta_max_eff = lerp(beta_max, alpha_unknownbeta_max, 1{d==0})
+beta_cap = beta_max_eff * 1{d>=0}
+if d<0: set_rollback_flag()
+ctx = make_ctx(t)
+r, ok, proof = Bridge_Read(ctx, token_id_if_available)
+s_q = clamp01(min(IQ_witness(ctx), HON_witness(ctx)))
+set_gate_caps(beta_min_eff, beta_cap)
+y_gate = Gate(y_fus, r, ok, s_q)
+emit_audit_field(proof)
+emit_audit_field(tg_audit)
+Maybe_Selection_OneStep(ctx)
+y_out = ccr_correct(y_gate,overlaps,m)
+emit_audit()
+return y_out
+
+function Maybe_Selection_OneStep(ctx):
+if budgets.sim==0: return
+node = select_node(ctx)
+if can_expand(node): expand_one(node)
+r = rollout(node,H_roll)
+backup(node,r,H_sel)
+	19.	Proof obligations and invariants
+Tokenizer: unique decode; no backtracking; probe bound<=L_tok; edit locality W_edit>=L_tok
+Attention: denominator >= beta_floor; whitening bounded; Type-B nonnegative; ratio Lipschitz constant 1/beta_floor; PRF error bound uniform in time
+Linear: injective addressing; stable references; ULP-level equality to a reference under the FP contract
+Memory: poles strictly inside unit circle; single-site extended-precision reduction; compensation bounds hold
+Bridge: K-candidate bound; guard from finite-support bounds; O(0) used only when guard holds; on failure beta:=0 for the event
+Trust gate: total on all inputs; NEG dominates (any NEG salt forces False); O(1) call and state budgets; conservative acceptance risk bound P[accept|False] <= P[Bin(M, eps_pos_hat) >= m*] with m* defined in Section 6.4; invariance under computable recodings that preserve Pi_s(v); audit contains m, LLR, Gamma; no raw text
+Search: per-event budgets respected; LUT error documented; disable on bound violations
+Concurrency: single-pointer publication; generation pinning; epoch GC
+Capacity: scheduling inequality enforced; on slack breach freeze inserts and publish new capacity
+
+Appendix A. Counterfactual Replay Module (CFR)
+A.1 Purpose
+O(1) per-event counterfactual vector cf_t reusing core state; optional coupling to the bounded one-step search. No hot-path degradation.
+A.2 Modes
+OFF; CFR-REPLAY (learning disabled, exact linear updates skipped); CFR-MIX (both external inputs and CFR proposals, fusion gated).
+A.3 State additions
+seed_attn, seed_mem, seed_sched (64-bit); LUT_d in R^r with entries in [−eps_phi,+eps_phi]; policy table P_cfr over action set A_cfr (|A_cfr|<=8); gating weights; beta_cfr_max<=beta_max; Proj_cfr and digests.
+A.4 Synthesis
+phi_cfr(q) := whiten(PRF(q) + LUT_d) with LUT_d indexed by seeds and event; u_cfr := memory_step with deterministic sparse excitation e_mem (sparsity T_phi_cfr<=T_phi); anchor from bridge using O(0) when guard_ok or two-hop fallback with bound K.
+A.5 Actions
+A_cfr = {Hold, Route, Rebind, PromoteHint, OverlayHint, DenFloorBump, MemExcite, TokenProposal}. All effects realized by existing APIs; no dynamic allocation.
+A.6 Fusion
+s_wit := clamp01(min(IQ_witness,HON_witness)); beta_cfr := g_cfr*(beta_min + (beta_cfr_max−beta_min)s_wit); y_cfr := Proj_cfr(cf_t); y_mix := (1−beta_cfr)y_fus + beta_cfry_cfr; then CCR.
+A.7 Coupling to one-step search
+Use mixed prior P_mix[a] := clamp01(alpha_pP[a] + (1−alpha_p)*P_cfr[a]) in P-UCT. TokenProposal may merge C_cfr into generator set C_t with a fixed cap and stable tie-breakers.
+A.8 Health checks
+PRF drift bound; memory excitation l1-norm bound and poles<1; guard_ok if O(0) used; search budgets; capacity bounds. On any failure set beta_cfr:=0 for the event.
+A.9 Determinism and complexity
+Seeds are functions of (gen_id, event, module_id). Work per event is constant: one PRF drift add, one Proj_cfr GEMV, one sparse memory excitation, at most one dictionary read or K-candidate two-hop, optional small merge, at most one selection/expansion/rollout/backup.
+
+Appendix B. Default constant ranges (non-normative examples)
+Tokenizer L_tok in [4,16], S_norm<=128, L_norm<=4, P_gen in [64,256], W_edit>=L_tok
+PRF r in [256,1024], tau set by validation, eps in [1e−6,1e−2], beta_floor>0
+Overlays P<=8, k_max<=8, r_v<=16
+Linear d=2, b in {4,8}, S<=4, L_cuckoo<=8, emergency path bounded, capacity margin>=5%
+Memory SOS L<=8 or ARMA p+q<=8, T_phi<=16, K<=8
+Bridge W in {2,3}, H<=128, K<=4, beta_max<=0.5, overlays per key Z<=4
+Trust gate M in {5,7}, k in {3,4}, b_bits>=64, p_prime≈2^61−1, B_floor>=20, rho≈0.995, d_trust in {16,32}, alpha_unknown≈0.5, beta_boost≈0.1
+Search A_max<=8, A_cap<=4, H_sel<=4, H_roll<=4, c_puct in [0.5,1.5], epsilon<=1/16
+
+Appendix C. Constant-size tests
+Determinism: replay fixed event log twice; outputs and audit hashes match bitwise
+Tokenizer: SP proof verified; Greedy==Decode; probe bound<=L_tok; W_edit locality holds
+PRF: scaling and clipping validated under fixed seeds; denominator min tracked
+Linear: probe histograms within bounds; emergency path unused in steady state; ULP-level match to reference
+Memory: convolution equivalence; pole radius <1; accumulator error within prediction
+CCR: overlap energy reduction meets alpha and eps_tail
+Bridge: O(0) hit rate; guard pass rate>=target; hub_and_p99<=K; failure path beta:=0
+Trust gate: T-NEG (single salt NEG forces False and beta=0), T-POS (m=k, Cons=True, LLR>=Gamma yields True and beta_min boosted), T-UNK (m=k, LLR<Gamma yields Unknown and beta_max shrunk), collision-rate empirical bound <= 2x analytic, m*>=k enforced
+Search: counts within {sim<=1, expand<=1}; path_len<=H_sel; roll_len<=H_roll
+Capacity: slack>=margin at rebuild; otherwise freeze and republish updated capacity or thresholds
+
+End of Sera v2.3 specification.
