@@ -635,3 +635,678 @@ This specification is intended to be:
 	•	Narrow in scope (assignment and capacities only).
 	•	Modular (separating indexing, planning, and serving).
 	•	Sufficiently precise to implement a working system and extend it in later versions.
+
+
+Title
+TCM-Core API
+Version v0.0.1
+
+Status
+Draft, implementation-oriented, stable surface for TCM-Core v0.0.1
+
+Language
+ASCII, English only
+	0.	Scope and goals
+
+0.1 Scope
+
+This document defines the HTTP API for TCM-Core v0.0.1.
+
+The API exposes the following capabilities:
+	1.	Managing documents (targets of assignment).
+	2.	Managing patterns (assignable items).
+	3.	Managing and inspecting plan snapshots (offline planner output).
+	4.	Serving online decisions (SERVE0).
+	5.	Recording feedback events.
+	6.	Querying basic decision logs.
+
+The API is intentionally narrow and mirrors the core TCM-Core concepts: documents, patterns, time slots, plan snapshots, and serve requests.
+
+0.2 Non-goals
+
+The v0.0.1 API does not:
+	1.	Define authentication or billing. These are deployment-specific.
+	2.	Provide UI, dashboards, or workflow orchestration.
+	3.	Provide full-text search or analytics APIs over logs.
+	4.	Define multi-tenant management endpoints. Tenanting is an internal concern.
+	5.	Specify any particular machine learning models or their management lifecycle.
+	6.	General conventions
+
+1.1 Base URL and versioning
+
+All endpoints in v0.0.1 are rooted at a common prefix:
+
+/tcm/v0/…
+
+The leading slash is mandatory. The “tcm” and “v0” segments are reserved.
+
+Future versions MUST use different version segments (for example /tcm/v1) and MUST NOT change the behavior of /tcm/v0 endpoints in a backward-incompatible way.
+
+1.2 Transport
+
+The API is expected to run over HTTPS. HTTP semantics are as follows:
+	1.	All write operations use HTTP POST.
+	2.	Read-only operations use HTTP GET.
+	3.	The server SHOULD respond with appropriate HTTP status codes:
+	•	2xx for success
+	•	4xx for client errors
+	•	5xx for server errors
+
+1.3 Content type and encoding
+
+Requests with bodies MUST set:
+
+Content-Type: application/json
+
+Responses with JSON bodies MUST set:
+
+Content-Type: application/json
+
+All JSON is encoded as UTF-8. Field names and documented literal values MUST be restricted to ASCII characters.
+
+1.4 Resource identifiers
+
+The following identifiers are used throughout the API:
+	1.	doc_id: string; unique per document within a tenant.
+	2.	pattern_id: string; unique per pattern within a tenant.
+	3.	plan_snapshot_id: string; unique per plan snapshot.
+	4.	request_id: string; unique per serve request.
+
+The server MUST treat doc_id and pattern_id as opaque strings, except for uniqueness and equality. Clients MAY use any ASCII-safe convention for their own IDs.
+
+1.5 Time representation
+
+All timestamps MUST be RFC 3339 strings in UTC, for example:
+
+“2025-11-27T01:23:45Z”
+
+Time slot keys in per-slot capacity maps MUST use the same format.
+
+1.6 Error model
+
+On error, the server MUST return a non-2xx HTTP status code and a JSON body of the form:
+
+{
+“error”: {
+“code”: “string-machine-code”,
+“message”: “Human readable message”,
+“details”: { … optional arbitrary JSON … }
+}
+}
+
+Examples of error codes:
+
+“invalid_argument”
+“not_found”
+“conflict”
+“plan_unavailable”
+“internal”
+
+The “message” field MUST be suitable for logs and debugging, not for end users. The “details” object MAY contain structured information such as field errors.
+	2.	Endpoint overview
+
+The v0.0.1 API defines the following endpoints:
+
+Documents
+POST /tcm/v0/documents:upsert
+POST /tcm/v0/documents:delete
+
+Patterns
+POST /tcm/v0/patterns:upsert
+POST /tcm/v0/patterns:delete
+
+Plans
+GET  /tcm/v0/plans
+GET  /tcm/v0/plans/{plan_snapshot_id}
+POST /tcm/v0/plans:run    (optional, see 4.3)
+
+Serve (online decisions)
+POST /tcm/v0/serve
+
+Feedback
+POST /tcm/v0/feedback
+
+Decision logs
+GET  /tcm/v0/decisions
+
+Implementations MAY add additional endpoints under different paths. They MUST NOT repurpose or change the semantics of the endpoints defined here.
+	3.	Documents API
+
+Documents represent targets of assignment (for example users, pages, items, events). They correspond to DocumentConfig_j in the core spec.
+
+3.1 POST /tcm/v0/documents:upsert
+
+Purpose:
+
+Create or update a document configuration.
+
+Request body:
+
+{
+“doc_id”: “string, required”,
+“text”: “string, required”,
+“embedding”: [float, …],               // optional
+“capacity”: {                            // optional
+“total”: 123,                          // C_total, optional
+“per_slot”: {                          // C_slot[s], optional
+“2025-11-27T00:00:00Z”: 10,
+“2025-11-27T01:00:00Z”: 5
+}
+},
+“attributes”: {                          // optional
+“key1”: “value or array”,
+“country”: “JP”,
+“segments”: [“high_value”, “beta”]
+}
+}
+
+Field semantics:
+
+doc_id
+Required. Identifier of the document. Unique per tenant. Idempotent key for upsert.
+
+text
+Required. Text representation used by IndexCore for candidate generation.
+
+embedding
+Optional. Fixed-length numeric vector used by ANN index if available.
+
+capacity.total
+Optional. Non-negative integer. Total number of assignments allowed for this document across the planning horizon. If omitted, treated as “unbounded” in v0.0.1.
+
+capacity.per_slot
+Optional. Mapping from slot timestamps to non-negative integers. Each key is a time slot string. If present, these are treated as C_j[s]. Missing slots are treated as zero or derived from total, depending on implementation.
+
+attributes
+Optional. Opaque key-value map used for filtering and scoring. Values MAY be strings, numbers, booleans, or arrays of these.
+
+Response:
+
+On success:
+
+HTTP 200 OK
+
+{
+“doc_id”: “same as request”
+}
+
+The operation MUST be idempotent: sending the same doc_id with the same body MUST yield the same logical state.
+
+3.2 POST /tcm/v0/documents:delete
+
+Purpose:
+
+Delete a document configuration.
+
+Request body:
+
+{
+“doc_id”: “string, required”
+}
+
+Behavior:
+	1.	If the document exists, it MUST be marked as deleted and excluded from future candidate generation and serving.
+	2.	If the document does not exist, the server MAY treat this as success or MAY return not_found. It SHOULD prefer idempotent success.
+
+Response:
+
+On success:
+
+HTTP 200 OK
+
+{
+“doc_id”: “same as request”
+}
+	4.	Patterns API
+
+Patterns represent assignable items (for example campaigns, notifications, rules). They correspond to PatternConfig_i in the core spec.
+
+4.1 POST /tcm/v0/patterns:upsert
+
+Purpose:
+
+Create or update a pattern configuration.
+
+Request body:
+
+{
+“pattern_id”: “string, required”,
+“text”: “string, required”,
+“embedding”: [float, …],               // optional
+“budget”: {                              // required at least one of total or per_slot
+“total”: 100000,                       // c_total, optional
+“per_slot”: {                          // c_slot[s], optional
+“2025-11-27T00:00:00Z”: 10000,
+“2025-11-27T01:00:00Z”: 5000
+}
+},
+“constraints”: {                         // optional, implementation-defined
+“per_doc_max”: 10
+},
+“attributes”: {                          // optional
+“country_allow”: [“JP”, “US”],
+“type”: “notify”
+},
+“priority”: 10.0                         // optional
+}
+
+Field semantics:
+
+pattern_id
+Required. Identifier of the pattern. Unique per tenant. Idempotent key for upsert.
+
+text
+Required. Text description used by IndexCore for candidate generation.
+
+embedding
+Optional. Fixed-length numeric vector used by ANN index if available.
+
+budget.total
+Optional. Non-negative integer. Total assignments allowed for this pattern across the planning horizon (c_i_total). If omitted and per_slot is provided, total MAY be derived as the sum of per_slot.
+
+budget.per_slot
+Optional. Mapping from slot timestamps to non-negative integers c_i[s]. If omitted, PLAN0 MAY derive per-slot capacities from budget.total and traffic distribution.
+
+constraints
+Optional. Opaque key-value map describing additional constraints. v0.0.1 does not inspect these fields, but implementations MAY interpret well-known keys.
+
+attributes
+Optional. Opaque key-value map used for filtering and scoring.
+
+priority
+Optional. Numeric priority hint. Higher values indicate more important patterns. v0.0.1 MAY ignore this field or use it to influence alpha_i in planning.
+
+Response:
+
+On success:
+
+HTTP 200 OK
+
+{
+“pattern_id”: “same as request”
+}
+
+The operation MUST be idempotent.
+
+4.2 POST /tcm/v0/patterns:delete
+
+Purpose:
+
+Delete a pattern configuration.
+
+Request body:
+
+{
+“pattern_id”: “string, required”
+}
+
+Behavior:
+	1.	If the pattern exists, it MUST be marked as deleted and excluded from future candidate generation and serving.
+	2.	If the pattern does not exist, the server MAY treat this as success or MAY return not_found. It SHOULD prefer idempotent success.
+
+Response:
+
+On success:
+
+HTTP 200 OK
+
+{
+“pattern_id”: “same as request”
+}
+	5.	Plans API
+
+Plans represent outputs of the offline planner PLAN0: per-pattern weights and per-slot capacities.
+
+5.1 GET /tcm/v0/plans
+
+Purpose:
+
+List available plan snapshots.
+
+Query parameters:
+
+none in v0.0.1
+
+Response:
+
+HTTP 200 OK
+
+{
+“plans”: [
+{
+“plan_snapshot_id”: “string”,
+“horizon_start”: “timestamp”,
+“horizon_end”: “timestamp”
+},
+…
+]
+}
+
+Semantics:
+	1.	The list MUST include at least the currently active plan snapshot, if any.
+	2.	The list MAY be truncated; the server MAY expose only a recent subset.
+
+5.2 GET /tcm/v0/plans/{plan_snapshot_id}
+
+Purpose:
+
+Retrieve details of a specific plan snapshot.
+
+Path parameter:
+
+plan_snapshot_id
+Required. Identifier of a plan snapshot as returned by /plans.
+
+Response on success:
+
+HTTP 200 OK
+
+{
+“plan_snapshot_id”: “string”,
+“horizon_start”: “timestamp”,
+“horizon_end”: “timestamp”,
+“slots”: [“timestamp_slot_0”, “timestamp_slot_1”, …],
+“alpha”: {
+“pattern_id_1”: 1.0,
+“pattern_id_2”: 0.8
+},
+“c_slot”: {
+“pattern_id_1”: {
+“timestamp_slot_0”: 100,
+“timestamp_slot_1”: 50
+},
+“pattern_id_2”: {
+“timestamp_slot_0”: 200
+}
+},
+“metadata”: {
+“planner_version”: “string”,
+“notes”: “optional”
+}
+}
+
+Field semantics:
+
+slots
+Ordered list of slot identifiers used by this plan. Each element is a timestamp string representing the start of a slot.
+
+alpha
+Map from pattern_id to non-negative float weight alpha_i. Used by SERVE0 in scoring.
+
+c_slot
+Map from pattern_id to per-slot capacity maps c_i[s]. Values are non-negative integers.
+
+metadata
+Optional map with planner-specific information.
+
+If the plan_snapshot_id is unknown, the server MUST return 404 Not Found with an error body.
+
+5.3 POST /tcm/v0/plans:run
+
+Purpose:
+
+Request that the server run PLAN0 and create a new plan snapshot. This endpoint is optional in v0.0.1 and MAY be disabled in managed deployments.
+
+Request body:
+
+{
+“horizon_start”: “timestamp, optional”,
+“horizon_end”: “timestamp, optional”,
+“slot_granularity”: “string, optional”
+}
+
+If fields are omitted, the server uses implementation-defined defaults.
+
+Response on success:
+
+HTTP 202 Accepted or 200 OK
+
+{
+“plan_snapshot_id”: “string”
+}
+
+Semantics:
+	1.	The server MAY run PLAN0 synchronously or asynchronously.
+	2.	If PLAN0 is asynchronous, the plan_snapshot_id refers to a plan that will appear in /plans once ready.
+	3.	The client SHOULD handle the possibility that the returned plan is not immediately usable.
+	4.	Serve API
+
+The serve endpoint exposes SERVE0: online decision making for individual requests.
+
+6.1 POST /tcm/v0/serve
+
+Purpose:
+
+Given a document (or context) and a time, select up to L patterns to assign.
+
+Request body:
+
+{
+“request_id”: “string, required”,
+“doc”: {
+“doc_id”: “string, optional”,
+“context_text”: “string, optional”,
+“attributes”: {
+“key”: “value or array”
+}
+},
+“timestamp”: “timestamp, required”,
+“limit”: 3,
+“filters”: {
+“allow_patterns”: [“pattern_id or prefix”, “…”],
+“deny_patterns”: [“pattern_id or prefix”, “…”]
+},
+“plan_snapshot_id”: “string, optional”,
+“debug”: false
+}
+
+Field semantics:
+
+request_id
+Required. Unique identifier for this serve request. Used to correlate decisions and feedback.
+
+doc
+Required object. Either:
+- References an existing document via doc_id, optionally with additional context_text and attributes.
+- Or, omits doc_id and provides context_text and attributes only, for transient contexts.
+
+If doc_id is provided, the server SHOULD look up the corresponding DocumentConfig. Attributes in the request MAY override or augment stored attributes.
+
+timestamp
+Required. Current time of the request. Used to map to a slot index s.
+
+limit
+Required. Maximum number of patterns to return. Must be a positive integer. The server MAY enforce an upper bound.
+
+filters.allow_patterns
+Optional. List of pattern_ids or implementation-defined prefixes that are allowed. If non-empty, only matching patterns are considered.
+
+filters.deny_patterns
+Optional. List of pattern_ids or prefixes that are disallowed. Matching patterns MUST NOT be returned.
+
+plan_snapshot_id
+Optional. If present, the server MUST attempt to use this plan snapshot for alpha and capacity. If absent, the server MUST use the currently active plan.
+
+debug
+Optional boolean. If true, the server MAY include additional debug information in the response. v0.0.1 does not standardize debug fields.
+
+Response on success:
+
+HTTP 200 OK
+
+{
+“request_id”: “same as request”,
+“plan_snapshot_id”: “string in use”,
+“slot”: “timestamp slot key”,
+“decisions”: [
+{
+“pattern_id”: “pattern:1”,
+“score”: 0.823
+},
+{
+“pattern_id”: “pattern:2”,
+“score”: 0.801
+}
+]
+}
+
+Field semantics:
+
+plan_snapshot_id
+The identifier of the plan snapshot actually used for this decision.
+
+slot
+The slot key derived from timestamp (for example the slot start time).
+
+decisions
+Ordered list of selected patterns, most preferred first. The length is less than or equal to limit. If no suitable patterns exist, the list MAY be empty.
+
+The server MUST:
+	1.	Enforce pattern and document capacities according to the active plan and runtime state.
+	2.	Exclude patterns that violate static constraints or filters.
+	3.	Use a deterministic tie-breaking rule where possible (for example pattern_id order) to improve reproducibility.
+	4.	Feedback API
+
+Feedback events allow the system to record outcomes (impressions, clicks, conversions, custom events) for decisions. They correspond to the feedback records in the core spec.
+
+7.1 POST /tcm/v0/feedback
+
+Purpose:
+
+Record an event for a specific (request_id, doc_id, pattern_id) combination.
+
+Request body:
+
+{
+“request_id”: “string, required”,
+“doc_id”: “string, required”,
+“pattern_id”: “string, required”,
+“event”: “string, required”,
+“value”: 1.0,
+“timestamp”: “timestamp, required”,
+“metadata”: {
+“key”: “value”
+}
+}
+
+Field semantics:
+
+event
+Required. Event type. Typical values include:
+“impression”
+“click”
+“convert”
+“dismiss”
+“custom:”
+
+v0.0.1 does not interpret event types. They are stored and may be used by future planner runs or external models.
+
+value
+Optional numeric value associated with the event (for example revenue, weight). Defaults to 1.0 if omitted.
+
+metadata
+Optional key-value object for additional fields (for example experiment labels, device info).
+
+Response on success:
+
+HTTP 200 OK
+
+{
+“status”: “ok”
+}
+
+The server MUST treat feedback events as append-only. It MUST NOT attempt to deduplicate events by default.
+	8.	Decision logs API
+
+The decisions endpoint provides a minimal way to retrieve historical decisions for debugging and analysis.
+
+8.1 GET /tcm/v0/decisions
+
+Purpose:
+
+List past decisions matching simple filters.
+
+Query parameters:
+
+from
+Optional. Start timestamp (inclusive) as RFC 3339 string.
+
+to
+Optional. End timestamp (exclusive) as RFC 3339 string.
+
+doc_id
+Optional. Filter by document identifier.
+
+pattern_id
+Optional. Filter by containing pattern identifier.
+
+request_id
+Optional. Filter by request identifier.
+
+limit
+Optional. Maximum number of items to return. Positive integer. The server MAY enforce an upper bound.
+
+cursor
+Optional. Opaque pagination cursor returned by a previous call.
+
+Response on success:
+
+HTTP 200 OK
+
+{
+“items”: [
+{
+“request_id”: “string”,
+“timestamp”: “timestamp”,
+“doc_id”: “string”,
+“pattern_ids”: [“pattern:1”, “pattern:2”],
+“plan_snapshot_id”: “string”,
+“slot”: “timestamp slot key”
+}
+],
+“next_cursor”: “string or null”
+}
+
+Semantics:
+	1.	The server MAY return fewer than limit items even if more are available.
+	2.	If next_cursor is non-null, the client MAY pass it to a subsequent request to retrieve more items.
+	3.	The set of fields returned for each item is fixed in v0.0.1 as shown above.
+	4.	Compatibility and evolution
+
+9.1 Backward compatibility
+
+The server MUST preserve the following guarantees for v0.0.1:
+	1.	Existing endpoints and HTTP methods remain available.
+	2.	Existing required request fields remain required and keep their meaning.
+	3.	Existing response fields remain present with compatible types.
+
+The server MAY add:
+	1.	New optional request fields.
+	2.	New optional response fields.
+	3.	New endpoints under the /tcm/v0 prefix.
+
+Clients SHOULD:
+	1.	Ignore unknown fields in responses.
+	2.	Not rely on the absence of optional fields.
+
+9.2 Relation to core TCM-Core v0.0.1 spec
+
+The API v0.0.1 is a direct mapping of TCM-Core v0.0.1 concepts:
+	1.	DocumentConfig_j is exposed via /documents:upsert and /documents:delete.
+	2.	PatternConfig_i is exposed via /patterns:upsert and /patterns:delete.
+	3.	PlanSnapshot is exposed via /plans and /plans/{id}.
+	4.	SERVE0 behavior is exposed via /serve.
+	5.	Feedback records are exposed via /feedback.
+	6.	Decision records are exposed via /decisions.
+
+The API does not specify internal data structures, indexing strategies, or planning algorithms. These are defined in the core TCM-Core specification and are implementation details from the API perspective.
+
+9.3 Authentication placeholder
+
+v0.0.1 does not specify authentication. In practical deployments, it is RECOMMENDED to:
+	1.	Require an API key or bearer token via HTTP headers.
+	2.	Scope identifiers and operations to a tenant associated with the credentials.
+	3.	Log all modification operations for audit.
+
+These concerns are intentionally left out of this versioned API surface.
+
