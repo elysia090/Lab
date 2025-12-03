@@ -1,616 +1,713 @@
-BEM Benchmark Suite v0.0.1 – Tightened Specification (Draft)
-	0.	Scope and Objectives
+BEM v0.0.1 – Boolean Expert Machine
+Core + ISA Specification (ASCII only, tightened)
 
-0.1 Purpose
+Status
+Experimental, implementation-oriented, hardware-oriented model
 
-This document defines BEM Benchmark Suite v0.0.1 as a set of task classes, metrics, and protocols for evaluating implementations of the Boolean Expert Machine (BEM) v0.0.1.
+Language
+English, ASCII only
+	0.	Overview
 
-The suite is designed to measure:
-	1.	Fast-path performance:
-1.1 Per-step and per-token cost.
-1.2 Scaling with N, K, W, number of experts, and ROUTE parameters.
-	2.	Algorithmic capability:
-2.1 Exact and approximate performance on structured sequence tasks.
-2.2 Generalization to longer sequences and higher difficulty.
-	3.	Language-model-style behavior:
-3.1 Bits-per-character (BPC) or token-level perplexity on small corpora.
-	4.	Learning and structural update behavior:
-4.1 Regret and adaptation in bandit-like settings.
-4.2 Verification-gated structural changes cost and rate.
+0.1 Scope
+
+This document defines BEM v0.0.1 as
+	1.	A finite-state abstract machine with bit-sliced global state and shared memory.
+	2.	A small RISC-like integer core ISA extended with BEM-specific instructions.
+	3.	A fixed set of co-processors (ANN, SAT/Hoare, HASH/ECC, LOG, optional WORLD).
+	4.	A fast path with strictly bounded per-step cost (independent of sequence length and history).
+	5.	A slow path for self-modification, gated by formal verification and optional PoX scoring.
+
+The goal is to provide a concrete target for implementations that:
+	•	Execute Boolean experts over bit-sliced state.
+	•	Route between experts using bandit-style learning and ANN-based candidate retrieval.
+	•	Evolve their own structure (experts, macros, invariants) under verification.
+	•	Maintain auditable logs and integrity proofs.
 
 0.2 Non-goals
 
-The benchmark suite does not:
-	1.	Fix specific datasets or corpora; it defines task families and parameter ranges.
-	2.	Impose absolute pass/fail thresholds.
-	3.	Constrain implementation internals beyond:
-3.1 Adhering to BEM v0.0.1 semantics.
-3.2 Respecting fast-path bounded cost.
-
-0.3 Structure
-
-The benchmark suite is partitioned into:
-	1.	Global assumptions and notation.
-	2.	Microbenchmarks for hardware primitives and co-processors.
-	3.	Algorithmic sequence tasks.
-	4.	Language-model-like tasks.
-	5.	Learning and structural update tasks.
-	6.	Reporting and scoring.
-	7.	Global Assumptions and Notation
-
-1.1 Hardware and configuration
-
-Unless stated otherwise, each benchmark assumes:
-	1.	Single active general-purpose core (BEM-CORE).
-	2.	Optional co-processors:
-2.1 BIT-ALU.
-2.2 ROUTE unit.
-2.3 SAT/Hoare unit.
-2.4 HASH/ECC unit.
-2.5 LOG unit.
-
-Implementations MUST report:
-	1.	CPU model, microarchitecture, and clock frequency (approximate).
-	2.	SIMD width W_hw (e.g., 128, 256, 512 bits).
-	3.	Effective BEM lane width W (which may be ≤ W_hw or equal).
-
-1.2 BEM parameters
-
-For each benchmark configuration, implementations MUST specify:
-	1.	N: state bit count.
-	2.	K: shared memory bit count.
-	3.	W: number of lanes.
-	4.	Maximum number of experts N_expert_max.
-	5.	Expert circuit size bound G_max.
-	6.	ROUTE parameters H, B, C_entry, K_cand.
-	7.	SAT/Hoare bounds n_max, m_max.
-	8.	Parameters for learning:
-8.1 Learning rate schedule eta_t.
-8.2 B_flip (local edit budget).
-
-1.3 Units and metrics
-
-Time and compute are measured as:
-	1.	cycles: CPU core cycles (estimated or measured).
-	2.	ops/sec: operations per second.
-	3.	tokens/sec or chars/sec: throughput at the token/character level.
-	4.	regret, accuracy, BPC: task-dependent performance metrics.
-
-Where possible, cycles SHOULD be measured using hardware performance counters. If unavailable, approximate cycle counts via instruction counts and clock frequency MAY be reported, clearly labeled as estimated.
-	2.	Microbenchmarks
-
-2.1 BIT-ALU throughput
-
-2.1.1 Purpose
-
-Measure raw throughput and latency of BIT-ALU bit-sliced operations for W lanes.
-
-2.1.2 Setup
-
-Parameters:
-	1.	W: lane width (fixed for the BEM instance).
-	2.	L_loop: number of iterations, L_loop ≥ 10^7.
-	3.	op_set: list of operations to benchmark:
-3.1 AND, OR, XOR, NOT.
-3.2 shift_left, shift_right (by constant).
-3.3 rotate_left, rotate_right (by constant).
-3.4 vector_popcount.
-
-Procedure:
-	1.	For each operation op ∈ op_set:
-1.1 Allocate one or more W-bit words as inputs in STATE or registers.
-1.2 Initialize with pseudorandom data.
-1.3 Execute op in a tight loop of L_loop iterations.
-1.4 Ensure compiler does not optimize away op:
-1.4.1 Accumulate a checksum in a scalar register.
-1.4.2 Store checksum to SHARED at the end.
-
-2.2.3 Metrics
-
-For each op:
-	1.	cycles_per_op = total_cycles / L_loop.
-	2.	ops_per_sec = (clock_frequency * 1.0) / cycles_per_op.
-	3.	bits_per_sec = ops_per_sec * W.
-
-Implementations MUST provide:
-	1.	cycles_per_op and bits_per_sec.
-	2.	Description of how cycles were measured or estimated.
-
-2.2 ROUTE query performance
-
-2.2.1 Purpose
-
-Measure performance and quality of ROUTE_QUERY as a function of index size and parameters (H, B, C_entry, K_cand).
-
-2.2.2 Setup
-
-Parameters:
-	1.	N_nodes_set = {10^4, 10^5, 10^6} total expert-like entries.
-	2.	K_cand (as configured).
-	3.	H, B, C_entry (routing configuration).
-	4.	Q: query count, Q ≥ 10^5 per N_nodes.
-
-Index construction:
-	1.	Sample N_nodes identifiers u uniformly in U or from a structured distribution.
-	2.	Assign them to ROUTE tables based on class and shard as per BEM configuration.
-	3.	Populate buckets using hash functions h_k.
-
-Queries:
-	1.	For each query index 1..Q:
-1.1 Sample q uniformly from identifiers used to build the index, or from a mixture of in-index and out-of-index IDs.
-1.2 Issue ROUTE_QUERY(q, class_expert, shard_filter, K_cand).
-1.3 Capture returned candidate set C_t.
-
-Optional ground truth:
-	1.	For a subset Q_truth of queries (Q_truth ≈ 10^3), precompute the exact nearest neighbors under sim(u, v) in the full set to allow recall measurements.
-
-2.2.3 Metrics
-
-For each N_nodes:
-	1.	cycles_per_query = total_cycles / Q.
-	2.	queries_per_sec.
-	3.	Optional recall@k:
-3.1 For k ≤ K_cand, recall@k = fraction of queries where the true nearest neighbor appears in C_t.
-
-Implementations MUST report:
-	1.	H, B, C_entry, K_cand.
-	2.	Approximate distribution of bucket occupancies (min, max, mean).
-	3.	cycles_per_query, queries_per_sec.
-	4.	If ground truth used, recall@k for chosen k.
-
-2.3 Expert evaluation cost
-
-2.3.1 Purpose
-
-Measure cost of BEM_EXPERT_BATCH for synthetic experts of controlled size and the scaling with gate count and W.
-
-2.3.2 Setup
-
-Parameters:
-	1.	G_set = {64, 128, 256, 512} synthetic circuit sizes (or implementation’s feasible subset).
-	2.	W: lane width.
-	3.	L_loop ≥ 10^6 invocations per G.
-
-Expert construction:
-	1.	For each G ∈ G_set:
-1.1 Construct an expert descriptor e_G with:
-1.1.1 Fixed n_i and m_i (e.g. n_i = 32, m_i = 8).
-1.1.2 C_rep of size approximately G gates (ANF or LUT-tree).
-1.1.3 Simple R_spec selecting bits from STATE and SHARED.
-1.1.4 W_spec writing to STATE or SHARED.
-1.2 Ensure circuits are non-trivial (not constant or identities).
-
-Benchmark:
-	1.	Initialize STATE for all W lanes with random bits.
-	2.	For each G:
-2.1 Execute BEM_EXPERT_BATCH with the expert e_G repeatedly in a loop of L_loop iterations.
-2.2 Randomize input bits per iteration (e.g. flip a small subset of STATE bits).
-2.3 Prevent dead-code elimination by accumulating simple checksums and writing them to SHARED.
-
-2.3.3 Metrics
-
-For each G:
-	1.	cycles_per_batch = total_cycles / L_loop.
-	2.	cycles_per_lane = cycles_per_batch / W.
-	3.	batches_per_sec = (clock_frequency * 1.0) / cycles_per_batch.
-
-Implementations MUST specify:
-	1.	Expert form (ANF, ROBDD, LUT-tree).
-	2.	n_i, m_i, and measure of gate count or LUT size.
-	3.	Any vectorization details relevant to implementation.
-
-2.4 SAT/Hoare kernel cost
-
-2.4.1 Purpose
-
-Measure the cost of SAT_CHECK and PROOF_CHECK for bounded CNF sizes.
-
-2.4.2 Setup
-
-Parameters:
-	1.	n_set = {32, 64, 128}.
-	2.	For each n, m_set = {4n, 8n}.
-	3.	L_inst = 10^4 instances per (n, m) pair.
-
-CNF generation:
-	1.	For each (n, m):
-1.1 Generate random CNFs with n variables and m clauses.
-1.2 Choose clause lengths in a small range (e.g. 3 to 5 literals).
-1.3 Ensure mixture of SAT and UNSAT instances.
-	2.	Optionally precompute proof objects for UNSAT instances.
-
-Benchmark:
-	1.	For each (n, m):
-1.1 Run SAT_CHECK on L_inst CNFs.
-1.2 If proof objects present, run PROOF_CHECK for them.
-
-2.4.3 Metrics
-
-For each (n, m):
-	1.	cycles_per_SAT_CHECK = total_cycles_sat / count_sat.
-	2.	cycles_per_PROOF_CHECK (if applicable).
-	3.	instances_per_sec for SAT_CHECK and PROOF_CHECK.
-	4.	Fraction SAT vs UNSAT.
-
-Implementations MUST describe CNF generation method to ensure comparability.
-	3.	Algorithmic Sequence Benchmarks
-
-3.1 Parity and majority
-
-3.1.1 Purpose
-
-Evaluate BEM’s ability to compute global sequence properties (parity and majority) with O(1)-per-step cost and generalization across sequence lengths.
-
-3.1.2 Task definition
-
-Input:
-	1.	Binary sequence x ∈ {0,1}^T.
-
-Tasks:
-	1.	Parity:
-y = XOR_{t=1..T} x_t.
-	2.	Majority:
-y = 1 if sum_{t=1..T} x_t ≥ T/2, else 0.
-
-BEM interaction:
-	1.	Sequence is presented token-by-token.
-	2.	At final step T, BEM outputs prediction y_hat ∈ {0,1} (or probability p(y=1)).
-	3.	Loss is 0/1 accuracy or cross-entropy.
-
-3.1.3 Protocol
-
-Training:
-	1.	Choose T_train_range (e.g. T in {16, 32, 64}).
-	2.	Train BEM with learning enabled on sequences with T sampled from T_train_range.
-
-Testing:
-	1.	Test lengths T in {T_train/2, T_train, 2T_train, 4T_train}.
-	2.	For each T:
-2.1 Sample test sequences of size at least 10^4.
-2.2 Run BEM in evaluation mode (no learning or structural updates).
-
-3.1.4 Metrics
-
-For each T:
-	1.	accuracy(T) = fraction of correct outputs.
-	2.	cycles_per_token(T) = average cycles per token.
-	3.	cycles_per_sequence(T) = T * cycles_per_token(T).
-
-Implementations MUST report:
-	1.	Whether parity and majority share experts, or use separate specialized experts.
-	2.	Any explicit state-encoding choices (e.g. dedicated bits for running parity).
-
-3.2 Balanced parentheses (Dyck-1)
-
-3.2.1 Purpose
-
-Test BEM’s ability to emulate stack-like behavior and detect well-formedness under length and depth generalization.
-
-3.2.2 Task definition
-
-Alphabet:
-
-Sigma = { “(”, “)” }.
-
-A sequence s ∈ Sigma^T is:
-	1.	Valid if it corresponds to a Dyck-1 well-formed parentheses string (never negative depth, final depth zero).
-	2.	Invalid otherwise (e.g. extra closing, missing closing, mismatched patterns).
-
-Two variants:
-	1.	Online validity:
-At each prefix t, predict whether prefix s[1..t] is still potentially valid (valid so far).
-	2.	Final validity:
-At final step T, predict whether entire s is valid.
-
-3.2.3 Protocol
-
-Training:
-	1.	Choose T_train, D_train.
-	2.	Generate sequences with length ≤ T_train and nesting depth ≤ D_train.
-	3.	Include mixture of valid and invalid sequences.
-	4.	Train BEM on online or final variant (or both).
-
-Testing:
-	1.	T_test in {T_train, 2T_train, 4T_train}.
-	2.	D_test in {D_train, 2D_train} where feasible.
-	3.	For each (T_test, D_test):
-3.1 Sample sequences with controlled length and depth.
-3.2 Evaluate BEM’s predictions.
-
-3.2.4 Metrics
-
-Per (T, D):
-	1.	accuracy_online(T, D) if online variant is used.
-	2.	accuracy_final(T, D).
-	3.	error_vs_depth(T, d) for depth bucket d.
-	4.	cycles_per_token(T, D).
-
-3.3 Key-value retrieval
-
-3.3.1 Purpose
-
-Evaluate BEM’s ability to store and retrieve associations over a context with distractors, similar to key-value attention behavior.
-
-3.3.2 Task definition
-
-Format:
-
-[START] k1 v1 k2 v2 … kK vK [SEP] q [END]
+BEM v0.0.1 does not define:
+	•	Concrete binary encodings of instructions.
+	•	Micro-architectural details (pipelines, cache hierarchies, TLBs).
+	•	Performance, area, or power targets.
+	•	Any host ABI, calling convention, or OS integration.
+	•	Any floating-point or neural primitives on the fast path.
+
+Floating-point or neural components may exist as untrusted proposal generators (for example for candidate experts, invariants, or patches). Their outputs must be validated by the verification kernel before they can change the trusted fast path or structural state.
+
+0.3 Parameters and symbols
+
+Global configuration parameters:
+	•	XLEN: integer register width in bits (for example 32 or 64).
+	•	W: SIMD width (number of logical lanes for bit-slicing).
+	•	N: number of global state bits.
+	•	K: number of shared memory bits (K >= N).
+	•	P: number of fixed-point parameters.
+	•	S: maximum number of expert slots (EXPERT[0..S-1]).
+	•	d: feature-bit dimension for routing (for example 64..256).
+	•	k_large: size of ANN candidate set (for example 16..64).
+	•	k_small: size of final routing candidate set (for example 1..4).
+	•	D_max: maximum ANN search depth.
+	•	M_max: maximum ANN neighbor degree.
+
+Notation:
+	•	Bits are elements of {0,1}.
+	•	Bitvectors of length n are elements of {0,1}^n.
+	•	Integers are elements of Z, represented as fixed-width XLEN-bit words when stored in registers.
+	•	Per-step complexity refers to core cycles and co-processor invocations associated with one logical step (event or token). It must be bounded by a constant that does not depend on episode length or total number of past steps.
+
+	1.	Machine state and segments
+
+1.1 Logical state
+
+At logical time t the BEM state is
+
+X_t = (s_t, M_t, Theta_t, C_t)
+
+where
+	•	s_t in {0,1}^N: global state bits (bit-sliced over W lanes).
+	•	M_t in {0,1}^K: shared memory bits (scalar).
+	•	Theta_t in Z^P: fixed-point parameters (for example bandit hyperparameters, PoX weights).
+	•	C_t: configuration (EXPERT table, CFG/CODE, ANN index, invariants, WORK configuration).
+
+Fast path:
+	•	May read and write s_t and M_t.
+	•	May read Theta_t and structural tables in C_t.
+	•	Must not modify structural tables.
+
+Slow path:
+	•	May modify Theta_t and C_t via patches that have passed verification and optional PoX checks.
+
+1.2 Memory segments
+
+Logical memory is partitioned into disjoint segments:
+	1.	STATE
+	•	Holds bit-sliced global state.
+	•	For each bit index k in [0, N):
+	•	STATE[k] in {0,1}^W stores bit k across all W lanes.
+	•	Lane l views s_t^(l)[k] as bit l of STATE[k].
+	2.	SHARED
+	•	Holds scalar data and mutable metadata:
+	•	M_t (shared bits, packed into words).
+	•	Theta_t (fixed-point parameter arrays).
+	•	routing statistics and bandit stats.
+	•	ANN indices and configuration.
+	•	task and context metadata.
+	•	co-processor arguments and results.
+	3.	EXPERT
+	•	EXPERT[0..S-1] descriptors for experts.
+	4.	CFG / CODE
+	•	Instruction array C[0..L-1].
+	•	CFG node metadata (pc ranges, successor lists, invariants).
+	•	Macro descriptors.
+	5.	TRACE / LOG
+	•	Step-level traces (optional).
+	•	Episode summaries.
+	•	Patch metadata.
+	•	PoX records.
+	6.	PROOF
+	•	CNF formulas.
+	•	Solver contexts.
+	•	Proof objects and unsat cores.
+	7.	WORK (optional PoX)
+	•	PoX weights and thresholds.
+	•	Moving averages and saturation metrics.
+
+From the ISA perspective, all segments are part of a flat byte-addressed memory. Segment boundaries and protections are established by configuration registers and software. The abstract semantics assumes no aliasing between segments.
+
+1.3 Identifier space
+
+Identifiers are 32-bit integers:
+	•	U = {0, 1, …, 2^32 - 1}.
+
+Each identifier u in U is logically structured as:
+	•	u = [class(6) | ecc(6) | shard(6) | local(14)]
 
 where:
-	1.	K key-value pairs.
-	2.	Keys k_i from key vocabulary K_voc.
-	3.	Values v_i from value vocabulary V_voc.
-	4.	Query q ∈ K_voc.
-	5.	Target output is v_j such that k_j = q.
+	•	class in {0..63}: object class (expert, cfg_node, variable, template, patch, hypothesis, etc).
+	•	ecc in {0..63}: ECC parity bits over shard and local.
+	•	shard in {0..63}: logical shard index.
+	•	local in {0..16383}: shard-local index.
+
+Gray encoding:
+	•	g(u) = u xor (u >> 1)
+
+Hamming distance:
+	•	d_H(a, b) = number of bits where a and b differ.
+
+Similarity function:
+	•	sim(u, v) = 32 - d_H(g(u), g(v)).
+
+Identifiers are used for experts, CFG nodes, CNF formulas, solver contexts, patches, and other objects.
+
+1.4 Expert descriptors
+
+For each expert slot i in [0, S):
+
+EXPERT[i] = (id_i, R_spec_i, C_rep_i, W_spec_i, stats_i, params_i, routing_meta_i)
+
+where:
+	•	id_i in U: expert identifier.
+	•	R_spec_i: input selection specification.
+	•	Defines how to read a finite vector x from (s_t, M_t):
+	•	bit indices into STATE and SHARED,
+	•	simple address expressions (for example base + offset),
+	•	dimension n_i.
+	•	C_rep_i: Boolean circuit representation (ANF or ROBDD).
+	•	Maps x in {0,1}^{n_i} to y in {0,1}^{m_i}.
+	•	W_spec_i: write-back specification.
+	•	Defines how to write y back into (s, M):
+	•	target bit indices or contiguous regions,
+	•	optional lane masks.
+	•	stats_i:
+	•	wins_total_i in Z_nonneg.
+	•	visits_total_i in Z_nonneg.
+	•	per-task wins_i,tau and visits_i,tau (tau = task id).
+	•	last_update_step_i in Z.
+	•	params_i:
+	•	z_i: log-weight (fixed-point).
+	•	L_i,tau, S_i,tau: cumulative loss and squared loss per task tau.
+	•	routing_meta_i:
+	•	priority tags.
+	•	macro flags.
+	•	pointer into ANN index structures.
+	•	version identifiers.
+
+Input and output sizes are bounded by configuration constants:
+	•	n_i <= N_in_max.
+	•	m_i <= N_out_max.
+
+	2.	ISA model
+
+2.1 Programmer-visible core state
+
+Registers:
+	•	x0..xR-1: general-purpose integer registers, each XLEN bits.
+	•	x0 is hard-wired to zero.
+	•	pc: program counter, byte address.
+	•	fcsr: BEM control and status register (exception flags, modes, etc).
+	•	csr_seg_*: implementation-defined CSRs for segment base and limit.
+
+Optional vector and mask registers:
+	•	v0..vV-1: W-bit vector temporaries (optional).
+	•	k0..kK-1: W-bit mask or predicate registers (optional).
+
+The abstract semantics requires only GPRs, pc, and memory. Vector and mask registers are an implementation optimization; if absent, operations on STATE are still defined.
+
+2.2 Memory model
+	•	Flat byte-addressed memory.
+	•	Load and store instructions operate on bytes and XLEN-bit words.
+	•	Segment layout is enforced by CSRs and software.
+	•	Accesses outside valid ranges are undefined at the abstract level (implementation may trap).
+
+2.3 Instruction classes
+
+Instructions are grouped into classes:
+	1.	Base integer RISC:
+	•	integer arithmetic and logical operations,
+	•	comparisons and branches,
+	•	loads and stores,
+	•	CSR access.
+	2.	Bitwise and population-count:
+	•	bitwise operations on XLEN-bit words,
+	•	optional vector-level bitwise and popcount.
+	3.	BEM-specific:
+	•	observation (BEM_OBS),
+	•	routing (BEM_ROUTE),
+	•	expert evaluation (BEM_EXPERT_BATCH),
+	•	stats and learning (BEM_STATS_UPDATE, BEM_LEARN),
+	•	logging and Merkle updates (BEM_LOG, BEM_MERKLE_UPDATE),
+	•	fast-path macro (BEM_STEP_FAST, optional).
+	4.	Co-processor call:
+	•	COPROC cp_id, op_id, arg_ptr, res_ptr.
+
+Binary encodings and exact opcode layouts are implementation-defined. This specification defines only abstract semantics.
+	3.	Base integer ISA
+
+3.1 Arithmetic and logical operations
+
+All operations take XLEN-bit inputs and produce XLEN-bit results.
+	•	ADD rd, rs1, rs2
+x[rd] = x[rs1] + x[rs2].
+	•	ADDI rd, rs1, imm
+x[rd] = x[rs1] + imm (imm sign-extended).
+	•	SUB rd, rs1, rs2
+x[rd] = x[rs1] - x[rs2].
+	•	AND rd, rs1, rs2
+x[rd] = x[rs1] bitwise_and x[rs2].
+	•	ANDI rd, rs1, imm
+x[rd] = x[rs1] bitwise_and imm.
+	•	OR rd, rs1, rs2
+x[rd] = x[rs1] bitwise_or x[rs2].
+	•	ORI rd, rs1, imm
+x[rd] = x[rs1] bitwise_or imm.
+	•	XOR rd, rs1, rs2
+x[rd] = x[rs1] bitwise_xor x[rs2].
+	•	XORI rd, rs1, imm
+x[rd] = x[rs1] bitwise_xor imm.
+
+Shifts:
+	•	SLL rd, rs1, rs2
+x[rd] = x[rs1] << (x[rs2] low bits).
+	•	SRL rd, rs1, rs2
+x[rd] = logical right shift.
+	•	SRA rd, rs1, rs2
+x[rd] = arithmetic right shift.
+
+Comparisons and set:
+	•	SLT rd, rs1, rs2
+x[rd] = 1 if x[rs1] < x[rs2] (signed), else 0.
+	•	SLTI rd, rs1, imm
+x[rd] = 1 if x[rs1] < imm (signed), else 0.
+	•	SLTU rd, rs1, rs2
+x[rd] = 1 if x[rs1] < x[rs2] (unsigned), else 0.
+	•	SLTIU rd, rs1, imm
+unsigned variant with immediate.
+
+3.2 Branches and jumps
+	•	BEQ rs1, rs2, offset
+If x[rs1] == x[rs2], pc = pc + offset; else pc = pc + instruction_length.
+	•	BNE rs1, rs2, offset
+If x[rs1] != x[rs2], branch.
+	•	BLT, BGE, BLTU, BGEU
+Branch on signed or unsigned comparisons.
+	•	JAL rd, offset
+x[rd] = pc + instruction_length; pc = pc + offset.
+	•	JALR rd, rs1, imm
+x[rd] = pc + instruction_length; pc = (x[rs1] + imm) & alignment_mask.
+
+3.3 Loads and stores
+	•	LB rd, offset(rs1)
+Load signed byte, sign-extend to XLEN.
+	•	LBU rd, offset(rs1)
+Load unsigned byte, zero-extend.
+	•	LW rd, offset(rs1) (XLEN >= 32)
+Load 32-bit word, sign-extend.
+	•	LD rd, offset(rs1) (XLEN = 64)
+Load XLEN-bit word.
+	•	SB rs2, offset(rs1)
+Store low 8 bits of x[rs2] to memory.
+	•	SW rs2, offset(rs1)
+Store low 32 bits of x[rs2].
+	•	SD rs2, offset(rs1) (XLEN = 64)
+Store XLEN bits.
+
+Alignment behavior for misaligned accesses is implementation-defined.
+
+3.4 CSR access
+	•	CSRRW rd, csr, rs1
+temp = CSR[csr]; CSR[csr] = x[rs1]; x[rd] = temp.
+	•	CSRRS rd, csr, rs1
+temp = CSR[csr]; CSR[csr] = temp | x[rs1]; x[rd] = temp.
+	•	CSRRC rd, csr, rs1
+temp = CSR[csr]; CSR[csr] = temp & ~x[rs1]; x[rd] = temp.
+
+CSR names and layout are implementation-defined. Typical CSRs include:
+	•	segment base and limit registers.
+	•	PoX configuration.
+	•	random seed for PRNG.
+	•	flags controlling BEM-specific instructions.
+
+	4.	Bitwise and STATE operations
+
+4.1 Word-level bitwise
+
+The base integer instructions already provide word-level bitwise operations:
+	•	AND, OR, XOR, shifts.
+
+These are used for hash functions, H_ctx, and generic bit manipulation.
+
+4.2 Vector-level (optional) and STATE access
+
+If vector registers v* are exposed:
+	•	VAND vd, vs1, vs2
+vd = vs1 bitwise_and vs2 (W bits).
+	•	VOR, VXOR, VNOT
+Analogous bitwise OR, XOR, NOT.
+	•	VSHL, VSHR, VROT
+Shift or rotate vd by an immediate or scalar amount.
+	•	VPOPCNT rd, vs1
+x[rd] = popcount(vs1) over all W bits.
+	•	VPAR rd, vs1
+x[rd] = popcount(vs1) mod 2.
+
+Interaction with STATE:
+	•	LSTATE vd, rs1
+k = x[rs1] (bit index); vd = STATE[k].
+	•	SSTATE vs1, rs1, vmask
+k = x[rs1];
+STATE[k] = (STATE[k] & ~vmask) | (vs1 & vmask).
+
+If vector registers are not implemented, LSTATE and SSTATE are abstract operations implemented by the BIT-ALU using internal temporaries. Semantics remain:
+	•	STATE is the only storage for bit-sliced global state.
+	•	All expert circuits operate on STATE via R_spec and W_spec.
+
+	5.	BEM-specific instructions
+
+All BEM-specific instructions operate over STATE and SHARED, and are implemented by fixed-cost micro-sequences on the core plus co-processor calls where noted.
+
+5.1 Observation
+
+BEM_OBS obs_ptr
+	•	Input:
+	•	obs_ptr (in rs1 or rd): pointer to a struct in SHARED.
+	•	Semantics:
+	•	Compute obs_t = O(s_t, M_t) = (task_id_t, context_hash_t, local_bits_t, feature_bits_t).
+	•	Write to memory at obs_ptr in a fixed layout:
+	•	task_id_t (integer).
+	•	context_hash_t (integer).
+	•	local_bits_t (packed bits).
+	•	feature_bits_t (packed bits, length d).
+
+O is deterministic and integer-only. The cost of BEM_OBS is bounded by a constant C_obs.
+
+5.2 Routing and ANN
+
+BEM_ROUTE route_ptr
+	•	route_ptr: pointer to a routing struct in SHARED.
+
+Input struct (written partly by BEM_OBS):
+	•	task_id_t.
+	•	context_hash_t.
+	•	feature_bits_t.
+	•	k_large and other routing parameters.
+
+Output struct:
+	•	candidate_count <= k_large.
+	•	candidate_ids[0..candidate_count-1]: expert slot indices or identifiers.
+	•	optional scores score_i,tau for each candidate.
+
+Semantics:
+	1.	Load (task_id_t, context_hash_t, feature_bits_t) from route_ptr.
+	2.	Compute q_t = F_id(task_id_t, context_hash_t), using only integer and bitwise ops.
+	3.	Invoke COPROC CPID_ANN with op_id = ANN_QUERY:
+	•	arguments: (q_t, feature_bits_t, k_large, config(task_id_t)).
+	•	results: candidate list C_large.
+	4.	Optionally compute routing scores score_i,tau based on bandit stats (visits_i,tau, wins_i,tau) and write them to route_ptr.
+
+The cost of BEM_ROUTE is bounded by C_ANN + C_route, derived from D_max, M_max, k_large, and bandit arithmetic.
+
+Selection of a single expert or a small set of experts (k_small) is done either inside BEM_ROUTE or by a short follow-up code sequence that reads the candidate list and scores.
+
+5.3 Expert batch execution
+
+BEM_EXPERT_BATCH cfg_ptr
+	•	cfg_ptr: pointer to a struct in SHARED describing the chosen expert(s) and lane assignment.
+
+Input struct:
+	•	mode: all_lanes | grouped | per_lane.
+	•	chosen expert slot indexes or identifiers.
+	•	optional lane masks for grouped or per-lane mode.
+
+Semantics:
+	•	For each expert i actually executed at this step:
+	•	Read STATE and SHARED via R_spec_i, producing x in {0,1}^{n_i}.
+	•	Evaluate C_rep_i(x) bit-sliced over W lanes, using only bitwise and popcount operations.
+	•	Write back y via W_spec_i into STATE and SHARED, respecting lane masks.
+
+The total cost of BEM_EXPERT_BATCH is bounded by C_expert_batch, which depends on N_in_max, N_out_max, circuit form, and k_small, but not on episode length or history.
+
+5.4 Statistics update
+
+BEM_STATS_UPDATE stats_ptr
+	•	stats_ptr: pointer to per-expert and per-task stats in SHARED.
+
+Semantics:
+	•	For each expert i used at step t and current task tau = task_id_t, with reward r_t:
+	•	visits_i,tau += 1
+	•	visits_total_i += 1
+	•	wins_i,tau += r_t
+	•	wins_total_i += r_t
+	•	N_tau (total visits for task tau) += 1
+
+BEM_STATS_UPDATE is algebraically simple and runs in bounded time C_stats. It may be executed immediately after BEM_EXPERT_BATCH or batched in the mid path.
+
+5.5 Log-domain weight update
+
+BEM_LEARN learn_ptr
+	•	learn_ptr: pointer to structures holding z_i, L_i,tau, S_i,tau, hyperparameters, and scheduling flags.
+
+Semantics (conceptual):
+
+For each expert i and task tau marked for update:
+	1.	hat_l_i,tau = L_i,tau / max(1, visits_i,tau)
+	2.	hat_l_i,tau_clipped = clamp(hat_l_i,tau, -L_max, L_max)
+	3.	eta_i,tau = c_eta / sqrt(S_i,tau + epsilon_eta)
+	4.	z_i’ = z_i - eta_i,tau * hat_l_i,tau_clipped
+	5.	If abs(z_i’ - z_i) > Delta_z_max, clip z_i’ to z_i +/- Delta_z_max
+	6.	Optionally renormalize z_i across experts.
+
+All arithmetic is fixed-point integer, implemented via ADD, MUL (if available), shifts, and table-based approximations. BEM_LEARN is a mid-path instruction and may complete its work over multiple calls.
+
+5.6 Logging and hash chain
+
+BEM_LOG log_ptr, size
+	•	log_ptr: pointer to a serialized log entry e_k in SHARED.
+	•	size: length in bytes.
+
+Semantics:
+	1.	Append e_k to TRACE / LOG at the current log position.
+	2.	Compute H_{k+1} = Hash(H_k || e_k) via CPID_HASH (HASH_BLOCK).
+	3.	Store H_{k+1} in a protected location (CSR or SHARED slot reserved for the chain head).
+
+The cost of BEM_LOG is bounded and its usage frequency is controlled by software.
+
+5.7 Merkle updates
+
+BEM_MERKLE_UPDATE root_ptr, range_ptr
+	•	root_ptr: pointer to stored Merkle roots for relevant segments.
+	•	range_ptr: pointer to a description of changed blocks (for example indices and hashes).
+
+Semantics:
+	•	Invoke CPID_HASH operations to update Merkle tree nodes for the changed leaves.
+	•	Update the relevant root hashes at root_ptr.
+
+Used on the slow path when structural changes or state migrations occur.
+
+5.8 Fast-path macro (optional)
+
+BEM_STEP_FAST step_ptr
+	•	step_ptr: pointer to a struct describing locations of obs_ptr, route_ptr, cfg_ptr, stats_ptr in SHARED and mode flags.
+
+Semantics:
+	•	Execute the fast step sequence:
+	1.	BEM_OBS obs_ptr
+	2.	BEM_ROUTE route_ptr
+	3.	BEM_EXPERT_BATCH cfg_ptr
+	4.	BEM_STATS_UPDATE stats_ptr
+
+in a single instruction. Semantics are exactly the same as the corresponding sequence. The cost is bounded by C_step = C_obs + C_ANN + C_route + C_expert_batch + C_stats.
+	6.	Co-processor interface
+
+6.1 COPROC instruction
+
+COPROC cp_id, op_id, arg_ptr, res_ptr
+	•	cp_id: co-processor identifier (for example CPID_ANN, CPID_SAT, CPID_HASH, CPID_WORLD).
+	•	op_id: operation code local to the given co-processor.
+	•	arg_ptr: pointer to argument struct in SHARED.
+	•	res_ptr: pointer to result struct in SHARED.
+
+Execution model:
+	•	For fast and mid-path safe operations, COPROC is synchronous:
+	•	the instruction completes before the next instruction, with bounded cost.
+	•	For slow-path operations, COPROC may:
+	•	schedule an asynchronous job and return a handle, or
+	•	run in a separate hardware resource pool, with completion indicated via SHARED.
+
+6.2 ANN co-processor
+
+cp_id = CPID_ANN.
+
+Supported operation:
+	•	op_id = ANN_QUERY
+
+Arguments at arg_ptr:
+	•	q_t: query key (integer).
+	•	f_t: feature_bits_t (packed bits, length d).
+	•	k: maximum candidate count (k <= k_large).
+	•	config: task-specific configuration.
+
+Results at res_ptr:
+	•	candidate_count.
+	•	candidate_ids[0..candidate_count-1]: slot indices or identifiers.
+
+Constraints:
+	•	Search depth <= D_max.
+	•	Neighbor degree <= M_max.
+	•	Worst-case complexity bounded and independent of episode length and history.
+
+Implementation may use graph-based ANN over Hamming distances of Gray-coded identifiers, bucketed lists, or other structures consistent with the bounds.
+
+6.3 SAT / Hoare co-processor
+
+cp_id = CPID_SAT.
+
+Representative operations:
+	•	op_id = SAT_CHECK
+	•	Args: baseCNF_id, deltaCNF_id.
+	•	Result: result in {SAT, UNSAT, UNKNOWN}, optional unsat_core_id.
+	•	op_id = PROOF_CHECK
+	•	Check external proofs against stored CNF.
+	•	op_id = HOARE_CHECK
+	•	Check CFG annotations (pre/post conditions, invariants).
+	•	op_id = CEGIS
+	•	Args: phi_id, hyp_class_id.
+	•	Result: candidate_id or cex_id.
+
+These operations are used on the slow path to validate patches, synthesize experts and invariants, and extract counterexamples.
+
+6.4 HASH / ECC co-processor
+
+cp_id = CPID_HASH.
+
+Representative operations:
+	•	op_id = HASH_BLOCK
+	•	Compute hash for a memory range.
+	•	op_id = MERKLE_NODE
+	•	Compute parent hash from child hashes.
+	•	op_id = ECC_ENCODE / ECC_DECODE
+	•	Apply ECC to identifiers or memory blocks.
+
+Used by BEM_LOG, BEM_MERKLE_UPDATE, and structural operations.
+
+6.5 WORLD co-processor (optional)
+
+cp_id = CPID_WORLD.
+
+Representative operations (informative, out of normative core):
+	•	WORLD_RETRIEVE
+	•	WORLD_CALL_TOOL
+	•	WORLD_STREAM_READ / WORLD_STREAM_WRITE
+
+These operations interact with external resources or tools, and may drive synthetic tasks or RAG-like retrieval. Their detailed semantics are outside the v0.0.1 core; they are constrained only by timing and isolation requirements so as not to violate fast-path guarantees.
+	7.	Fast, mid, and slow path
+
+7.1 Fast path
+
+The fast path implements the per-step loop. Conceptually:
+
+Loop over t:
+	1.	obs_t = O(s_t, M_t).
+	2.	(q_t, f_t) = (F_id(task_id_t, context_hash_t), feature_bits_t).
+	3.	C_large = ANN_QUERY(q_t, f_t, k_large, config(task_id_t)).
+	4.	Select expert(s) using bandit statistics and z_i.
+	5.	Evaluate expert(s) over STATE and SHARED (bit-sliced).
+	6.	Perform minimal stats update.
+
+In ISA form, this is either:
+	•	One BEM_STEP_FAST step_ptr per step, or
+	•	The explicit sequence:
+BEM_OBS obs_ptr
+BEM_ROUTE route_ptr
+BEM_EXPERT_BATCH cfg_ptr
+BEM_STATS_UPDATE stats_ptr
+
+The fast-path cost satisfies:
+
+Cost_step <= C_obs + C_ANN + C_route + C_expert_batch + C_stats
+
+where each constant is fixed by configuration and implementation, and independent of episode length and total history.
+
+No SAT_CHECK, CEGIS, or heavy COPROC operations are allowed on the fast path.
+
+7.2 Mid path
+
+Mid path operations run periodically, for example at episode boundaries or every M steps. They include:
+	•	BEM_LEARN for z_i, L_i,tau, S_i,tau.
+	•	Aggregation and smoothing of statistics for bandits.
+	•	Lightweight template extraction from recent logs.
+
+Mid path must not violate fast-path timing guarantees. It may be implemented as short bursts interleaved with fast-path steps or as work on separate cores synchronizing via SHARED.
+
+7.3 Slow path
+
+Slow path operations run asynchronously or on dedicated resources. They include:
+	•	Structural proposal generation (expert split, merge, macro creation, superoptimization).
+	•	Verification condition construction.
+	•	SAT_CHECK, HOARE_CHECK, PROOF_CHECK, CEGIS.
+	•	ANN index maintenance and rebalancing.
+	•	PoX scoring and scheduling.
+	•	Merkle tree updates and integrity checks.
+
+Slow path must respect resource partitioning and scheduling so that fast-path timing remains bounded.
+	8.	Learning and bandits (machine-level summary)
+
+Algorithmic behavior of bandits and learning is expressed via:
+	•	BEM_STATS_UPDATE (collect loss / reward statistics).
+	•	BEM_LEARN (update log-weights and learning rates).
+	•	BEM_ROUTE (use stats and z_i for routing decisions).
+
+The ISA does not fix a particular bandit algorithm. The reference intent is:
+	•	Per task tau, bandit stats (visits_i,tau, wins_i,tau, L_i,tau, S_i,tau) are maintained.
+	•	Routing uses scores such as:
+mean_i,tau = wins_i,tau / max(1, visits_i,tau)
+bonus_i,tau = c_explore * sqrt( log(max(1, N_tau)) / max(1, visits_i,tau) )
+score_i,tau = mean_i,tau + bonus_i,tau
+	•	Log-domain weights z_i are updated using fixed-point mirror-descent style rules.
+
+All arithmetic is realized via the base integer ISA; BEM_LEARN and BEM_ROUTE only require additions, multiplications or approximate square roots, and clamps.
+	9.	Structural updates and verification hooks
+
+Structural updates are implemented in software using:
+	•	COPROC CPID_SAT and CPID_HASH.
+	•	Regular integer and memory instructions.
+	•	BEM_LOG and BEM_MERKLE_UPDATE for audit and integrity.
+
+9.1 Patch representation
+
+A patch delta is a structured object stored in SHARED and PROOF, describing:
+	•	changes to EXPERT (for example add, split, merge, deprecate, replace C_rep_i),
+	•	changes to CFG / CODE,
+	•	changes to ANN index,
+	•	associated CNF and invariant updates.
+
+9.2 Patch pipeline
+
+The patch pipeline is:
+	1.	Propose a patch delta (for example from template extraction, CEGIS, or operator input).
+	2.	Build verification condition VC(delta) as CNF in PROOF.
+	3.	Invoke COPROC CPID_SAT, op_id = SAT_CHECK, on baseCNF and deltaCNF.
+	4.	If result is UNSAT:
+	•	Optionally compute PoX score(delta) using evaluation runs and analysis.
+	•	If PoX acceptance criteria satisfied:
+	•	Apply patch: update EXPERT, CFG / CODE, ANN index, and related metadata.
+	•	Update Merkle roots via CPID_HASH and BEM_MERKLE_UPDATE.
+	•	Log the patch and its proof via BEM_LOG.
+	5.	If result is SAT or UNKNOWN:
+	•	Do not apply patch.
+	•	Optionally log counterexamples or proof failures.
+
+The ISA only requires COPROC, BEM_LOG, BEM_MERKLE_UPDATE, and regular load/store; patch semantics are specified at the abstract machine level.
+	10.	Integrity and audit
+
+Integrity and audit are based on:
+	•	A hash chain over LOG.
+	•	Merkle trees over structural segments (EXPERT, CFG / CODE, WORK).
+	•	Strict patch application policy.
+
+10.1 Log chain
+
+LOG stores entries e_k. A hash chain is defined:
+	•	H_0 = fixed constant.
+	•	For k >= 0: H_{k+1} = Hash(H_k || e_k).
+
+BEM_LOG maintains H_k using CPID_HASH. H_k is stored in protected state (CSR or reserved SHARED) and optionally exported externally.
+
+Any modification to past entries will be detectable as a mismatch in H_k.
+
+10.2 Merkle trees
+
+Merkle trees can cover:
+	•	EXPERT segment.
+	•	CFG / CODE.
+	•	WORK configuration.
+
+Leaves store hash(block). Internal nodes store hash(children). BEM_MERKLE_UPDATE plus CPID_HASH maintain consistency when blocks change. Root hashes are stored in protected locations.
+
+10.3 Patch acceptance policy
+
+A patch delta is allowed to change structural state only if:
+	1.	SAT_CHECK(VC(delta)) returns UNSAT (verification condition holds).
+	2.	Optional PoX condition holds:
+	•	score(delta) >= D (threshold stored in WORK).
+
+On acceptance:
+	•	The patch is applied to memory.
+	•	Merkle roots are updated.
+	•	A patch log entry is emitted via BEM_LOG containing:
+	•	patch identifier,
+	•	structural changes,
+	•	identifiers of verification artifacts,
+	•	PoX components and score,
+	•	parent hash pointer.
+
+This yields an auditable chain of structural changes over time.
+	11.	Informative note: behavioral intent
+
+This section is informative and does not change normative semantics.
+	•	The fast path implements a contextual bandit over experts, with safety and cost encoded into rewards.
+	•	The mid path adjusts log-weights and statistics so that regret against a reference policy class remains sublinear in horizon.
+	•	The slow path searches over structural configurations (experts, macros, invariants) and uses verification plus PoX to decide which structural changes to admit.
+	•	The ISA is designed so that:
+	•	fast path is a small, analyzable loop over BEM_OBS, BEM_ROUTE, BEM_EXPERT_BATCH, BEM_STATS_UPDATE,
+	•	mid and slow paths are realized by the same core+co-processor infrastructure without affecting fast-path bounds.
 
-Sequences are tokenized at key/value symbol granularity.
-
-3.3.3 Protocol
-
-Parameters:
-	1.	L: total sequence length.
-	2.	K: number of key-value pairs.
-	3.	|K_voc|, |V_voc|: vocabulary sizes.
-
-Training:
-	1.	Choose moderate values for (L_train, K_train).
-	2.	Train BEM with learning enabled on randomly sampled sequences.
-
-Testing:
-	1.	Vary L and K beyond training values:
-1.1 L in {L_train, 2L_train}.
-1.2 K in {K_train, 2K_train}.
-	2.	Vary query position (early, middle, late).
-	3.	Evaluate retrieval accuracy.
-
-3.3.4 Metrics
-
-Per configuration (L, K):
-	1.	retrieval_accuracy(L, K) = fraction where predicted v_hat = v_target.
-	2.	accuracy_by_position:
-2.1 accuracy when q is early.
-2.2 accuracy when q is middle.
-2.3 accuracy when q is late.
-	3.	cycles_per_token(L, K).
-	4.	cycles_per_query (final step).
-
-Implementations SHOULD describe how information is encoded in STATE and SHARED (e.g. dedicated slots for key-value pairs, expert structures for lookup).
-	4.	Language-Model-Style Benchmarks
-
-4.1 Character-level language modeling
-
-4.1.1 Purpose
-
-Measure BEM’s ability to act as a small character-level model with bounded fast-path cost.
-
-4.1.2 Task definition
-
-Corpus:
-	1.	A small text corpus (e.g. fiction excerpts, technical notes).
-	2.	Normalized to a fixed character set C (e.g. 96 printable ASCII).
-
-Task:
-
-Next-character prediction:
-	1.	Input: context c_1..c_t.
-	2.	Output: distribution p(c_{t+1} | c_1..c_t).
-	3.	Loss: cross-entropy over characters.
-
-4.1.3 Protocol
-
-Data split:
-	1.	Train set, validation set, test set.
-
-Training:
-	1.	Fixed training budget (e.g. number of tokens or steps).
-	2.	BEM configured with:
-2.1 Fixed N, K, W, expert budget N_expert_max.
-2.2 Learning and structural updates enabled.
-	3.	Optimize on train set, monitor validation BPC.
-
-Testing:
-	1.	Evaluate on test set.
-	2.	Record predictive distributions and cost metrics.
-
-4.1.4 Metrics
-
-On test:
-	1.	bits_per_char (BPC) = average cross-entropy in bits per character.
-	2.	perplexity = 2^{BPC}.
-	3.	total_tokens_seen during training.
-	4.	cycles_per_char on inference (no learning).
-	5.	chars_per_second per core.
-
-Implementations MUST report:
-	1.	Whether per-character predictions share the same BEM configuration as other benchmarks.
-	2.	Any task-specific tuning (e.g. selecting experts specializing in character classes).
-
-4.2 Token-level code modeling (optional)
-
-4.2.1 Purpose
-
-Optionally measure BEM’s ability to model code sequences with syntactic structure.
-
-4.2.2 Task definition
-
-Corpus:
-	1.	Code files in a chosen language (C, Rust, Python, etc.).
-	2.	Tokenized using a simple lexer into identifiers, keywords, operators, literals.
-
-Task:
-
-Next-token prediction with cross-entropy loss.
-
-4.2.3 Metrics
-
-On test:
-	1.	token-level perplexity.
-	2.	Syntax-related error rates:
-2.1 Frequency of unmatched brackets.
-2.2 Inconsistent indentation (if applicable).
-	3.	cycles_per_token.
-	4.	Learning and Structural Update Benchmarks
-
-5.1 Contextual bandit
-
-5.1.1 Purpose
-
-Evaluate online weight updates (U_gate_weight) under contextual bandit loss and no-regret behavior.
-
-5.1.2 Task definition
-
-At each round t:
-	1.	Context x_t ∈ X (e.g. small binary vector).
-	2.	K actions (arms) a ∈ {1..K}.
-	3.	Reward r_t ∈ [0,1] drawn from R(a, x_t).
-
-BEM:
-	1.	Observes x_t via O(s_t, M_t).
-	2.	Selects internal expert i_t (or expert group) that maps to actions.
-	3.	Induces action a_t over arms.
-	4.	Receives reward r_t and uses U_gate_weight to update weights w_i.
-
-5.1.3 Protocol
-
-Parameters:
-	1.	T: total rounds.
-	2.	K: arms count.
-	3.	Context distribution: e.g. uniform over {0,1}^d.
-
-Reward mapping:
-	1.	For each arm a, define a linear threshold model:
-E[r_t | a, x_t] = sigmoid(w_a · x_t)
-	2.	Keep w_a fixed and unknown to BEM.
-
-Benchmark:
-	1.	Run for T rounds with learning enabled.
-	2.	Record rewards, actions, and any structural updates (if allowed).
-
-5.1.4 Metrics
-	1.	Cumulative reward sum_{t} r_t.
-	2.	Baseline reward of best fixed arm in hindsight.
-	3.	Cumulative regret R_T.
-	4.	Regret scaling R_T vs T.
-	5.	Number of gate weight updates and cost (cycles).
-
-Implementations MUST report whether structural changes are enabled; if so, they MUST separate performance with and without structural updates.
-
-5.2 Non-stationary bandit
-
-5.2.1 Purpose
-
-Measure adaptation speed and structural changes under distribution shifts.
-
-5.2.2 Task definition
-
-Same as contextual bandit, but reward mapping changes at change-points:
-	1.	Tasks A, B, C, … with different sets of w_a^task.
-
-At specified steps t_change_j:
-	1.	Change underlying reward mapping from one task to the next.
-
-5.2.3 Metrics
-
-For each change:
-	1.	Immediate regret spike after change.
-	2.	Adaptation time:
-Number of steps until moving-average regret falls below a threshold.
-	3.	Structural changes:
-Number of new experts spawned, merges, splits.
-	4.	Compute overhead of adaptation:
-Extra cycles in mid-path and slow-path updates per change.
-
-5.3 Safety-constrained program fragment
-
-5.3.1 Purpose
-
-Evaluate effectiveness and cost of verification-gated structural optimization.
-
-5.3.2 Task definition
-
-Define a small BEM-controlled process with a safety property, for example:
-	1.	An index i must remain within bounds [0, M).
-	2.	A BAD flag must never be set to 1.
-
-BEM is allowed to:
-	1.	Propose structural patches Delta (e.g. micro-optimizations to expert circuits).
-	2.	Apply patches only after VC(Delta) is verified.
-
-Process:
-	1.	The process runs for many steps (e.g. 10^8 steps).
-	2.	BEM periodically proposes optimizations (e.g. reduce gate counts, fuse experts).
-	3.	Each patch is checked by SAT/Hoare.
-
-5.3.3 Metrics
-
-Over the run:
-	1.	N_patch_proposed, N_patch_accepted, N_patch_rejected.
-	2.	Average verification cost per accepted patch:
-cycles_per_verification = verification_cycles / N_patch_accepted.
-	3.	Ratio of verification cost to fast-path cost:
-verification_cycles / fast_path_cycles, e.g. per 10^6 tokens.
-	4.	Observed safety violations (should be zero under correct implementation).
-	5.	Reporting and Scoring
-
-6.1 Configuration reporting
-
-For each benchmark run, implementations MUST report:
-	1.	Hardware:
-1.1 CPU model.
-1.2 SIMD width.
-1.3 Clock frequency.
-	2.	BEM configuration:
-2.1 N, K, W.
-2.2 G_max, D_max.
-2.3 ROUTE parameters H, B, C_entry, K_cand.
-2.4 N_expert_max.
-2.5 n_max, m_max.
-	3.	Learning settings:
-3.1 Learning rate schedule.
-3.2 Structural updates enabled/disabled.
-3.3 B_flip.
-
-6.2 Results reporting
-
-Per benchmark:
-	1.	Microbenchmarks:
-1.1 cycles_per_op for BIT-ALU.
-1.2 cycles_per_query for ROUTE.
-1.3 cycles_per_batch for experts.
-1.4 cycles_per_SAT_CHECK and per_PROOF_CHECK.
-	2.	Algorithmic tasks:
-2.1 accuracies, errors vs length/depth/position.
-2.2 cycles_per_token and cycles_per_sequence.
-	3.	LM-style tasks:
-3.1 BPC or perplexity.
-3.2 cycles_per_char or cycles_per_token.
-	4.	Learning tasks:
-4.1 Regret curves.
-4.2 Adaptation times.
-4.3 Structural update counts and costs.
-	5.	Safety/verification tasks:
-5.1 Patch stats.
-5.2 Verification cost ratios.
-5.3 Safety violations.
-
-6.3 Composite scores (optional)
-
-To compare implementations, composite scores MAY be defined, for example:
-	1.	Fast-path score:
-S_fast = tokens_per_second × accuracy_on_core_tasks.
-	2.	Learning score:
-S_learn = 1 / (1 + normalized_regret).
-	3.	Safety score:
-S_safe = 1 / (1 + verification_cost_ratio), with penalty for any safety violations.
-
-Composite scoring is not mandatory in v0.0.1 and may be standardized in later versions.
-
-6.4 Versioning
-
-This document defines BEM Benchmark Suite v0.0.1.
-
-Future versions MAY:
-	1.	Introduce fixed reference datasets for some tasks.
-	2.	Add standardized composite scores and leaderboards.
-	3.	Extend benchmarks to multi-core or distributed BEM configurations while preserving per-core fast-path semantics.
