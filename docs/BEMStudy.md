@@ -1,628 +1,357 @@
-BEM TEACH AGI Task Grammar v0.0.1
-Primitive Families and Template Specifications
-	0.	Scope
-
-0.1 Goal
-
-This document specifies a set of task template families that SHOULD be included in the TEACH grammar when the long-term objective is broad general capability (AGI-oriented) rather than narrow specialization.
-
-0.2 Assumptions
-	1.	TEACH maintains a library of task templates T = {t_1, …, t_M}.
-	2.	Each template t has:
-	•	a domain tag dom(t) (algorithmic, environment, tool, language, meta, safety),
-	•	a difficulty descriptor diff(t),
-	•	a generator G_t that produces episodes consistent with BEM’s environment interface,
-	•	a reward definition R_t,
-	•	and optional structural constraints (e.g. safety invariants).
-	3.	TEACH supports compositional operators:
-	•	SEQ(a, b), PAR(a, b), NEST(a, k), MASK(a, pattern), INTERLEAVE(a, b), and variants.
-	4.	TEACH_STEP selects templates using a bandit policy over context and difficulty bands.
-
-The goal here is to define the primitive families and their template signatures; implementation details of TEACH_STEP and bandits are out of scope.
-	1.	Grammar Model
-
-1.1 Template interface
-
-Each task template t defines:
-	1.	A parameter space Θ_t (difficulty, sizes, noise levels).
-	2.	A generative process for episodes:
-	•	Sample θ ∼ P_t over Θ_t.
-	•	Sample an environment instance E from Env_t(θ).
-	•	Run BEM in interaction with E for T steps (T may be random).
-	3.	A reward function R_t:
-	•	For each step or episode, compute reward r_t according to R_t.
-	4.	Evaluation metrics for that template family (accuracy, regret, BPC, etc.).
-
-Notation (per template t):
-	•	Input/observation space: O_t
-	•	Action space: A_t
-	•	Hidden state space (environment side): H_t
-	•	Reward: r_t = f_t(H_t, A_t)
-
-TEACH sees t only through its meta statistics (pass rates, regret, novelty) and does not need to inspect Env_t internals.
-
-1.2 Primitive families
-
-We group templates into five high-level families:
-	1.	Algorithmic and formal reasoning tasks
-	2.	World and causal environment tasks
-	3.	Tool and external oracle tasks
-	4.	Language and communication tasks
-	5.	Meta-learning, self-modeling, and safety tasks
-
-For TEACH, each primitive is a parameterized template family t_family(param_vector). The grammar contains these families plus composition operators.
-	2.	Algorithmic and Formal Core Families
-
-2.1 Arithmetic and algebra
-
-2.1.1 Template: ARITH_EXPR
-
-Name: ARITH_EXPR(bit_width, n_vars, depth, ops_set)
-
-Domain: algorithmic
-
-Input format:
-	•	A sequence encoding of an arithmetic expression over integers:
-	•	Variables x_1, …, x_{n_vars} with values in [−2^{bit_width−1}, 2^{bit_width−1}−1].
-	•	Operators from ops_set ∈ {+, −, ×, max, min}.
-	•	Optional parentheses up to nesting depth depth.
-	•	The input is serialized as tokens; internally the environment maintains exact integer values.
-
-Output:
-	•	A single integer y ∈ Z in the same bit_width range representing the exact evaluation of the expression.
-
-Task variants:
-	1.	Direct evaluation:
-	•	At the end of the sequence, BEM outputs y_hat.
-	•	Reward: 1 if y_hat = y, else 0, or negative absolute error normalized.
-	2.	Stepwise prediction:
-	•	BEM predicts intermediate sub-expression values at designated points.
-	•	Reward: sum of correctness over intermediate predictions.
-
-Difficulty parameters:
-	•	bit_width ∈ {8, 16, 32}.
-	•	n_vars ∈ {2, …, 8}.
-	•	depth ∈ {1, …, 4}.
-	•	ops_set subsets (e.g. {+, −} vs {+, −, ×}).
-
-Metric focus:
-	•	Exact correctness rate vs bit_width and depth.
-	•	Cycles per token and per expression.
-
-2.2 Logic and small SAT/proof tasks
-
-2.2.1 Template: LOGIC_SAT_DECIDE
-
-Name: LOGIC_SAT_DECIDE(n_vars, m_clauses)
-
-Domain: algorithmic
-
-Input format:
-	•	A Boolean formula in CNF with:
-	•	n_vars variables,
-	•	m_clauses clauses,
-	•	clause length in a small range (e.g. 2–5 literals),
-	•	encoded as a token sequence.
-
-Output:
-	•	A binary decision y ∈ {SAT, UNSAT}.
-
-Reward:
-	•	1 for correct decision, 0 otherwise.
-
-Difficulty parameters:
-	•	n_vars ∈ {4, 8, 16}.
-	•	m_clauses ∈ {4n, 8n}.
-	•	Structured vs random formulas.
-
-2.2.2 Template: LOGIC_IMPLICATION
-
-Name: LOGIC_IMPLICATION(n_vars, m_A, m_B)
-
-Input:
-	•	Two CNFs A and B over the same variable set.
-
-Output:
-	•	y ∈ {0,1} indicating whether A ⇒ B logically holds.
-
-Reward:
-	•	1 if prediction matches ground truth obtained via PROVER, else 0.
-
-Metric focus:
-	•	Decision error rates.
-	•	Scaling with n_vars and m.
-
-2.3 Tiny interpreter / VM execution
-
-2.3.1 Template: EXEC_TINY_VM
-
-Name: EXEC_TINY_VM(L_instr, mem_size, ops_set)
-
-Domain: algorithmic
-
-Toy language:
-	•	A small stack or register machine with:
-	•	few registers or a stack,
-	•	operations such as load, store, add, branch_if_zero,
-	•	memory size mem_size.
-
-Input:
-	•	A program P of length L_instr in the toy language.
-	•	Initial memory or register configuration.
-
-Output variants:
-	1.	Final register value:
-	•	Output value of a designated register at program termination.
-	2.	Assertion check:
-	•	Input includes specification “at end, R_k must equal C”.
-	•	BEM must output whether the assertion holds.
-
-Reward:
-	•	1 on exact match / correct assertion decision, 0 otherwise.
-
-Difficulty:
-	•	L_instr ∈ {5, 10, 20}.
-	•	mem_size ∈ {16, 64}.
-	•	Limited branch depth.
-
-Metric focus:
-	•	Correctness vs L_instr.
-	•	Cycles per instruction simulated.
-
-	3.	World and Causal Environment Families
-
-3.1 Gridworld and object persistence
-
-3.1.1 Template: GRID_NAV
-
-Name: GRID_NAV(size, partial_obs, obstacles)
-
-Domain: environment
-
-Environment:
-	•	A 2D grid of size size × size.
-	•	An agent with position (x, y).
-	•	Optional walls and obstacles.
-
-Observation:
-	•	If partial_obs = 0: full grid state.
-	•	If partial_obs = 1: local window around agent.
-
-Actions:
-	•	A = {UP, DOWN, LEFT, RIGHT, STAY}.
-
-Goal:
-	•	Reach a specified goal cell G with minimal steps.
-
-Reward:
-	•	−1 per step, +R_goal on reaching goal, with episode termination.
-
-Difficulty:
-	•	size ∈ {5, 10, 20}.
-	•	partial_obs ∈ {0,1}.
-	•	obstacle density proportion.
-
-Metrics:
-	•	Success rate.
-	•	Steps to goal.
-	•	Cycles per step.
-
-3.1.2 Template: GRID_COLLECT
-
-Name: GRID_COLLECT(size, n_objects)
-
-Same gridworld but with:
-	•	n_objects items scattered.
-	•	Goal: collect all items with minimal steps under step budget.
-
-Reward:
-	•	+R_item per item collected, −1 per step, optional bonus for completing collection.
-
-3.2 Causal inference and interventions
-
-3.2.1 Template: CAUSAL_BANDIT
-
-Name: CAUSAL_BANDIT(n_vars, k_arms)
-
-Domain: environment + bandit
-
-Environment:
-	•	A hidden causal DAG over X_1, …, X_{n_vars}.
-	•	Each arm a ∈ {1,…,k_arms} corresponds to an intervention do(A = a) on some variables.
-
-Observation:
-	•	Samples of variables after interventions.
-	•	Context features derived from observations.
-
-Reward:
-	•	Real-valued reward based on some function of post-intervention distribution, e.g. expected value of a target variable.
-
-Task:
-	•	Choose interventions that maximize cumulative reward.
-	•	Optionally answer queries about counterfactuals or effects of interventions.
-
-Difficulty:
-	•	n_vars ∈ {4, 8}.
-	•	k_arms ∈ {4, 8}.
-	•	DAG depth and noise variance.
-
-Metrics:
-	•	Regret relative to optimal intervention policy.
-	•	Quality of causal effect predictions (if asked to output estimates).
-
-3.3 Non-stationary environments
-
-3.3.1 Wrapper template: ENV_NONSTATIONARY
-
-Name: ENV_NONSTATIONARY(base_template, n_changes, change_type)
-
-Domain: wrapper
-
-Definition:
-	•	Given a base template T_base (e.g. GRID_NAV, bandit, KV), construct a piecewise-stationary version where:
-	•	parameters θ_j for segment j change at defined time points,
-	•	the agent is not directly told the segment index.
-
-Task:
-	•	Maximize cumulative reward across segments.
-	•	Adapt quickly after each change.
-
-Parameters:
-	•	n_changes ∈ {1, 2, 4}.
-	•	change_type ∈ {reward_only, dynamics, both}.
-	•	segment lengths.
-
-Metrics:
-	•	Regret spike and adaptation time per change.
-	•	Structural changes triggered in BEM.
-
-	4.	Tool and External Oracle Families
-
-4.1 Simple calculator and database tools
-
-4.1.1 Template: TOOL_CALC_ARITH
-
-Name: TOOL_CALC_ARITH(cost_per_call, bit_width)
-
-Domain: tool use
-
-Environment:
-	•	BEM can solve arithmetic expressions either:
-	•	internally using its own experts, or
-	•	by calling an external CALC_TOOL that returns the exact result at a cost.
-
-Actions:
-	•	THINK(step): internal reasoning step.
-	•	TOOL_CALL(expr_id): query CALC_TOOL for specified sub-expression.
-	•	ANSWER(y_hat): final answer.
-
-Reward:
-	•	Base accuracy reward: 1 if final answer correct, 0 otherwise.
-	•	Cost penalty: − cost_per_call × (# of TOOL_CALL actions).
-	•	Optional penalty for exceeding step budget.
-
-Difficulty:
-	•	bit_width, expression depth, step budget, tool latency.
-
-Metrics:
-	•	Trade-off curve: accuracy vs average tool calls.
-	•	Internal vs external compute usage.
-
-4.1.2 Template: TOOL_DB_LOOKUP
-
-Name: TOOL_DB_LOOKUP(n_keys, noise_rate)
-
-Environment:
-	•	A key–value database accessible via TOOL_DB.
-	•	Queries return values with optional noise or missing entries.
-
-Task:
-	•	Given a higher-level problem (e.g. small relational query), BEM must:
-	•	choose which keys to query,
-	•	combine results to produce final answer.
-
-Reward:
-	•	Correct final answer, minus cost for DB calls.
-	•	Optional penalty for redundant or useless queries.
-
-Difficulty:
-	•	n_keys in DB, query complexity, noise_rate.
-
-4.2 External LLM / PROVER / code-runner as untrusted tools
-
-4.2.1 Template: TOOL_LLM_SUGGEST
-
-Name: TOOL_LLM_SUGGEST(error_rate, coverage)
-
-Environment:
-	•	An external LLM tool that can propose candidate solutions or code snippets.
-	•	The tool output is:
-	•	correct with probability (1 − error_rate) on supported tasks,
-	•	unsupported or incorrect on some tasks (coverage < 1).
-
-Actions:
-	•	THINK: internal reasoning.
-	•	TOOL_LLM(query): get suggestion.
-	•	OPTIONAL_VERIFY: use PROVER or internal checks.
-	•	ANSWER(y_hat).
-
-Reward:
-	•	Final correctness.
-	•	Penalties:
-	•	using LLM without verification on high-risk tasks,
-	•	verification cost when PROVER is used,
-	•	unnecessary calls.
-
-Difficulty:
-	•	error_rate ∈ [0, 0.3].
-	•	coverage ∈ [0.5, 1.0].
-	•	verification cost.
-
-4.2.2 Template: TOOL_PROVER_VERIFY
-
-Name: TOOL_PROVER_VERIFY(cost)
-
-Environment:
-	•	External PROVER that can check logical constraints or code safety properties.
-
-Task:
-	•	Given candidate patches or solutions, decide:
-	•	which ones to send to PROVER,
-	•	when to trust PROVER vs internal checks.
-
-Reward:
-	•	Correct safe decisions.
-	•	Time and cost penalties for verification calls.
-
-	5.	Language and Communication Families
-
-5.1 Instruction to policy or plan
-
-5.1.1 Template: NL2PLAN_GRID
-
-Name: NL2PLAN_GRID(size, instr_complexity)
-
-Domain: language + environment
-
-Environment:
-	•	A gridworld instance as in GRID_NAV or GRID_COLLECT.
-
-Input:
-	•	A textual or structured instruction, for example:
-	•	“Collect the red key before going to the blue door.”
-	•	“Avoid cells marked with X.”
-
-Task:
-	•	Execute actions in the grid such that the instruction is satisfied.
-
-Reward:
-	•	Success: reaching goals specified by instruction, obeying constraints.
-	•	Penalties: violating constraints, extra steps.
-
-Difficulty:
-	•	instr_complexity: number of atomic conditions and relational constraints.
-	•	grid size and object count.
-
-Metrics:
-	•	Success rate as function of instruction complexity and grid size.
-
-5.2 Description ↔ state / trajectory mapping
-
-5.2.1 Template: TRACE_TO_SUMMARY
-
-Name: TRACE_TO_SUMMARY(env_type, max_len)
-
-Domain: language + environment
-
-Input:
-	•	A trajectory τ: sequence of (obs_t, action_t) from an environment instance.
-
-Output:
-	•	A short textual summary of salient events, in a constrained format (could be a tag set or simple schema).
-
-Reward:
-	•	Similarity between produced summary and ground truth summary under a defined metric:
-	•	exact match in structured format, or
-	•	token-level F1 for simple text.
-
-Difficulty:
-	•	max_len: maximum summary length.
-	•	env_type: grid, causal, tool-use environment, etc.
-
-5.2.2 Template: SUMMARY_TO_GOAL
-
-Name: SUMMARY_TO_GOAL(env_type)
-
-Input:
-	•	A description of desired end state or constraints.
-
-Output:
-	•	A specification that the environment can interpret as a target goal or constraints (structured object).
-
-Reward:
-	•	1 if the decoded goal matches the underlying intended goal, 0 otherwise.
-
-5.3 Multi-agent communication
-
-5.3.1 Template: COMM_REFERENTIAL
-
-Name: COMM_REFERENTIAL(bandwidth, vocab_size)
-
-Domain: multi-agent, communication
-
-Environment:
-	•	Two roles: Sender and Receiver (both BEM instances or one BEM plus fixed heuristic).
-	•	Sender observes a target object among distractors.
-	•	Sender sends a message m within bandwidth bits or tokens.
-	•	Receiver sees the set of objects and m, and must identify the target.
-
-Actions:
-	•	Sender: choose message m from message space of size 2^{bandwidth}.
-	•	Receiver: choose object index.
-
-Reward:
-	•	1 if Receiver selects correct object, 0 otherwise.
-
-Difficulty:
-	•	bandwidth (bits per message).
-	•	number of objects.
-	•	variability of target features.
-
-Metrics:
-	•	Communication success rate.
-	•	Emergence of compressed protocols.
-
-	6.	Meta-Learning, Self-Modeling, and Safety Families
-
-6.1 Meta-RL and system identification
-
-6.1.1 Template: META_BANDIT
-
-Name: META_BANDIT(task_count, probe_budget)
-
-Domain: meta-learning
-
-Environment:
-	•	A distribution over bandit tasks {T_i}, each with different reward functions over arms.
-
-Episode structure:
-	1.	At episode start, a task T_i is sampled but not disclosed.
-	2.	The agent has a limited probe phase of length probe_budget where exploration is cheap or rewarded differently.
-	3.	After probe, the agent is primarily evaluated on exploitation performance.
-
-Reward:
-	•	Combination of probe performance and exploitation performance.
-
-Difficulty:
-	•	task_count: number of distinct tasks in the family.
-	•	probe_budget.
-	•	similarity between tasks.
-
-Metrics:
-	•	Regret relative to a meta-optimal policy.
-	•	Sample complexity for task identification.
-
-6.1.2 Template: META_GRID
-
-Name: META_GRID(layout_count, probe_budget)
-
-Analogue to META_BANDIT, but for grid layouts (different layouts, rewards, obstacle patterns).
-
-6.2 Uncertainty estimation and ask-for-help
-
-6.2.1 Template: SAFE_DECISION_WITH_HELP
-
-Name: SAFE_DECISION_WITH_HELP(base_task, help_cost)
-
-Domain: meta + safety
-
-Wrapper:
-	•	Given a base template T_base (e.g. arithmetic, logic, grid), extend the action space with:
-	•	PREDICT(y_hat): commit to an answer.
-	•	HELP: query an oracle for correct answer at cost help_cost.
-	•	ABSTAIN (optional): refuse to answer.
-
-Reward:
-	•	Base correctness reward for PREDICT.
-	•	Cost penalty for HELP.
-	•	Possibly heavy penalty for confident wrong answers.
-	•	Optional neutral reward for ABSTAIN depending on regime.
-
-Difficulty:
-	•	help_cost.
-	•	proportion of “hard” instances.
-	•	distribution shift between train and test.
-
-Metrics:
-	•	Coverage vs accuracy curve.
-	•	Calibration metrics (e.g. expected calibration error).
-	•	HELP usage rate.
-
-6.3 Self-prediction and calibration
-
-6.3.1 Template: SELF_CALIBRATION_BATCH
-
-Name: SELF_CALIBRATION_BATCH(base_task, batch_size)
-
-Domain: meta-self
-
-Episode:
-	1.	TEACH samples a batch of M instances from base_task.
-	2.	Before solving, BEM outputs a predicted accuracy p_pred ∈ [0,1] or predicted loss.
-	3.	BEM then solves the M instances normally.
-	4.	The environment computes actual batch accuracy p_true.
-	5.	Reward combines:
-	•	task performance,
-	•	calibration penalty |p_pred − p_true| or squared error.
-
-Difficulty:
-	•	batch_size.
-	•	variability of instance difficulty.
-
-Metrics:
-	•	Calibration error across batches.
-	•	Trade-off between prediction quality and actual task performance.
-
-6.4 Safety-constrained optimization
-
-6.4.1 Template: SAFE_RL
-
-Name: SAFE_RL(env_type, constraint_level)
-
-Domain: safety + RL
-
-Environment:
-	•	A Markov decision process with:
-	•	reward signal R_t,
-	•	cost signal C_t ≥ 0 representing constraint violations or risk.
-
-Objective:
-	•	Maximize expected cumulative reward subject to:
-	•	E[C_t] ≤ ε or constraint on expected discounted cost.
-
-Reward shaping:
-	•	Episode reward includes penalties for violations and possibly for near-violations.
-
-Difficulty:
-	•	constraint_level ε.
-	•	observability of C_t (immediate vs delayed).
-	•	environment structure.
-
-Metrics:
-	•	Reward achieved vs constraint satisfaction.
-	•	Number of violations.
-	•	Comparison to optimal constrained policy (when known).
-
-	7.	Minimal AGI-Oriented Base Library for TEACH
-
-For an AGI-oriented TEACH configuration, the grammar SHOULD include at least one template family from each of the following categories:
-	1.	Algorithmic/formal
-	•	ARITH_EXPR
-	•	LOGIC_SAT_DECIDE and/or LOGIC_IMPLICATION
-	•	EXEC_TINY_VM
-	2.	World/causal
-	•	GRID_NAV and GRID_COLLECT
-	•	CAUSAL_BANDIT
-	•	ENV_NONSTATIONARY wrapper for at least one base task
-	3.	Tools/oracles
-	•	TOOL_CALC_ARITH
-	•	TOOL_DB_LOOKUP
-	•	TOOL_LLM_SUGGEST and TOOL_PROVER_VERIFY (untrusted oracle pattern)
-	4.	Language/communication
-	•	NL2PLAN_GRID
-	•	TRACE_TO_SUMMARY and SUMMARY_TO_GOAL
-	•	COMM_REFERENTIAL
-	5.	Meta/safety/self
-	•	META_BANDIT or META_GRID
-	•	SAFE_DECISION_WITH_HELP
-	•	SELF_CALIBRATION_BATCH
-	•	SAFE_RL
-
-These primitives, combined with existing composition operators (SEQ, PAR, NEST, MASK, INTERLEAVE), provide TEACH with a grammar that spans:
-	•	algorithmic computation,
-	•	physical/world interaction,
-	•	tool-mediated reasoning,
-	•	language-conditioned behavior and communication,
-	•	meta-learning, calibration, and safety-constrained optimization.
-
-This coverage is intended to bias BEM’s long-run self-training process toward broadly useful capabilities rather than narrow pattern matching.
+BEM TEACH – AGI Task Grammar v0.0.1
+(Integrated English ASCII Draft, no separators)
+	0.	Scope and Goals
+
+0.1 Purpose
+
+This document refines the TEACH component of BEM v0.0.1 by specifying an AGI-oriented task grammar that:
+	1.	Treats tasks as compositional objects over:
+1.1 Environment problems (external dynamics, rewards).
+1.2 Program fragments (CFG and EXPERT sequences).
+1.3 Hybrids that couple environment and internal behavior.
+	2.	Ensures closure:
+2.1 Any executable CFG fragment or EXPERT sequence can become a template.
+2.2 The grammar is closed under projection, concatenation, and simple mutations.
+2.3 Base problems are a bias, not the only primitives.
+	3.	Supports no-regret curriculum:
+3.1 Templates compete via meta-bandits.
+3.2 Sub-tasks (smaller fragments) can emerge automatically under pressure from PoX and regret.
+
+The goal is that, once TEACH is instantiated, BEM can:
+	•	Start from a small set of biased base problems and trivial program fragments.
+	•	Automatically discover and schedule smaller and more structured sub-tasks, down to near-ISA granularity where useful.
+	•	Use the same bandit machinery to allocate training to both semantic tasks and internal program fragments.
+
+0.2 Non-goals
+
+This document does not:
+	1.	Fix any particular environment API or simulator.
+	2.	Specify concrete corpora or datasets.
+	3.	Define a separate TEACH-ISA; instead, it reuses CFG and EXPERT representations.
+	4.	Fix the exact meta-reward function; it specifies required ingredients and constraints.
+
+0.3 Relationship to BEM v0.0.1
+
+This document refines:
+	•	TEACH segment contents.
+	•	The notion of “task templates” and “task grammar” referenced in sections 2.1, 8.5, 10, 14, 17.5 of the integrated BEM spec.
+
+All changes are additive and compatible with the existing step and bandit semantics.
+	1.	Task Objects and Template Types
+
+1.1 Task Template
+
+A task template t is a symbolic object stored in TEACH with:
+	•	id_t in U (class = task_template).
+	•	type_t in {env, prog, hybrid}.
+	•	domain_t in D_domain (math, code, reasoning, control, safety, etc).
+	•	structure_t: grammar tree (see 3).
+	•	bindings_t: parameter ranges and environment bindings.
+	•	stats_t: online statistics for meta-bandit and curriculum.
+	•	meta_bandit_t: bandit state for TEACH_BANDIT (visits, loss_sum, etc).
+
+1.2 Task Instance
+
+A task instance I(t, seed) is a concrete episode specification generated from template t and random seed:
+
+I(t, seed) = (env_spec, prog_spec, reward_contract, stop_criteria)
+
+where:
+	•	env_spec describes the external environment (or NONE for pure internal tasks).
+	•	prog_spec describes required or constrained internal behavior (CFG fragments, expert sets, invariants).
+	•	reward_contract defines how step and episode rewards r_t, R_episode are computed.
+	•	stop_criteria define maximum steps, success conditions, and failure conditions.
+
+1.3 Template Types
+
+Type env:
+	•	structure_t describes an environment problem (e.g., bandit, gridworld, algorithmic sequence).
+	•	prog_spec is unconstrained except for global safety.
+	•	Reward is purely environment based.
+
+Type prog:
+	•	structure_t describes one or more CFG fragments or EXPERT sequences.
+	•	env_spec is NONE (or a trivial environment).
+	•	Reward is derived from internal behavior metrics (see 5).
+
+Type hybrid:
+	•	structure_t combines env and prog components.
+	•	env_spec and prog_spec are both non-trivial.
+	•	Reward is a function of both environment performance and internal behavior.
+
+	2.	Representation in TEACH Segment
+
+2.1 TEACH Segment Layout
+
+TEACH holds:
+	1.	Template table TEMPL[0..N_template_max-1], each entry:
+TEMPL[i] = (id_t, type_t, domain_t, structure_ptr, bindings_ptr, stats_t, meta_bandit_t)
+	2.	Grammar parameters:
+	•	D_task: max grammar depth.
+	•	L_frag_max: max length of prog fragments (in CFG nodes or expert steps).
+	•	N_template_max: max number of live templates.
+	•	p_mut: base mutation probability per template selection.
+	•	p_split_frag: probability of sub-fragment extraction.
+	•	p_merge_frag: probability of template merge.
+	•	decay rates for stats and meta-bandits.
+	3.	Curriculum statistics:
+	•	per difficulty band (e.g., k = 0..K_difficulty-1):
+	•	pass_rate_band[k], usage_band[k], novelty_band[k].
+	•	per domain: domain usage, regret, safety measures.
+
+2.2 Link to CFG and EXPERT
+
+Each prog or hybrid template can reference:
+	•	CFG nodes via ids in U (class = cfg_node).
+	•	EXPERT slots via ids in U (class = expert).
+
+structure_t encodes references as:
+	•	node sequences: [v_0, v_1, …, v_m].
+	•	expert sequences: [i_0, i_1, …, i_m].
+	•	constraints: allowed transitions, lane masks, invariants.
+
+These references are symbolic and resolved at task instantiation time.
+	3.	Grammar Structure
+
+3.1 Grammar Trees
+
+structure_t is a rooted tree built from:
+	•	Leaves:
+	•	LEAF_ENV(p): environment primitive p.
+	•	LEAF_PROG(f): program fragment f (CFG path or expert sequence).
+	•	Internal nodes (combinators):
+	•	SEQ(a, b): run a then b.
+	•	PAR(a, b): run a and b in parallel lanes or independent episodes.
+	•	NEST(a, depth_range): nest a to a sampled depth.
+	•	MASK(a, pattern): add corruption or masking.
+	•	INTERLEAVE(a, b): interleave event streams from a and b.
+	•	LOOP(a, k_range): repeat a k times.
+	•	BRANCH(cond, a, b): conditional subtask selection.
+	•	REDUCE(a, op): summarization (e.g., aggregate rewards, counts).
+	•	MAP_LANES(a, layout): apply a across lane groups.
+
+3.2 Environment Primitives (Base Problems)
+
+LEAF_ENV(p) refers to environment problems such as:
+	•	Bit sequence tasks (parity, majority, Dyck-1, key-value retrieval).
+	•	Contextual bandits and non-stationary bandits.
+	•	Simple control or navigation problems.
+	•	Language-model-style next-token tasks on small corpora.
+
+These are bias choices. The grammar does not rely on them being semantically fundamental; they are simply initial templates in TEMPL.
+
+3.3 Program Primitives
+
+LEAF_PROG(f) refers to fragments f extracted from CFG and EXPERT:
+	•	CFG p-path: v_0 -> v_1 -> … -> v_m with m <= L_frag_max.
+	•	Expert sequence: [i_0, …, i_m] with m <= L_frag_max.
+	•	Mixed path: (CFG nodes plus annotated expert calls).
+
+Initially, LEAF_PROG fragments may be:
+	•	trivial (single basic block, single expert), or
+	•	simple paths corresponding to known routines (e.g., routing, bandit update).
+
+Over time, TEACH can introduce new LEAF_PROG via template extraction (see 6).
+	4.	Task Instance Generation
+
+4.1 Template Selection
+
+Given a domain d and difficulty band k requested by S_domain or the scheduler:
+	1.	Collect candidate templates:
+T_dk = { t | domain_t = d and difficulty_t near band k }
+	2.	Use TEACH_BANDIT.CHOOSE over T_dk:
+	•	meta_bandit_t holds UCB-like stats.
+	•	The arm is template id_t.
+	•	The meta-loss is derived from meta_reward_t (see 5).
+	3.	Let t* be the selected template.
+
+4.2 Template Mutation
+
+With probability p_mut (configurable per band and domain):
+	1.	Sample a small set of grammar edits on structure_t*:
+	•	Replace a sub-node with a simpler variant (e.g., SEQ(a, b) -> a).
+	•	Insert, delete, or swap children in SEQ, PAR, INTERLEAVE.
+	•	Adjust depth_range, k_range within bounds.
+	•	Replace LEAF_ENV(p) with a nearby environment variant.
+	•	Replace LEAF_PROG(f) with a sub-fragment of f (if available).
+	2.	The resulting structure defines t_new, with:
+	•	id_new, stats_new initialized, meta_bandit_new initialized.
+	•	domain_new and type_new inherited with minor adjustments.
+	3.	With probability p_split_frag, enforce at least one LEAF_PROG to be replaced with a strictly shorter fragment, ensuring downward closure.
+	4.	Insert t_new into TEMPL if capacity allows; otherwise, optionally evict an underperforming template.
+
+4.3 Instance Materialization
+
+Given t_selected (t* or t_new) and seed:
+	1.	Traverse structure_t to create env_spec and prog_spec:
+	•	For LEAF_ENV: sample environment parameters from bindings_t.
+	•	For LEAF_PROG: resolve CFG / EXPERT ids and define:
+	•	fragment boundaries (entry, exit).
+	•	allowed transitions.
+	•	constraints on expert usage.
+	2.	Define reward_contract:
+	•	environment reward from env_spec (if any).
+	•	program reward from internal metrics:
+	•	regret reduction on fragment.
+	•	cost reduction on fragment.
+	•	BAD rate on fragment.
+	•	equivalence / safety metrics if applicable.
+	3.	Define stop_criteria:
+	•	max_steps (bounded by configuration).
+	•	success/failure predicates on env and internal state.
+	•	safety overrides.
+	4.	Produce an opaque teacher_task_desc_t to be consumed by T_id and the environment manager.
+	5.	Meta-Reward for Templates
+
+5.1 Required Ingredients
+
+For each template t, TEACH maintains:
+	•	pass_rate_t: moving average of success probability on instances.
+	•	regret_t: moving average of per-episode regret on tasks instanced from t.
+	•	cost_t: moving average of cycles per step or per episode.
+	•	info_gain_t: optional measure (e.g., coverage of new contexts, fragment diversity).
+	•	safety_t: rate of BAD events associated with t.
+
+5.2 Meta-Reward Definition
+
+meta_reward_t is a scalar in [0, 1], defined by:
+
+meta_reward_t = sigma( w_pass * pass_rate_t
+- w_regret * norm_regret_t
+- w_cost * norm_cost_t
++ w_info * norm_info_t
+- w_safe * norm_bad_t )
+
+where:
+	•	sigma is a bounded squashing function (e.g., logistic), implemented in fixed-point.
+	•	norm_* are normalized versions of the underlying metrics (by band and domain).
+	•	w_* are configurable weights stored in TEACH or WORK.
+
+5.3 Bandit Loss for Templates
+
+TEACH_BANDIT uses a loss in [0,1]:
+
+loss_template_t = 1 - meta_reward_t
+
+and maintains:
+	•	visits_t, loss_sum_t, loss_sq_sum_t, z_t
+
+in meta_bandit_t, using the same UCB-V style index as BANDIT_CORE.
+	6.	Grammar Evolution and Fragment Extraction
+
+6.1 Template Extraction T_extract
+
+From TRACE and CFG, TEACH constructs candidate program fragments:
+	1.	Identify hot regions:
+	•	high regret contributions.
+	•	high BAD occurrences.
+	•	high cost concentration.
+	•	frequent occurrence across tasks.
+	2.	For each hot path P:
+	•	P = [u_0, …, u_L], where u_j are CFG nodes or expert calls.
+Generate fragment candidates:
+	•	whole path P if L <= L_frag_max.
+	•	all contiguous subpaths P[i:j], 0 <= i < j <= L, (j-i) <= L_frag_max.
+	•	optionally, prefixes P[0:j] and suffixes P[i:L].
+	3.	Deduplicate fragments based on id sets and local structure hashes.
+	4.	For each surviving fragment f:
+	•	Build LEAF_PROG(f) and wrap in a minimal template t_f (type = prog).
+	•	Initialize stats_t_f and meta_bandit_t_f.
+	•	Insert into TEMPL if capacity allows, or push into a candidate pool.
+
+6.2 Downward Closure
+
+To guarantee that smaller program tasks can emerge:
+	1.	When T_extract installs a template with fragment f of length L > 1, it SHOULD also:
+	•	Install 1 or more sub-fragments of f (length < L), or
+	•	Mark f as splittable for later TEACH_STEP mutation.
+	2.	TEACH_STEP, under p_split_frag, MUST prefer mutations that strictly reduce fragment length or reduce the number of nodes in the grammar tree when:
+	•	cost_t is high, or
+	•	regret_t is high.
+
+This enforces a bias toward discovering simpler sub-tasks around difficult or expensive regions.
+
+6.3 Template Simplification and Pruning
+
+Periodically:
+	1.	Identify templates with:
+	•	very low usage_t and low meta_reward_t, or
+	•	high redundancy with other templates via structure similarity and overlapping support.
+	2.	Mark for pruning:
+	•	Remove from TEMPL or demote to a cold pool.
+	•	Keep their historical stats in compressed form for analysis if needed.
+	3.	Optionally merge similar templates:
+	•	For env templates: merge parameter ranges and adjust bindings.
+	•	For prog templates: construct a merged fragment with small generalization, verified via PROVER.
+	4.	Relationship to ISA and BEM Core
+
+7.1 Closure over Program Space
+
+The TEACH grammar is required to satisfy:
+	1.	Any executable CFG path or EXPERT sequence of length 1..L_frag_max is admissible as a LEAF_PROG.
+	2.	Grammar combinators SEQ, PAR, INTERLEAVE, LOOP, NEST are sufficient to embed these fragments into larger templates without requiring additional ISA primitives.
+	3.	No special “TEACH-ISA” is introduced; CFG and EXPERT representations are the sole program carriers.
+
+7.2 Base Problems as Bias, Not Semantics
+
+Base problems (LEAF_ENV):
+	1.	Are chosen for practical reasons:
+	•	diagnostic power and interpretability.
+	•	coverage of common algorithmic and reasoning patterns.
+	2.	Do not have semantic privilege:
+	•	TEACH_BANDIT treats environment and program templates with the same bandit core.
+	•	meta_reward_t is defined for all templates using the same functional form.
+	•	Over time, TEACH can allocate more probability mass to program fragments if they yield better PoX and regret improvements.
+
+7.3 Automatic Sub-task Emergence
+
+Given the above constraints, the system can, in principle:
+	•	Start with a small set of biased base problems plus trivial program fragments.
+	•	Through T_extract and TEACH_STEP mutations, generate and refine:
+	•	smaller, more focused fragments around difficult regions.
+	•	hybrid templates combining external tasks with internal behavior constraints.
+	•	Allocate training and verification resources based on meta-reward and PoX.
+
+	8.	Safety and Cost Constraints
+
+8.1 Bounded TEACH Cost
+
+TEACH operations must obey:
+
+Cost_TEACH_step <= C_teach_max
+
+independent of episode length, achieved by:
+	•	Bounding D_task, L_frag_max, template count, and mutation operations per TEACH_STEP call.
+	•	Using approximate bandit indices and small constant-time approximations for meta_reward and normalization.
+
+8.2 Safety Coupling
+
+Templates must respect global safety constraints:
+	•	reward_contract must penalize or nullify templates that systematically increase BAD.
+	•	meta_reward_t must include a safety term norm_bad_t with non-zero weight w_safe.
+	•	The contextual scheduler (Algorithm D) may reduce alpha_synth or alpha_act for domains or bands with elevated safety_t.
+
+	9.	Informative Notes
+
+9.1 AGI Orientation
+
+The grammar is designed so that:
+	•	The space of tasks spans both “what the agent does in the world” (env) and “how the agent internally computes” (prog).
+	•	Over long training runs, the teacher can:
+	•	discover reusable algorithmic fragments,
+	•	tighten them via verification and superoptimization,
+	•	and redeploy them as primitives in more complex tasks.
+
+9.2 Practical Initialization
+
+A practical v0.0.1 deployment might:
+	1.	Seed TEMPL with:
+	•	a small set of env base problems (parity, majority, Dyck-1, key-value, bandit).
+	•	a small set of trivial prog fragments (routing, bandit update, a few known CFG blocks).
+	2.	Enable T_extract and ensure:
+	•	hot regions are logged with enough detail.
+	•	sub-fragment extraction is implemented.
+	•	meta_reward includes PoX and fragment-level metrics.
+	3.	Let TEACH_BANDIT and scheduler gradually shift mass from hand-picked tasks to discovered fragments where they improve PoX.
+
+End of BEM TEACH – AGI Task Grammar v0.0.1.
