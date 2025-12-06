@@ -1,17 +1,16 @@
 BEM Tool and Resource Layer v0.0.1
 Tool Bus, Resource Catalog, and External Integration
+(Integrated English ASCII Draft, aligned with BEM v0.0.1 core)
 	0.	Scope and Goals
 
 0.1 Purpose
 
 This document defines the Tool and Resource Layer v0.0.1 for the Boolean Expert Machine (BEM) v0.0.1. It specifies:
-	1.	How external tools (filesystems, databases, LLMs, solvers, simulators, environments) are represented and invoked from BEM.
+	1.	How external tools (filesystems, databases, solvers, LLMs, simulators, environments, UI gateways) are represented and invoked from BEM.
 	2.	A unified Tool Bus abstraction in SHARED memory for enqueueing tool requests with bounded fast-path cost.
-	3.	A Resource Catalog that maps stable integer identifiers in U to logical resources such as files, directories, and database connections.
-	4.	Execution rules ensuring that BEM fast-path complexity remains bounded and independent of episode length while allowing rich external integration.
-	5.	Profiles for filesystem and database integration consistent with the BEM execution model.
-
-This layer is intended as an extension of the BEM core specification and assumes the existence of STATE, SHARED, TRACE, PROOF, WORK, and TEACH segments, and the BEM ISA including COP instructions.
+	3.	A Resource Catalog that maps stable identifiers in U to logical resources such as files, directories, database connections, and external environments.
+	4.	Execution rules ensuring that BEM fast-path complexity remains bounded and independent of external latencies while allowing rich external integration.
+	5.	Profiles for filesystem and database integration, and hooks for other tool kinds, consistent with the BEM execution model, TEACH, PROVER, and PoX.
 
 0.2 Non-goals
 
@@ -19,168 +18,242 @@ This document does not define:
 	1.	Any particular filesystem implementation or POSIX semantics.
 	2.	Any concrete database engine (PostgreSQL, ClickHouse, etc).
 	3.	Any network protocol, RPC format, or host operating system API.
-	4.	Any particular encoding format beyond recommending a deterministic, self-describing encoding (for example CBOR) for tool payloads.
-	5.	Any specific external tool or environment task set; only the abstraction and constraints.
+	4.	Any specific serialization format beyond requiring a deterministic, self-describing encoding for tool payloads (for example CBOR or an equivalent scheme).
+	5.	Any particular external tool or task set; only the abstraction and constraints.
 
-0.3 Design goals
+0.3 Assumptions
+	1.	BEM core, ISA, and segments are as in BEM v0.0.1:
+	1.	STATE, SHARED, TRACE, WORK, TEACH, PATCH_QUEUE, ENV, PROVER, etc.
+	2.	Identifiers U with layout defined in the core spec.
+	3.	COP instructions for co-processor calls with bounded cost.
+	2.	TEACH, PoX, and PROVER may be implemented partly using external tools, but from BEM core’s point of view their interfaces remain as defined in the core spec.
 
-The Tool and Resource Layer is designed to satisfy:
+0.4 Design goals
 
 G1 (bounded fast-path)
-Tool interactions from the fast-path are limited to O(1) enqueue operations into a bounded Tool Bus, with no busy-waiting or unbounded computation.
+Tool interactions from STEP_FAST are limited to O(1) enqueue operations into a bounded Tool Bus, with no busy-waiting or unbounded computation.
 
 G2 (uniform external interface)
-All external tools (filesystem, database, solver, LLM, environment) share a common request descriptor format and status protocol in SHARED.
+All external tools (filesystem, database, solver, LLM, environment, human-feedback gateway) share a common TOOL_REQ descriptor format and status protocol in SHARED.
 
 G3 (stable resource handles)
-Resources (files, directories, database connections, logical environments) are identified by U-space identifiers and looked up via O(1) slot tables, never by raw string paths or DSN strings in fast-path.
+Resources (files, directories, database connections, logical environments) are identified by U-space identifiers and accessed via O(1) slot tables, never by raw string paths or DSN strings on fast-path.
 
 G4 (host implementation transparency)
 The host runtime may implement tools in-process, out-of-process, or on remote machines without modifying BEM core semantics.
 
 G5 (auditability)
-Tool invocations and results are logged to TRACE and can participate in the hash chain and Merkle trees defined in the core specification.
-	1.	Identifier Classes and Resource IDs
+Tool invocations and results are logged to TRACE and participate in the hash chain and Merkle trees defined in the core specification.
+
+G6 (compatibility with higher layers)
+The Tool and Resource Layer is suitable as a substrate for PROVER, external environments, and the Human Feedback Layer v0.0.1, without changing BEM’s fast-path cost model.
+	1.	Identifiers and Classes
 
 1.1 U-space reuse
 
-The BEM core defines a 32-bit domain:
+BEM core defines a 32-bit identifier domain:
 
-U = {0, 1, …, 2^32 - 1}
+U = {0, 1, …, 2^32 − 1}
 
-with structure:
+with bit layout:
 
-u = [class(6) | ecc(6) | shard(6) | local(14)]
+u = [class(6) | ecc(6) | bucket(10) | local(10)]
 
-where class, ecc, shard, and local are interpreted as small integers. The Tool and Resource Layer introduces additional classes in this domain.
+where:
+	1.	class ∈ [0, 63] is the object kind.
+	2.	ecc ∈ [0, 63] are parity/ECC bits used for corruption detection.
+	3.	bucket ∈ [0, 1023] is a 10-bit shard or routing index.
+	4.	local ∈ [0, 1023] is a 10-bit sub-index within (class, bucket).
 
-1.2 New identifier classes
+The Tool and Resource Layer reuses this structure without changing field widths. For resource-related classes, bucket is interpreted as a resource shard index, and local as an index within that shard.
 
-The following classes are reserved for the Tool and Resource Layer:
+1.2 Additional identifier classes
+
+The following class tags in U are reserved (exact numeric values are configuration constants):
 	1.	class = fs_node
-Logical filesystem node (file, directory, symbolic link, or volume marker).
+Logical filesystem node (file, directory, symlink, volume marker, virtual node).
 	2.	class = db_conn
 Logical database connection or logical database handle.
 	3.	class = tool_kind
-Logical tool kind (filesystem tool, database tool, LLM tool, solver tool, environment tool, etc).
+Logical tool kind (filesystem tool, database tool, prover tool, LLM tool, environment tool, human-feedback tool, etc).
 	4.	class = env_task (optional)
-Logical environment or task descriptor for external simulators or task engines.
+Logical external environment or external simulator task descriptor.
 
-The exact integer values for class are chosen at configuration time and must be consistent across STATE, SHARED, and host runtime.
+These classes coexist with expert, task, template, patch, and other classes from the BEM core.
 
-1.3 Slot mappings for resource classes
+1.3 Slot mappings
 
-For each resource class, a slot mapping is defined:
+For each resource class, there is a slot mapping stored in SHARED:
+	1.	FS_NODE table: index i ∈ [0, F)
+Maps fs_node ids to concrete filesystem metadata.
+	2.	DB_CONN table: index j ∈ [0, D)
+Maps db_conn ids to database connection metadata.
+	3.	TOOL_KIND table: index t ∈ [0, T)
+Maps tool_kind ids to tool type roles and policies.
 
-slot_fs   : U -> {0..F-1} union {bottom}
-slot_db   : U -> {0..D-1} union {bottom}
-slot_tool : U -> {0..T-1} union {bottom}
+The mapping between a U id and a slot index is implementation-defined. A typical pattern:
+	1.	For a given fs_node id u:
+	1.	class(u) = fs_node.
+	2.	bucket(u) encodes a shard index.
+	3.	local(u) encodes an index within that shard.
+	2.	FS_NODE slots are allocated such that (class=fs_node, bucket, local) uniquely identify one entry.
 
-where:
-	1.	slot_fs(u) != bottom if and only if u is an allocated fs_node identifier.
-	2.	slot_db(u) != bottom if and only if u is an allocated db_conn identifier.
-	3.	slot_tool(u) != bottom if and only if u is an allocated tool_kind identifier.
-	4.	For each mapping, u != v and both allocated implies slot_x(u) != slot_x(v).
-
-Slot mappings and their inverses are stored in SHARED in the Resource Catalog segment. Rebalancing may change slot_x(u) but must preserve resource content and semantics of references that use identifiers u.
-	2.	Resource Catalog Segment
+The Tool and Resource Layer requires:
+	1.	For each active resource id u, there is exactly one slot in the corresponding table.
+	2.	The host runtime maintains any auxiliary indices it needs; BEM core only relies on table slots and id equality.
+	3.	Resource Catalog Segment
 
 2.1 Overview
 
-The Resource Catalog is a logical subset of SHARED that exposes O(1) access to resource metadata. It defines at minimum:
+The Resource Catalog is a logical subset of SHARED that exposes constant-time access to resource metadata. It includes at minimum:
 	1.	FS_NODE table for filesystem nodes.
 	2.	FS_ALIAS table for frequently used filesystem nodes.
 	3.	DB_CONN table for database connections.
 	4.	TOOL_KIND table for known tool kinds.
 
+Implementations may add a generic RESOURCE table, but FS_NODE, FS_ALIAS, DB_CONN, and TOOL_KIND are normative.
+
 2.2 FS_NODE table
 
 For each filesystem node slot i in [0, F):
 
-FS_NODE[i] = (id, parent_id, kind, hash_name, hash_path, backend_id, flags)
+FS_NODE[i] = (
+id,         // U, class=fs_node
+parent_id,  // U, class=fs_node or null id for root
+kind,       // u8
+backend_id, // u16
+flags,      // u16
+hash_name,  // u64
+hash_path   // u64
+)
 
-where:
-	1.	id in U with class = fs_node.
-	2.	parent_id in U with class = fs_node or a distinguished null id for root.
-	3.	kind in {0,1,2,…}
-0 = regular file
-1 = directory
-2 = symbolic link
-Other values are implementation-specific.
-	4.	hash_name in Z_64
-Hash of the basename (for example 64-bit hash of the last path component).
-	5.	hash_path in Z_64
-Hash of the logical path (absolute or root-relative).
-	6.	backend_id in Z_16
-Identifies which filesystem backend or volume to use (for example host filesystem, object store, in-memory store).
-	7.	flags in Z_16
-Bitmask indicating read-only, write-allowed, append-only, ephemeral, sensitive, or other policy flags.
+Semantics:
+	1.	id
+	1.	Must be a U identifier with class = fs_node.
+	2.	Must be unique among all active FS_NODE entries.
+	2.	parent_id
+	1.	Either a valid fs_node id or a distinguished null id representing a root.
+	2.	Defines a logical tree or DAG; exact topology is host-defined.
+	3.	kind
+	1.	0 = regular file
+	2.	1 = directory
+	3.	2 = symbolic link
+	4.	Other values are reserved for future kinds (for example virtual node, volume root).
+	4.	backend_id
+	1.	Identifies a logical filesystem backend or volume (for example HOST_FS0, OBJECT_STORE0).
+	2.	Interpretation is host-defined.
+	5.	flags (bitmask)
+At minimum:
+	1.	bit 0: read-allowed
+	2.	bit 1: write-allowed
+	3.	bit 2: append-only
+	4.	bit 3: ephemeral (temporary data)
+	5.	bit 4: sensitive (subject to stricter logging or access controls)
+Other bits are configuration-dependent.
+	6.	hash_name
+	1.	64-bit hash of the basename (the last path component) under a fixed hash function.
+	2.	Used for quick comparisons; not a security primitive.
+	7.	hash_path
+	1.	64-bit hash of the logical path (for example absolute or root-relative) under a fixed hash function.
+	2.	Host runtime may use it to map to an OS path or an object-key.
 
-Host runtime is responsible for mapping (backend_id, id) or (backend_id, hash_path) to concrete OS-level paths or storage locations.
+The FS_NODE table does not mandate a particular directory layout. It only ensures that given an id, BEM can load metadata in O(1).
 
 2.3 FS_ALIAS table
 
-Frequently used filesystem nodes are exposed via a small alias table:
+FS_ALIAS is a small alias table for frequently used filesystem nodes:
 
-FS_ALIAS[k] in U for k in {0..A-1}
+For each alias index k in [0, A):
 
-Each FS_ALIAS[k] must satisfy:
-	1.	FS_ALIAS[k] is either a valid fs_node identifier or a distinguished null id.
-	2.	FS_ALIAS[k] is loaded into registers by simple LD from a fixed SHARED offset.
+FS_ALIAS[k] in U
 
-Typical usage:
+Constraints:
+	1.	FS_ALIAS[k] is either:
+	1.	A valid fs_node id referencing some FS_NODE entry, or
+	2.	A distinguished null id.
+	2.	FS_ALIAS indices are used directly in CFG as small immediates.
+
+Typical alias assignments:
 
 0 = DATA_ROOT
 1 = LOG_ROOT
 2 = SNAPSHOT_ROOT
 3 = CONFIG_ROOT
+4 = TRACE_EXPORT_ROOT
 etc.
 
-CFG programs can use small alias indices as immediates and resolve them to fs_node ids via a single memory load, enabling “instant” reference to key filesystem locations without string manipulation.
+CFG fragments may:
+	1.	Load FS_ALIAS[k] into a register in one or two instructions.
+	2.	Pass that id to tool requests without manipulating strings.
 
 2.4 DB_CONN table
 
 For each database connection slot j in [0, D):
 
-DB_CONN[j] = (id, backend_id, flags, config_handle)
+DB_CONN[j] = (
+id,          // U, class=db_conn
+backend_id,  // u16
+flags,       // u16
+config_tag   // u32
+)
 
-where:
-	1.	id in U with class = db_conn.
-	2.	backend_id in Z_16
-Identifies which logical DB backend to use (for example POSTGRES_MAIN, ANALYTICS_DB).
-	3.	flags in Z_16
-Bitmask specifying read-only, write-allowed, transactional, etc.
-	4.	config_handle in Z_64
-Opaque handle used by host runtime to look up connection strings or credentials. BEM core treats it as an opaque integer.
-
-DB connections may refer to SQL engines, key-value stores, or other logical stores.
+Semantics:
+	1.	id
+	1.	Must be a U identifier with class = db_conn.
+	2.	Unique among DB_CONN entries.
+	2.	backend_id
+	1.	Identifies logical DB backend (for example POSTGRES_MAIN, KV_STORE0).
+	2.	Interpretation is host-defined.
+	3.	flags (bitmask)
+At minimum:
+	1.	bit 0: read-allowed
+	2.	bit 1: write-allowed
+	3.	bit 2: transactional
+	4.	bit 3: analytics / heavy query allowed
+	4.	config_tag
+	1.	Opaque 32-bit tag used by host runtime to look up connection strings, credentials, pools, etc.
+	2.	BEM core treats it as an integer with no structure.
 
 2.5 TOOL_KIND table
 
 For each tool kind slot t in [0, T):
 
-TOOL_KIND[t] = (id, role_flags)
+TOOL_KIND[t] = (
+id,         // U, class=tool_kind
+role_flags, // u32
+policy_tag  // u32
+)
 
-where:
-	1.	id in U with class = tool_kind.
-	2.	role_flags in Z_32
-Encodes the logical type, for example:
-bit 0: filesystem tool
-bit 1: database tool
-bit 2: prover tool
-bit 3: LLM tool
-bit 4: environment tool
-etc.
-
-The mapping from TOOL_KIND index to semantics is defined by host runtime and configuration.
+Semantics:
+	1.	id
+	1.	Must be a U identifier with class = tool_kind.
+	2.	Unique among TOOL_KIND entries.
+	2.	role_flags (bitmask)
+Recommended bits:
+	1.	bit 0: filesystem tool
+	2.	bit 1: database tool
+	3.	bit 2: prover tool
+	4.	bit 3: LLM tool
+	5.	bit 4: environment tool
+	6.	bit 5: human-feedback / UI gateway tool
+Other bits are reserved.
+	3.	policy_tag
+	1.	Opaque policy identifier for host runtime (ratelimits, timeouts, sandboxing profile, etc).
+	2.	BEM core does not interpret it.
 
 2.6 Optional generic resource table
 
-If needed, a generic RESOURCE table may unify FS_NODE and DB_CONN:
+Implementations MAY introduce a generic RESOURCE table:
 
-RESOURCE[k] = (id, class, backend_id, flags, meta_ptr)
+RESOURCE[k] = (
+id,        // U
+class_tag, // u8
+backend_id,// u16
+flags,     // u16
+meta_ptr   // u64
+)
 
-where meta_ptr points into SHARED for class-specific metadata. For v0.0.1, FS_NODE and DB_CONN are sufficient and normative; RESOURCE is informative.
+but v0.0.1 does not depend on RESOURCE. It is informative and intended for implementations that want to unify FS_NODE and DB_CONN metadata routed through a single host mapping layer.
 	3.	Tool Bus Segment
 
 3.1 TOOL_REQ entry format
@@ -189,353 +262,393 @@ The Tool Bus is a bounded array of request descriptors in SHARED:
 
 For each slot q in [0, Q):
 
-TOOL_REQ[q] = (tool_kind_id, op, flags, resource_id, in_ptr, in_len, out_ptr, out_cap, status, err_code, reserved)
+TOOL_REQ[q] = (
+tool_kind_id, // U, class=tool_kind
+op,           // u16
+flags,        // u16
+resource_id,  // U
+in_ptr,       // u64
+in_len,       // u32
+out_ptr,      // u64
+out_cap,      // u32
+status,       // u8
+err_code,     // u16
+reserved      // u8
+)
 
-where:
-	1.	tool_kind_id in U with class = tool_kind.
-Selects the logical tool family (filesystem, database, prover, etc).
-	2.	op in Z_16
-Tool-specific operation code. Examples:
-For filesystem:
-0 = STAT, 1 = READ, 2 = WRITE, 3 = LIST
-For database:
-0 = EXEC_QUERY, 1 = PREPARE, 2 = FETCH, etc.
-	3.	flags in Z_16
-Operation-specific flags. For example:
-For filesystem:
-bit 0: allow partial read
-bit 1: append mode
-For database:
-bit 0: transactional
-bit 1: read-only
-	4.	resource_id in U
-The logical resource being operated on. For example:
-fs_node id for filesystem operation.
-db_conn id for database operation.
-env_task id for environment operation.
-	5.	in_ptr in Z_64
-Pointer into SHARED or STATE where the request payload is stored. Payload encoding is implementation-defined but should be deterministic (e.g. CBOR). BEM ISA loads and stores treat in_ptr as a byte address in the conceptual address space for SHARED and STATE.
-	6.	in_len in Z_32
-Length in bytes of the request payload.
-	7.	out_ptr in Z_64
-Pointer into SHARED or STATE where the tool should write its response.
-	8.	out_cap in Z_32
-Maximum number of bytes that may be written starting at out_ptr.
-	9.	status in Z_8
-Status code controlled by BEM and host runtime:
-0 = empty (slot is free)
-1 = pending (enqueued by BEM, not yet processed by tool)
-2 = done (processed, response available)
-3 = error (tool failed, see err_code)
-	10.	err_code in Z_16
-Tool-specific error code, valid when status = 3.
-	11.	reserved in Z_8
-Reserved for future use; must be initialized to 0 by BEM when creating a request.
+Fields:
+	1.	tool_kind_id
+	1.	U identifier with class=tool_kind, selecting the logical tool family (filesystem, database, prover, environment, LLM, HITL gateway, etc).
+	2.	op
+	1.	Tool-specific operation code (for example FS_READ, DB_EXEC_QUERY).
+	2.	The numeric values are defined per tool kind.
+	3.	flags
+	1.	Operation-specific flags as a bitmask.
+	2.	Defined per tool kind, but must not affect the structure of TOOL_REQ.
+	4.	resource_id
+	1.	Logical resource being operated on.
+	2.	For filesystem tools: fs_node id.
+	3.	For database tools: db_conn id.
+	4.	For environment tools: env_task id or another class as configured.
+	5.	For tools that do not need a resource, a distinguished null id may be used.
+	5.	in_ptr, in_len
+	1.	Byte address and length of the request payload in SHARED (or a designated I/O buffer region logically part of SHARED/STATE).
+	2.	Payload must be encoded deterministically (for example CBOR, fixed-struct encoding).
+	3.	BEM core does not interpret payload contents beyond length bounds.
+	6.	out_ptr, out_cap
+	1.	Byte address and maximum length of the response buffer.
+	2.	The tool must not write beyond out_cap bytes starting at out_ptr.
+	7.	status
+	1.	0 = empty (slot is free)
+	2.	1 = pending (enqueued by BEM, not yet processed by tool)
+	3.	2 = done (processed, response available)
+	4.	3 = error (tool failed, see err_code)
+	8.	err_code
+	1.	Tool-specific error code, meaningful when status=3.
+	2.	For status ∈ {0,1,2}, err_code SHOULD be 0.
+	9.	reserved
+	1.	Reserved for future use.
+	2.	BEM MUST initialize reserved to 0 when creating a request.
 
-3.2 Tool request lifecycle
+3.2 Request lifecycle
 
-A tool request follows this lifecycle:
+The normative lifecycle of a tool request is:
 	1.	Allocation
-BEM searches TOOL_REQ for a slot q with status = 0 (empty).
-If no such slot exists, it may:
-a) Skip creation and log a backpressure event, or
-b) Overwrite a low-priority pending request according to a policy in WORK.
-Overwriting is implementation-specific and not required by v0.0.1.
+	1.	A BEM routine (mid-path or slow-path; or a bounded helper callable from fast-path) searches TOOL_REQ for a slot q with status = 0.
+	2.	If no empty slot is available, the routine:
+	1.	MAY skip creating the request and log a backpressure event in WORK or TRACE, or
+	2.	MAY overwrite a low-priority pending request according to a policy in WORK.
+Overwrite policies are implementation-specific and not mandated by v0.0.1.
 	2.	Initialization
-BEM writes:
-TOOL_REQ[q].tool_kind_id = desired tool kind id
-TOOL_REQ[q].op           = chosen operation
-TOOL_REQ[q].flags        = chosen flags
-TOOL_REQ[q].resource_id  = resource handle
-TOOL_REQ[q].in_ptr       = payload pointer
-TOOL_REQ[q].in_len       = payload length
-TOOL_REQ[q].out_ptr      = response buffer pointer
-TOOL_REQ[q].out_cap      = response buffer capacity
-TOOL_REQ[q].err_code     = 0
-TOOL_REQ[q].reserved     = 0
+	1.	The routine writes:
+	1.	TOOL_REQ[q].tool_kind_id = chosen tool kind id.
+	2.	TOOL_REQ[q].op           = chosen operation code.
+	3.	TOOL_REQ[q].flags        = chosen flags.
+	4.	TOOL_REQ[q].resource_id  = resource handle or null id.
+	5.	TOOL_REQ[q].in_ptr       = payload pointer.
+	6.	TOOL_REQ[q].in_len       = payload length.
+	7.	TOOL_REQ[q].out_ptr      = response buffer pointer.
+	8.	TOOL_REQ[q].out_cap      = response buffer capacity.
+	9.	TOOL_REQ[q].err_code     = 0.
+	2.	TOOL_REQ[q].reserved     = 0.
 	3.	Enqueue
-BEM sets TOOL_REQ[q].status = 1 (pending).
-This transition marks the request as visible to external workers.
-	4.	Processing
-External workers scan TOOL_REQ entries for status = 1, process them, and write:
-	•	Response bytes to [out_ptr, out_ptr + used_bytes)
-	•	TOOL_REQ[q].err_code if needed
-	•	TOOL_REQ[q].status = 2 (done) or 3 (error)
-Workers must not modify tool_kind_id, op, flags, resource_id, or in_ptr/in_len.
+	1.	The routine sets TOOL_REQ[q].status = 1 (pending).
+	2.	This transition marks the request as visible to external workers.
+	4.	Processing by external worker
+	1.	External workers scan TOOL_REQ entries for status=1.
+	2.	For each q:
+	1.	Read tool_kind_id, op, flags, resource_id, in_ptr, in_len, out_ptr, out_cap.
+	2.	Map resource_id to a concrete host resource via Resource Catalog and host configuration.
+	3.	Decode the payload at in_ptr.
+	4.	Execute the host-level operation (filesystem I/O, DB query, solver call, LLM inference, environment step, HITL UI action, etc).
+	5.	Encode the response into out_ptr, writing at most out_cap bytes.
+	6.	Set TOOL_REQ[q].err_code if an error occurred.
+	7.	Set TOOL_REQ[q].status to:
+	1.	2 = done, if operation succeeded.
+	2.	3 = error, if an error occurred.
+	3.	Workers MUST NOT modify tool_kind_id, op, flags, resource_id, in_ptr, in_len, out_ptr, out_cap.
 	5.	Completion handling
-Mid-path or slow-path BEM routines scan for status in {2,3}, read responses, update STATE/SHARED as needed, log to TRACE, and then reset TOOL_REQ[q].status to 0 (empty) to reuse the slot.
+	1.	Mid-path or slow-path BEM routines scan TOOL_REQ entries for status ∈ {2,3}.
+	2.	For each such q:
+	1.	Decode response from [out_ptr, out_ptr + used_bytes) as defined by the tool.
+	2.	Update STATE, SHARED, WORK, or TEACH as appropriate.
+	3.	Log the tool invocation and outcome to TRACE (see Section 7).
+	4.	Set TOOL_REQ[q].status = 0 (empty) when processing is complete.
 
 3.3 COP binding
 
-The BEM ISA includes a generic co-processor call:
+The BEM ISA includes a generic co-processor instruction:
 
 COP op_id, rs_arg, rd_res
 
-The Tool and Resource Layer binds certain op_id values to Tool Bus operations. For example:
-
-op_id = COP_TOOL_ENQUEUE
+The Tool and Resource Layer binds certain op_id values to Tool Bus operations. At minimum:
+	1.	COP_TOOL_ENQUEUE (normative)
 
 Semantics:
+	1.	Input:
+	1.	rs_arg: pointer to a small descriptor in SHARED or STATE containing:
+	1.	tool_kind_id
+	2.	resource_id
+	3.	op
+	4.	flags
+	5.	in_ptr, in_len
+	6.	out_ptr, out_cap
+	2.	Output:
+	1.	rd_res: integer result:
+	1.	≥ 0: the chosen TOOL_REQ index q.
+	2.	< 0: an error code (for example −1 = no free slot, −2 = invalid tool_kind_id).
 
-Input:
+The COP implementation:
+	1.	Searches TOOL_REQ for a free slot (status=0) in bounded time.
+Q is a configuration constant and small enough that an O(Q) scan is acceptable.
+	2.	On success, initializes TOOL_REQ[q] and sets status=1.
+	3.	Returns q in rd_res, or a negative error code on failure.
 
-rs_arg: pointer to a small descriptor in SHARED or STATE containing tool_kind_id, resource_id, op, flags, and payload location.
-
-Output:
-
-rd_res: integer result with the chosen TOOL_REQ index q or a negative error code if allocation failed.
-
-Implementation:
-	1.	BEM-CORE loads descriptor from [rs_arg].
-	2.	BEM-CORE searches TOOL_REQ for an empty slot q in O(1) or O(Q) time with Q bounded and small.
-	3.	If slot found, BEM-CORE populates TOOL_REQ[q] as above and sets status = 1.
-	4.	rd_res is set to q.
-
-Fast-path code may inline this logic without explicitly calling COP, as long as behavior is equivalent. The normative semantics is the enqueue of a TOOL_REQ entry with bounded cost.
-	4.	Filesystem Integration Profile v0.0.1
+Fast-path code MAY inline the equivalent logic as long as:
+	1.	The per-step cost remains bounded by C_step_max.
+	2.	The externally observable semantics of TOOL_REQ are preserved.
+	3.	Filesystem Integration Profile v0.0.1
 
 4.1 Filesystem tool kind
 
-A distinguished tool_kind id TOOL_FS is reserved for filesystem operations. TOOL_KIND entry for TOOL_FS must set role_flags with a bit indicating “filesystem”.
+A distinguished tool_kind id TOOL_FS is reserved for filesystem operations. Its TOOL_KIND entry MUST have:
+	1.	role_flags bit “filesystem tool” set.
+	2.	policy_tag configured according to deployment needs.
 
 4.2 Path resolution
 
-BEM does not manipulate raw path strings. Path resolution is a host responsibility and proceeds as follows:
-	1.	FS_NODE and FS_ALIAS are initialized at startup or snapshot restore time.
-Host runtime constructs FS_NODE entries using a configuration file (for example a JSON map from logical names to OS paths).
-	2.	BEM code obtains a file_id either by:
-a) Loading FS_ALIAS[k] for a common location, or
-b) Following parent-child relationships in FS_NODE, or
-c) Having file_id embedded in configuration.
-	3.	TOOL_FS requests use resource_id = file_id.
-
-Host runtime maps (backend_id, file_id) to concrete paths and uses OS-level APIs to perform IO.
+BEM core MUST NOT manipulate arbitrary path strings on fast-path. Path resolution is a host responsibility.
+	1.	At initialization or snapshot restore time:
+	1.	The host runtime populates FS_NODE and FS_ALIAS from a configuration source (for example a static mapping from logical names to OS paths or object keys).
+	2.	BEM code obtains fs_node ids by:
+	1.	Loading FS_ALIAS[k] for common locations, or
+	2.	Reading ids from configuration stored in SHARED, or
+	3.	Following parent-child relationships in FS_NODE in bounded loops on mid-path or slow-path.
+	3.	Filesystem TOOL_REQ entries use resource_id = fs_node id.
+The host runtime maps (backend_id, id, hash_path) to a concrete OS-level path or object key.
 
 4.3 Filesystem operations
 
-For TOOL_FS, op codes are defined as:
+For TOOL_FS, the following op codes are defined:
 
 0 = FS_STAT
 1 = FS_READ
 2 = FS_WRITE
 3 = FS_LIST
 
-Request payload formats (suggested):
+Payload layouts are defined as follows (normative default; implementations may extend but not change existing fields):
 	1.	FS_STAT
-in payload: empty or small flags.
-out payload: fixed-size struct with size, mtime, kind, flags.
+	1.	in payload: optional flags; MAY be empty.
+	2.	out payload: fixed-size struct:
+	1.	size_bytes (u64)
+	2.	mtime_seconds (u64)
+	3.	kind (u8)
+	4.	flags (u16)
+	5.	reserved (padding)
 	2.	FS_READ
-in payload: (offset, length) in bytes.
-Host runtime reads up to length bytes from file at offset and writes into [out_ptr, out_ptr + min(length, out_cap)).
+	1.	in payload:
+	1.	offset (u64)
+	2.	length (u32)
+	2.	Host runtime:
+	1.	Reads up to length bytes from file at offset.
+	2.	Writes min(length, out_cap) bytes into [out_ptr, out_ptr + used).
+	3.	Encodes used_bytes (u32) at the start of the out payload (or in a small header), followed by raw bytes.
 	3.	FS_WRITE
-in payload: (offset, length, data) where data resides in a separate region; in_ptr and in_len describe data.
-Host runtime writes data to the file at offset. out payload may contain number of bytes written or status.
+	1.	in payload:
+	1.	offset (u64)
+	2.	length (u32)
+	3.	data is placed directly at in_ptr+header_size or in a separate buffer as defined by convention.
+	2.	Host runtime:
+	1.	Writes up to length bytes from the payload to the file at the given offset.
+	2.	Out payload: number of bytes successfully written (u32) and an optional status code.
 	4.	FS_LIST
-in payload: listing options (recursive, pattern, limit).
-out payload: list of child fs_node ids or hashed names.
+	1.	in payload:
+	1.	options bitmask (recursive, include_dirs, include_files)
+	2.	max_entries (u32)
+	2.	out payload:
+	1.	entry_count (u32)
+	2.	For each entry:
+	1.	child_id (U, fs_node)
+	2.	kind (u8)
 
-Fast-path must not wait for FS completion. Mid-path routines may poll for TOOL_REQ entries with tool_kind_id = TOOL_FS and status in {2,3}.
+FS_READ and FS_WRITE MUST respect FS_NODE.flags; if a write is attempted on a read-only node, the tool MUST set status=3 and an appropriate err_code.
 
 4.4 Caching
 
-BEM can treat data read via FS_READ as cached in STATE or SHARED. Policy variables:
-	1.	Max cached bytes.
-	2.	Eviction policy (LRU, FIFO, pinned for critical config files).
-	3.	Flags in FS_NODE.flags to decide whether data may be cached.
-
-Caching policy is implementation-specific and does not affect the Tool Bus semantics.
+BEM may treat data read via FS_READ as cached in STATE or SHARED. Caching policy (size limits, eviction) is implementation-specific and not part of this spec. Caching MUST NOT change TOOL_REQ semantics.
 	5.	Database Integration Profile v0.0.1
 
 5.1 Database tool kind
 
-A distinguished tool_kind id TOOL_DB is reserved for database operations. TOOL_KIND entry for TOOL_DB must set role_flags with a bit indicating “database”.
+A distinguished tool_kind id TOOL_DB is reserved for database operations. Its TOOL_KIND entry MUST set a “database tool” bit in role_flags.
 
 5.2 DB connections
 
-DB_CONN entries are initialized by host runtime using configuration files or environment. BEM core treats DB_CONN[j].config_handle as opaque and uses DB_CONN[j].id as resource_id in TOOL_REQ.
+DB_CONN entries are initialized by the host runtime using deployment configuration. BEM code uses DB_CONN[j].id as resource_id in TOOL_REQ entries for TOOL_DB.
 
 5.3 Database operations
 
-Example op codes for TOOL_DB:
+For TOOL_DB, the following op codes are defined:
 
 0 = DB_EXEC_QUERY
-1 = DB_PREPARE (optional)
-2 = DB_FETCH (optional)
-3 = DB_META (schema, introspection)
+1 = DB_META  (optional; schema/introspection)
 
 DB_EXEC_QUERY:
 	1.	resource_id: db_conn id.
-	2.	in payload: encoded query object containing:
-	•	optional query kind (text, prepared id, logical operation)
-	•	parameters (encoded deterministically)
-	•	result shaping hints (for example limits, projection).
-	3.	out payload: encoded result summary or a small fixed prefix of rows, or an opaque handle to an out-of-band result set managed by the host.
+	2.	in payload: encoded query object:
 
-The DB tool is encouraged to:
-	1.	Normalize results into a compact fixed schema (for example rows of fixed-size fields or columnar fragments) to simplify BEM parsing.
-	2.	Provide aggregated metrics (row count, latency, cost estimate) that BEM can use directly as reward or features.
+QUERY_REQ = (
+query_kind,  // u8 (0=text,1=logical_op,2=prepared_id)
+limit,       // u32
+flags,       // u32 (read-only, transactional hints)
+payload…   // query text or logical description, deterministically encoded
+)
+	3.	out payload: encoded result summary:
+
+QUERY_RES = (
+row_count,   // u32 (rows returned or affected)
+col_count,   // u16
+meta_flags,  // u16
+data…      // results encoded in fixed schema or small prefix
+)
+
+Implementations are encouraged to provide:
+	1.	Compact, fixed-schema encodings (for example fixed-size columns, small row slices).
+	2.	Aggregated metrics (row_count, latency, estimated cost) that BEM can use directly as features or rewards.
+
+DB_META is optional and MAY expose schema information. Its exact payload is implementation-defined.
 
 5.4 DB as environment or shared memory
 
-Two typical roles:
+Two main usage patterns:
 	1.	Slow shared memory or knowledge base
-BEM uses TOOL_DB for occasional lookups or updates; results are written into SHARED and then used in O(small) features for routing, bandits, or TEACH.
-	2.	Environment for tasks
-Task templates in TEACH may specify DB operations as part of their dynamics. Rewards r_t may be defined from DB responses (for example constraint satisfaction, number of rows matching a condition, query cost minimization). Tool requests remain asynchronous and are integrated via mid-path updates.
-	3.	External Worker Model
+	1.	BEM queries DB sporadically to fetch parameters, coefficients, or knowledge.
+	2.	Results are written into SHARED and later consumed by bandits, TEACH, or environment drivers.
+	2.	External environment or simulator
+	1.	TEACH templates may define tasks whose transition dynamics are driven by DB queries.
+	2.	The environment driver uses TOOL_DB to fetch next-state / reward information asynchronously.
+	3.	Fast-path only consumes ready results, never blocking on DB latency.
+	3.	Other Tool Kinds
 
-6.1 Worker responsibilities
+6.1 Prover tool
 
-External workers are processes or threads that:
-	1.	Have read-write access to SHARED and TRACE segments, or to a synchronized representation of these segments.
-	2.	Periodically scan TOOL_REQ for entries with status = 1 (pending).
-	3.	For each such entry:
-a) Interpret tool_kind_id and op.
-b) Map resource_id to concrete host-level resource using Resource Catalog and host configuration.
-c) Decode request payload at in_ptr with length in_len.
-d) Execute the corresponding host-level operation (filesystem IO, DB query, solver call, LLM invocation, environment step, etc).
-e) Encode the response into out_ptr with capacity out_cap.
-f) Set status to 2 (done) or 3 (error) and populate err_code if needed.
+A tool_kind id TOOL_PROVER MAY be defined for external SAT/SMT/CEGIS engines backing the PROVER interface in the core spec.
+	1.	PROVER’s SAT_CHECK and CEGIS calls may be implemented by:
+	1.	Enqueueing TOOL_REQ entries with tool_kind_id=TOOL_PROVER and appropriate op codes.
+	2.	Mid/slow-path workers translating these to concrete solver calls.
+	3.	Passing results back to PROVER’s logical interface.
+	2.	From the perspective of BEM core, PROVER still exposes SAT_CHECK/CEGIS as in Section 6.1 of the core spec. Whether PROVER is backed by TOOL_PROVER or inline code is an implementation choice.
 
-Workers must ensure:
-	1.	Never writing beyond out_cap bytes.
-	2.	Never modifying TOOL_REQ fields other than status, err_code, and response data.
-	3.	Failing safely: on error, set status to 3 and a non-zero err_code.
+6.2 Environment tool
 
-6.2 Consistency and idempotence
+A tool_kind id TOOL_ENV MAY be used for external environments and simulators:
+	1.	resource_id may be an env_task id (class=env_task) or a task-specific handle.
+	2.	op codes could include:
+	1.	ENV_RESET
+	2.	ENV_STEP
+	3.	ENV_INFO
+	3.	These calls integrate with TEACH by:
+	1.	Storing env descriptors in ENV or SHARED.
+	2.	Using TOOL_ENV as the transport to host-level simulators.
 
-Because BEM may re-read or replay logs, workers are encouraged to implement idempotent operations when possible. For example:
-	1.	Writes identified by a unique tool request key derived from TRACE index and hash of payload.
-	2.	Logical upsert semantics for DB operations.
+The spec does not fix these formats; they must follow TOOL_REQ semantics.
 
-Exact policies are implementation-specific but must not violate the Tool Bus semantics.
+6.3 LLM and HITL gateway tools
 
-6.3 Security boundaries
+A tool_kind id TOOL_LLM MAY be used to reach external language models, and a tool_kind id TOOL_HINL MAY be used as a gateway for Human Feedback Layer v0.0.1.
+	1.	TOOL_LLM payloads SHOULD be deterministic and schema-based (prompt, parameters, truncation limits).
+	2.	TOOL_HINL payloads SHOULD wrap HINL_TASK creation and updates, but the Human Feedback Layer spec is the normative reference for HINL semantics.
+	3.	Execution Model and Complexity Constraints
 
-The Tool and Resource Layer is agnostic to security boundaries, but typical deployments enforce:
-	1.	Resource scoping via backend_id and flags.
-	2.	Access control in host runtime, mapping resource_id to concrete OS paths or credentials only when allowed by policy.
-	3.	Logging of tool invocations to TRACE for audit.
-	4.	Execution Model and Complexity Constraints
+7.1 Fast-path constraints
 
-7.1 Fast-path allowed operations
+Within STEP_FAST and other fast-path primitives, BEM MAY:
+	1.	Read and write STATE and local SHARED fields.
+	2.	Call COP_TOOL_ENQUEUE (or inline equivalent) to enqueue TOOL_REQ entries, with bounded cost.
+	3.	Read previously produced tool results that are guaranteed ready by configuration (for example pre-loaded configuration data).
 
-Within STEP_FAST and other fast-path routines, BEM may:
-	1.	Read and write STATE and localized SHARED fields.
-	2.	Call ANN_QUERY and other bounded co-processor operations as defined by core spec, provided their runtime cost is bounded by configuration constants.
-	3.	Enqueue TOOL_REQ entries as described in Section 3, including:
-a) Locating a free slot.
-b) Writing tool_kind_id, resource_id, op, flags, in_ptr, in_len, out_ptr, out_cap.
-c) Setting status to 1 (pending).
+Fast-path MUST NOT:
+	1.	Busy-wait for TOOL_REQ.status to change from 1 to {2,3}.
+	2.	Poll TOOL_REQ in loops whose iteration count depends on external tool latency.
+	3.	Depend on the completion of any specific TOOL_REQ in order to bound C_step_max.
 
-Fast-path must not:
-	1.	Busy-wait for status to change from 1 to 2 or 3.
-	2.	Perform polling loops whose iteration count depends on external tool latency.
-	3.	Inspect out payloads that are not guaranteed to be ready by configuration.
+Any reading of tool results on fast-path MUST be done under a static policy that either:
+	1.	Only uses data that is known to be pre-populated or cached, or
+	2.	Uses stale-but-safe defaults when data is not ready.
 
 7.2 Mid-path responsibilities
 
 Mid-path routines (executed periodically):
-	1.	Scan TOOL_REQ for entries with status in {2,3}.
-	2.	For each completed entry:
-a) Decode response payload from [out_ptr, out_ptr + used_bytes).
-b) Update STATE, SHARED, and WORK (for example bandit priors, TEACH statistics, scheduler context).
-c) Log tool invocation and outcome to TRACE, including tool_kind_id, op, resource_id, status, err_code, and hashes of request and response.
-d) Reset TOOL_REQ[q].status to 0 (empty) once processing is complete.
-	3.	Run GRPO_LITE updates, teacher updates, log aggregation, and template extraction as defined in core spec.
+	1.	Scan TOOL_REQ for entries with status ∈ {2,3}.
+	2.	For each completed entry q:
+	1.	Decode the response payload.
+	2.	Update STATE, SHARED, WORK, TEACH, or ENV descriptors.
+	3.	Append a TRACE entry describing the tool call (Section 8).
+	4.	Set TOOL_REQ[q].status = 0.
+	3.	Run GRPO_LITE, TEACH updates, statistics aggregation, and simple scheduling decisions while respecting their own bounded cost constraints.
 
-Mid-path may use approximate time or step counts to schedule its own execution but must maintain bounded per-call costs.
+Mid-path MUST treat Q and the number of completed requests checked per tick as configuration-bounded to keep per-call cost finite.
 
 7.3 Slow-path responsibilities
 
-Slow-path routines (Level 2 and 3) are responsible for:
-	1.	Structural patch generation and verification.
-	2.	PROVER and CEGIS calls, which themselves can use the Tool Bus with tool_kind_id = TOOL_PROVER.
-	3.	PoX scoring and patch scheduling.
-	4.	Snapshot and restore procedures.
+Slow-path routines (Level 2 and 3 in the core spec) are responsible for:
+	1.	Structural patch generation and verification, including heavy use of PROVER and TOOL_PROVER.
+	2.	PoX scoring and patch scheduling.
+	3.	Snapshot creation and restore.
+	4.	Offline analysis and bulk operations.
 
-Slow-path is allowed to run arbitrarily complex algorithms, as long as:
-	1.	Fast-path remains bounded and independent of slow-path workload.
-	2.	Only verified patches that satisfy VC(Delta) and PoX thresholds are applied to configuration.
+Slow-path MAY issue TOOL_REQ entries for large operations (for example long-running solver calls, bulk DB queries, batch environment rollouts). Its cost does not affect C_step_max as long as all fast-path invariants are respected.
 
 7.4 Complexity invariants
 
-Overall, the Tool and Resource Layer must preserve the following:
-	1.	Per-step fast-path cost is bounded by a constant that depends only on configuration parameters, not on the number or latency of external tool requests.
-	2.	TOOL_REQ size Q is finite and bounded; searching for free slots is bounded cost (for example Q is small or scan is capped).
-	3.	No external tool can cause unbounded fast-path delay; external latencies affect only mid/slow-path scheduling and the availability of updated data.
-	4.	Logging and Trace Integration
+The Tool and Resource Layer MUST preserve:
+	1.	Per-step fast-path cost bounded by a constant C_step_max that depends only on configuration (W, B, K_exp, etc), not on external latencies or TOOL_REQ backlog.
+	2.	Q (the number of TOOL_REQ slots) finite and bounded. Searching for free or completed slots is bounded cost per mid/slow-path tick.
+	3.	No external tool can cause an unbounded delay in STEP_FAST.
+	4.	All modifications to FS_NODE, DB_CONN, TOOL_KIND, FS_ALIAS, and TOOL_REQ respect the core determinism and logging model (hash chain and Merkle roots).
+	5.	Logging, Trace, and Replay
 
-8.1 Tool logs
+8.1 Tool trace entries
 
-TRACE entries should include minimal but sufficient information to reconstruct tool interactions. For each tool invocation, BEM logs:
-	1.	Time or step index.
-	2.	task_id and context_hash at invocation.
-	3.	tool_kind_id, op, resource_id, TOOL_REQ index.
-	4.	A hash of request payload.
-	5.	A hash of response payload once processed.
-	6.	status and err_code.
+TRACE (as defined in the core spec) SHOULD include entries for tool invocations. For each TOOL_REQ slot q, when its processing is completed:
 
-Hashes are computed via the HASH unit and integrated into the log hash chain as in the core spec.
+TRACE_tool_entry = (
+time_or_step,   // step counter or logical time
+task_id,        // current task_id_t or a reserved id
+bucket,         // routing bucket or reserved
+slot,           // expert slot or reserved
+tool_kind_id,   // U, class=tool_kind
+op,             // u16
+resource_id,    // U
+req_hash,       // u64 hash of request payload
+res_hash,       // u64 hash of response payload
+status,         // u8
+err_code        // u16
+)
 
-8.2 Use for replay and analysis
+Constraints:
+	1.	HASH unit (from the core spec) MUST be used to compute req_hash and res_hash with a fixed hash function.
+	2.	TRACE entries are integrated into the hash chain H exactly as other entries.
 
-Offline analysis tools may:
-	1.	Reconstruct which external operations were performed.
-	2.	Correlate external behavior with BEM performance metrics, PoX scores, and bandit statistics.
-	3.	Decide which external tools or backends to modify or optimize.
-	4.	Example Control Flows
+8.2 Use in analysis and replay
 
-9.1 Reading a configuration file
-	1.	A CFG fragment in mid-path wants to read a small configuration file at logical location CONFIG_ROOT / “env.json”.
-	2.	Host runtime has initialized FS_ALIAS[3] = file_id for CONFIG_ROOT and a child FS_NODE for “env.json” with id env_file_id.
-	3.	BEM mid-path routine:
-a) Loads env_file_id into a register.
-b) Allocates a buffer in SHARED at buf_ptr with capacity buf_cap.
-c) Allocates a TOOL_REQ slot q.
-d) Writes:
-TOOL_REQ[q].tool_kind_id = TOOL_FS
-TOOL_REQ[q].op           = FS_READ
-TOOL_REQ[q].flags        = 0
-TOOL_REQ[q].resource_id  = env_file_id
-TOOL_REQ[q].in_ptr       = pointer to a small struct with offset=0, length=buf_cap
-TOOL_REQ[q].in_len       = size of that struct
-TOOL_REQ[q].out_ptr      = buf_ptr
-TOOL_REQ[q].out_cap      = buf_cap
-TOOL_REQ[q].status       = 1
-	4.	External filesystem worker reads the entry, maps env_file_id to an OS path, reads the file, writes content into [buf_ptr, buf_ptr + used], sets status=2.
-	5.	On next mid-path tick, BEM detects status=2, decodes the configuration, updates SHARED, logs the action, and resets status to 0.
+Offline tools MAY:
+	1.	Reconstruct all tool invocations, their resources, and payload hashes.
+	2.	Correlate tool outcomes with reward, regret, PoX scores, patch acceptance, and TEACH evolution.
+	3.	Detect anomalies (unexpected error patterns, latency distributions).
+	4.	Use the combination of TRACE and snapshots to replay or simulate BEM’s behavior with or without reissuing external tool calls.
+	5.	Versioning and Compatibility
 
-9.2 Executing a database query as environment step
-	1.	A task template describes an environment where the next observation depends on the result of a SQL query.
-	2.	BEM mid-path or environment executor constructs a query object and encodes it at query_ptr, length query_len.
-	3.	It allocates a TOOL_REQ slot with:
-TOOL_REQ[q].tool_kind_id = TOOL_DB
-TOOL_REQ[q].op           = DB_EXEC_QUERY
-TOOL_REQ[q].resource_id  = db_conn_id from DB_CONN
-TOOL_REQ[q].in_ptr       = query_ptr
-TOOL_REQ[q].in_len       = query_len
-TOOL_REQ[q].out_ptr      = result_ptr
-TOOL_REQ[q].out_cap      = result_cap
-TOOL_REQ[q].status       = 1
-	4.	DB worker executes the query and writes a compact result summary into [result_ptr, result_ptr + used], sets status=2.
-	5.	Mid-path reads the result, updates environment state in SHARED or STATE, computes reward r_t, and calls BANDIT_UPDATE_STEP.
-	6.	Fast-path remains unaffected by the DB latency; it only processes new observations and rewards when available.
-	7.	Versioning and Backwards Compatibility
+9.1 Version tag
 
-10.1 Version tag
+Tool and Resource Layer v0.0.1 is identified by a version field stored in WORK or a configuration segment, for example:
 
-This document defines Tool and Resource Layer v0.0.1. Implementations should record this version in WORK or configuration metadata and in snapshot descriptors.
+TOOL_LAYER_VERSION = 0x00000001
 
-10.2 Backwards compatibility
+Snapshots SHOULD record this version.
 
-Future versions may:
-	1.	Add new op codes for TOOL_FS and TOOL_DB.
-	2.	Add new tool kinds in TOOL_KIND.
-	3.	Extend TOOL_REQ with additional fields, preferably by repurposing reserved bits or appending fields while maintaining existing layout.
+9.2 Forwards compatibility
+
+Future versions MAY:
+	1.	Add new tool kinds and new TOOL_KIND role_flags.
+	2.	Add new op codes for existing tool kinds (FS, DB, PROVER, ENV, LLM, HINL).
+	3.	Extend TOOL_REQ with additional fields by:
+	1.	Using previously reserved bits/bytes, or
+	2.	Appending new fields after reserved while preserving the layout and meaning of existing fields.
 
 Compatibility rules:
-	1.	A v0.0.1 runtime must ignore unknown tool_kinds and unknown op values, treating them as errors.
-	2.	A v0.0.2 or later runtime should be able to read snapshots created by v0.0.1 if TOOL_REQ, FS_NODE, FS_ALIAS, and DB_CONN layouts are unchanged for existing fields.
+	1.	A v0.0.1 runtime MUST treat unknown tool_kind_id or unknown op codes as errors:
+	1.	Set TOOL_REQ[q].status = 3 (error).
+	2.	Set TOOL_REQ[q].err_code to a generic “unsupported” value.
+	2.	A v0.0.2+ runtime SHOULD be able to load snapshots written by v0.0.1 as long as:
+	1.	FS_NODE, FS_ALIAS, DB_CONN, TOOL_KIND, and TOOL_REQ layouts are unchanged for existing fields.
+	2.	Unused reserved bytes are treated as zero or ignored.
 
-End of BEM Tool and Resource Layer v0.0.1.
+9.3 Relation to Human Feedback Layer
+
+Human Feedback Layer v0.0.1 is defined on top of this Tool and Resource Layer:
+	1.	TOOL_HINL is a tool_kind id with a role_flag indicating “human-feedback gateway”.
+	2.	Human Feedback Layer defines HINL_TASK, HINL_* payloads, and how TOOL_REQ is used to interface with external UI workers.
+	3.	This Tool and Resource Layer ensures that TOOL_HINL can operate with the same bounded fast-path and auditability guarantees as other tools.
+
+End of BEM Tool and Resource Layer v0.0.1 tightened draft.
