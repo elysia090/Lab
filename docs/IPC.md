@@ -51,6 +51,7 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 5.1.1 Creator obtains an fd via memfd_create or shm_open.
 5.1.2 Creator MUST size the object via ftruncate(fd, total_size).
 5.1.3 In v0.0.1, total_size MUST equal header_size + ring_bytes, and ring_offset MUST equal header_size.
+5.1.4 Creator MUST set arena_offset=0 and arena_bytes=0 in v0.0.1.
 5.2 Mapping
 5.2.1 Attach MUST mmap(fd, total_size, PROT_READ|PROT_WRITE, MAP_SHARED).
 5.2.2 Attach MUST validate header fields before any queue operations.
@@ -74,9 +75,11 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 7.1 The header is a fixed binary layout. Implementations MUST treat the mapping as bytes and use fixed offsets below.
 7.2 Implementations MAY additionally define a #[repr(C)] Rust struct for convenience, but MUST verify at build-time or runtime that:
 7.2.1 size_of(header) == 0x180, and
-7.2.2 each field offset matches section 7.3.
+7.2.2 each field offset matches section 7.4.
 7.2.3 If such verification is not present, using a compiler-laid-out struct is non-compliant.
-7.3 All reserved bytes MUST be zero on create and MUST be validated as zero on attach.
+7.3 Reserved bytes and reserved flag bits
+7.3.1 All reserved bytes MUST be zero on create and MUST be validated as zero on attach.
+7.3.2 All reserved flag bits (7..31) MUST be zero on create and MUST be validated as zero on attach.
 7.4 Header offsets (from mapping base)
 7.4.1 0x000 magic: u64
 7.4.2 0x008 version_major: u16
@@ -115,7 +118,7 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 7.5.5 bit 4 CONSUMER_CLOSED
 7.5.6 bit 5 SHUTDOWN
 7.5.7 bit 6 NOT_FULL_ENABLED
-7.5.8 bits 7..31 reserved, MUST be 0.
+7.5.8 bits 7..31 reserved (MUST be 0).
 	8.	Ring layout and slot encoding
 8.1 Ring
 8.1.1 cap = 1 << capacity_pow2.
@@ -149,7 +152,7 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 9.6.2 Implementations MUST use wrapping_add for local head/tail increments.
 9.7 On CORRUPT detection, implementation MUST
 9.7.1 set flags.SHUTDOWN (best-effort),
-9.7.2 wake both doorbells (see 12.10),
+9.7.2 wake both doorbells (see 12.9),
 9.7.3 return Error::CorruptIndices.
 	10.	Memory ordering contract (mandatory)
 10.1 Producer publish rule
@@ -164,17 +167,22 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 10.4 Doorbell ordering
 10.4.1 Doorbell loads/stores MAY be Relaxed.
 10.4.2 Correctness MUST rely on Acquire/Release on head/tail plus user-space rechecks.
-10.5 Flags ordering
-10.5.1 Creator MUST set flags.INITIALIZED using a Release operation after initialization is complete.
-10.5.2 Blocking loops MUST read flags using Acquire when checking for SHUTDOWN/CLOSED to ensure prompt visibility.
+10.5 Flags and initialization ordering
+10.5.1 Creator MUST initialize all header fields, all reserved bytes, the ring bytes, head=0, tail=0, and doorbells=0.
+10.5.2 Creator MUST set or clear NOT_FULL_ENABLED before setting INITIALIZED.
+10.5.3 Creator MUST set flags.INITIALIZED using a Release operation after initialization is complete.
+10.5.4 Blocking loops MUST read flags using Acquire when checking for SHUTDOWN/CLOSED to ensure prompt visibility.
+10.5.5 Attach MUST NOT perform operations until INITIALIZED is observed with Acquire.
 	11.	Ownership and attachment protocol (mandatory)
 11.1 Exactly one Producer may perform push operations.
 11.2 Exactly one Consumer may perform pop operations.
 11.3 Cross-process uniqueness MUST be enforced via flags bits:
-11.3.1 attach_producer MUST set PRODUCER_ATTACHED via compare_exchange on flags.
-11.3.2 attach_consumer MUST set CONSUMER_ATTACHED via compare_exchange on flags.
-11.3.3 If the relevant bit is already set, attach MUST fail with Error::AlreadyAttached.
-11.3.4 v0.0.1 defines no crash-recovery or stealing of attachments. A stale ATTACHED bit requires creating a new queue.
+11.3.1 attach_producer MUST set PRODUCER_ATTACHED via compare_exchange on the whole flags word.
+11.3.2 attach_consumer MUST set CONSUMER_ATTACHED via compare_exchange on the whole flags word.
+11.3.3 CAS success ordering MUST be AcqRel and failure ordering MUST be Acquire.
+11.3.4 CAS MUST preserve all other defined flag bits (it MUST only set the relevant ATTACHED bit).
+11.3.5 If the relevant bit is already set, attach MUST fail with Error::AlreadyAttached.
+11.3.6 v0.0.1 defines no crash-recovery or stealing of attachments. A stale ATTACHED bit requires creating a new queue.
 11.4 Only Producer writes head. Only Consumer writes tail.
 11.5 Only Consumer waits on doorbell_ne.
 11.6 Only Producer waits on doorbell_nf when NOT_FULL_ENABLED.
@@ -189,11 +197,13 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 12.2 Spurious wakeups and EINTR
 12.2.1 Waiter MUST treat any return from futex_wait as a prompt to recheck conditions in a loop.
 12.2.2 EINTR and EAGAIN MUST be handled as spurious returns.
-12.3 Timeout model (normative)
-12.3.1 timeout is an optional relative duration.
-12.3.2 If timeout is None, futex_wait MUST be called with NULL timeout.
-12.3.3 If timeout is Some(d), futex_wait MUST be called with a relative timespec derived from d.
-12.3.4 On ETIMEDOUT, blocking operation MUST return Timeout.
+12.3 Timeout model (normative, fixed-budget)
+12.3.1 timeout is an optional relative duration. If provided, it is a total budget for the entire blocking call.
+12.3.2 Implementations MUST track a deadline and pass the remaining time to each futex_wait.
+12.3.3 Spurious returns MUST NOT extend the total wait time budget.
+12.3.4 If remaining <= 0, blocking operation MUST return Timeout without calling futex_wait.
+12.3.5 If timeout is None, futex_wait MUST be called with NULL timeout.
+12.3.6 On ETIMEDOUT, blocking operation MUST return Timeout.
 12.4 Not-empty wait (consumer)
 12.4.1 Consumer waits only when empty.
 12.4.2 pop_blocking(timeout) loop
@@ -208,8 +218,8 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 12.4.2.7.2 recheck h=head.load(Acquire), t as above, if h!=t then proceed
 12.4.2.8 epoch = doorbell_ne.load(Relaxed).
 12.4.2.9 Recheck empty using fresh h=head.load(Acquire) and t.
-12.4.2.10 If still empty, futex_wait(doorbell_ne, epoch, timeout).
-12.4.2.11 If syscall fails, return Syscall { op=FutexWaitNe, errno }.
+12.4.2.10 If still empty, futex_wait(doorbell_ne, epoch, remaining_timeout).
+12.4.2.11 If syscall fails (errno not EINTR/EAGAIN/ETIMEDOUT), return Syscall { op=FutexWaitNe, errno }.
 12.4.2.12 If timed out, return Timeout.
 12.4.2.13 Loop.
 12.5 Not-empty wake (producer)
@@ -220,9 +230,9 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 12.5.2.3 Publish head.store(Release, next_head).
 12.5.2.4 If was_empty then
 12.5.2.4.1 doorbell_ne.fetch_add(1, Relaxed)
-12.5.2.4.2 futex_wake(doorbell_ne, 1), else if fails return Syscall { op=FutexWakeNe, errno }.
+12.5.2.4.2 futex_wake(doorbell_ne, 1); on failure return Syscall { op=FutexWakeNe, errno }.
 12.6 Not-full wait (producer, optional)
-12.6.1 Enabled iff flags.NOT_FULL_ENABLED is set at init.
+12.6.1 Enabled iff flags.NOT_FULL_ENABLED is set at init and observed after INITIALIZED.
 12.6.2 Producer waits only when full.
 12.6.3 push_blocking(timeout) loop
 12.6.3.1 Read t = tail.load(Acquire).
@@ -233,8 +243,8 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 12.6.3.6 Spin phase: for i in 0..spin_iters recheck full (refresh t with Acquire permitted).
 12.6.3.7 epoch = doorbell_nf.load(Relaxed).
 12.6.3.8 Recheck full using t = tail.load(Acquire).
-12.6.3.9 If still full, futex_wait(doorbell_nf, epoch, timeout).
-12.6.3.10 If syscall fails, return Syscall { op=FutexWaitNf, errno }.
+12.6.3.9 If still full, futex_wait(doorbell_nf, epoch, remaining_timeout).
+12.6.3.10 If syscall fails (errno not EINTR/EAGAIN/ETIMEDOUT), return Syscall { op=FutexWaitNf, errno }.
 12.6.3.11 If timed out, return Timeout.
 12.6.3.12 Loop.
 12.7 Not-full wake (consumer, optional)
@@ -247,17 +257,16 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 12.7.2.5 Publish tail.store(Release, next_tail).
 12.7.2.6 If was_full then
 12.7.2.6.1 doorbell_nf.fetch_add(1, Relaxed)
-12.7.2.6.2 futex_wake(doorbell_nf, 1), else if fails return Syscall { op=FutexWakeNf, errno }.
+12.7.2.6.2 futex_wake(doorbell_nf, 1); on failure return Syscall { op=FutexWakeNf, errno }.
 12.8 Close wake
-12.8.1 close_producer MUST wake doorbell_ne with futex_wake(doorbell_ne, INT_MAX). On failure, return Syscall { op=FutexWakeNe, errno }.
-12.8.2 close_consumer MUST wake doorbell_nf with futex_wake(doorbell_nf, INT_MAX) when NOT_FULL_ENABLED. On failure, return Syscall { op=FutexWakeNf, errno }.
+12.8.1 close_producer MUST wake doorbell_ne with futex_wake(doorbell_ne, INT_MAX).
+12.8.2 close_consumer MUST wake doorbell_nf with futex_wake(doorbell_nf, INT_MAX) when NOT_FULL_ENABLED.
 12.9 Shutdown wake
 12.9.1 shutdown() MUST set flags.SHUTDOWN and wake all potential waiters.
 12.9.2 Exact rule
 12.9.2.1 flags.fetch_or(SHUTDOWN, Release)
 12.9.2.2 doorbell_ne.fetch_add(1, Relaxed); futex_wake(doorbell_ne, INT_MAX)
 12.9.2.3 doorbell_nf.fetch_add(1, Relaxed); futex_wake(doorbell_nf, INT_MAX)
-12.9.3 On futex_wake failure in shutdown, implementation SHOULD still proceed and return Syscall { op=FutexWake*, errno } only if the API is fallible.
 	13.	Ring operations (exact)
 13.1 Producer local state
 13.1.1 Producer MUST keep head_local in private memory.
@@ -270,21 +279,23 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 13.3.1.1 payload.len <= payload_capacity.
 13.3.1.2 Producer uniqueness holds.
 13.3.2 Algorithm
-13.3.2.1 If cached_tail is stale or predicted full, refresh t = tail.load(Acquire), update cached_tail.
-13.3.2.2 If head_local.wrapping_sub(t) == cap, return Full.
-13.3.2.3 slot = ring_base + ((head_local & mask) * slot_stride).
-13.3.2.4 Copy payload into slot+8..slot+8+len.
-13.3.2.5 Write slot_header (len, tag, sflags, reserved=0) at slot.
-13.3.2.6 next_head = head_local.wrapping_add(1).
-13.3.2.7 Publish head.store(Release, next_head).
-13.3.2.8 Apply not-empty wake rule if transition was empty.
-13.3.2.9 head_local = next_head.
+13.3.2.1 Read f = flags.load(Acquire). If f has SHUTDOWN, return Shutdown. If f has CONSUMER_CLOSED, return Closed.
+13.3.2.2 If cached_tail is stale or predicted full, refresh t = tail.load(Acquire), update cached_tail.
+13.3.2.3 If head_local.wrapping_sub(t) == cap, return Full.
+13.3.2.4 slot = ring_base + ((head_local & mask) * slot_stride).
+13.3.2.5 Copy payload into slot+8..slot+8+len.
+13.3.2.6 Write slot_header (len, tag, sflags, reserved=0) at slot.
+13.3.2.7 next_head = head_local.wrapping_add(1).
+13.3.2.8 Publish head.store(Release, next_head).
+13.3.2.9 Apply not-empty wake rule if transition was empty.
+13.3.2.10 head_local = next_head.
 13.4 try_pop(out)
 13.4.1 Preconditions
 13.4.1.1 Consumer uniqueness holds.
 13.4.2 Algorithm
 13.4.2.1 If cached_head is stale or predicted empty, refresh h = head.load(Acquire), update cached_head.
-13.4.2.2 If cached_head == tail_local, return Empty.
+13.4.2.2 If cached_head == tail_local:
+13.4.2.2.1 Read f = flags.load(Acquire). If f has SHUTDOWN, return Shutdown. If f has PRODUCER_CLOSED, return Closed. Else return Empty.
 13.4.2.3 slot = ring_base + ((tail_local & mask) * slot_stride).
 13.4.2.4 Read slot_header.
 13.4.2.5 If len > payload_capacity, return CorruptSlot.
@@ -302,19 +313,23 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 13.5.2 Batch operations MUST preserve the same visibility guarantees as single push/pop.
 13.5.3 Batch operations MUST NOT introduce CAS/RMW on head/tail.
 13.5.4 Batch operations MUST NOT call futex when progress is possible (i.e., they are non-blocking).
-13.5.5 push_batch(k items)
-13.5.5.1 If k==0, return.
-13.5.5.2 Read t0 = tail.load(Acquire); was_empty = (head_local == t0).
-13.5.5.3 Ensure capacity for k items using head_local.wrapping_sub(t0) and cap; if insufficient, return Full (or partial, implementation-defined).
-13.5.5.4 Write k slots.
-13.5.5.5 Publish head once with Release: head.store(Release, head_local + k modulo 2^64).
-13.5.5.6 If was_empty, perform exactly one not-empty wake.
+13.5.5 push_batch(k items) (all-or-nothing)
+13.5.5.1 If k==0, return Ok.
+13.5.5.2 Read f = flags.load(Acquire). If f has SHUTDOWN, return Shutdown. If f has CONSUMER_CLOSED, return Closed.
+13.5.5.3 Read t0 = tail.load(Acquire); was_empty = (head_local == t0).
+13.5.5.4 If head_local.wrapping_sub(t0) + k > cap, return Full and MUST NOT publish any of the k items.
+13.5.5.5 Write k slots.
+13.5.5.6 Publish head once with Release: head.store(Release, head_local + k modulo 2^64).
+13.5.5.7 If was_empty, perform exactly one not-empty wake.
+13.5.5.8 head_local = head_local + k modulo 2^64.
 13.5.6 pop_batch(up to k items)
 13.5.6.1 If k==0, return 0.
-13.5.6.2 If NOT_FULL_ENABLED, read h0 = head.load(Acquire) and compute was_full = (h0.wrapping_sub(tail_local) == cap).
-13.5.6.3 Pop n available items (0..=k).
-13.5.6.4 Publish tail once with Release: tail.store(Release, tail_local + n modulo 2^64).
-13.5.6.5 If was_full and n>0, perform exactly one not-full wake.
+13.5.6.2 If cached_head == tail_local:
+13.5.6.2.1 Read f = flags.load(Acquire). If f has SHUTDOWN, return 0 (and/or expose Shutdown via API). If f has PRODUCER_CLOSED, return 0. Else return 0.
+13.5.6.3 If NOT_FULL_ENABLED, read h0 = head.load(Acquire) and compute was_full = (h0.wrapping_sub(tail_local) == cap).
+13.5.6.4 Pop n available items (0..=k).
+13.5.6.5 Publish tail once with Release: tail.store(Release, tail_local + n modulo 2^64).
+13.5.6.6 If was_full and n>0, perform exactly one not-full wake.
 	14.	Close and shutdown semantics
 14.1 close_producer()
 14.1.1 Sets flags.PRODUCER_CLOSED via fetch_or(AcqRel or Release).
@@ -324,10 +339,14 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 14.2.1 Sets flags.CONSUMER_CLOSED via fetch_or(AcqRel or Release).
 14.2.2 Wakes doorbell_nf with wake-all if NOT_FULL_ENABLED.
 14.2.3 After close_consumer, consumer MUST NOT pop.
-14.3 Blocking return rules
-14.3.1 pop_blocking returns Closed if empty and PRODUCER_CLOSED is set.
-14.3.2 push_blocking returns Closed if full and CONSUMER_CLOSED is set (when NOT_FULL_ENABLED).
-14.3.3 Both return Shutdown if SHUTDOWN is set.
+14.3 Return rules for non-blocking operations
+14.3.1 try_pop MUST return Closed if PRODUCER_CLOSED is set and the queue is empty.
+14.3.2 try_push MUST return Closed if CONSUMER_CLOSED is set.
+14.3.3 Both try_* MUST return Shutdown if SHUTDOWN is set.
+14.4 Blocking return rules
+14.4.1 pop_blocking returns Closed if empty and PRODUCER_CLOSED is set.
+14.4.2 push_blocking returns Closed if full and CONSUMER_CLOSED is set (when NOT_FULL_ENABLED).
+14.4.3 Both return Shutdown if SHUTDOWN is set.
 	15.	Attach and validation (mandatory)
 15.1 Attach MUST validate:
 15.1.1 magic matches.
@@ -361,13 +380,11 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 16.3 Safety (mandatory)
 16.3.1 Public API MUST be memory-safe.
 16.3.2 Internal pointer arithmetic is unsafe but MUST be encapsulated.
-16.3.3 Implementation MUST NOT create Rust references (&T / &mut T) into shared memory for:
-16.3.3.1 slot payload,
-16.3.3.2 slot headers,
-16.3.3.3 header fields or reserved bytes.
-16.3.4 Access to shared memory MUST be via raw pointers plus atomics for atomic fields, and explicit copies for payload.
-16.3.5 Implementations SHOULD avoid forming &AtomicU64/&AtomicI32 directly from shared memory bytes unless alignment and lifetime are guaranteed; prefer fixed-offset pointer casts and atomic operations on those addresses.
-16.3.6 All atomics MUST use core::sync::atomic and the orderings specified in section 10.
+16.3.3 Implementation MUST NOT create Rust references (&T / &mut T) into shared memory for slot payload and slot headers.
+16.3.4 Non-atomic header fields MUST be accessed via explicit loads/stores from raw pointers (copy-in/copy-out).
+16.3.5 Atomic header fields MAY be accessed via properly aligned pointers to Atomic* types at the fixed offsets.
+16.3.6 Access to shared memory MUST use atomics for atomic fields, and explicit copies for payload.
+16.3.7 All atomics MUST use core::sync::atomic and the orderings specified in section 10.
 	17.	Error model (required set)
 17.1 InvalidMagic
 17.2 UnsupportedVersion
@@ -413,12 +430,16 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 19.4.2 SHUTDOWN is set,
 19.4.3 both doorbells are woken.
 19.5 ABI layout test that asserts the fixed offsets in section 7 at runtime (and compile-time where possible).
+19.6 Close and shutdown tests:
+19.6.1 try_pop returns Closed when empty and PRODUCER_CLOSED is set.
+19.6.2 try_push returns Closed when CONSUMER_CLOSED is set.
+19.6.3 try_* return Shutdown when SHUTDOWN is set.
 	20.	Compliance checklist
 20.1 Implements the header ABI exactly (fixed header_size, ring_offset, offsets) and validates on attach.
 20.2 Implements Acquire/Release orderings exactly as in section 10.
-20.3 Uses expected-value futex waits with recheck loops.
+20.3 Uses expected-value futex waits with recheck loops and fixed-budget timeout semantics.
 20.4 Wakes only on empty->non-empty and full->not-full transitions (plus shutdown/close wake-all).
-20.5 Enforces SPSC uniqueness across processes via flags compare_exchange.
+20.5 Enforces SPSC uniqueness across processes via flags compare_exchange with specified orderings.
 20.6 For NOT_FULL_ENABLED, was_full detection MUST use a fresh head.load(Acquire).
 20.7 Creator MUST set arena_offset=0 and arena_bytes=0 in v0.0.1.
 20.8 Creator MUST set all reserved bytes and reserved flag bits to 0; attach MUST reject otherwise.
