@@ -23,9 +23,9 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 2.1.3 The implementation MUST use FUTEX_WAIT and FUTEX_WAKE only (no *_BITSET, no PI, no requeue) in v0.0.1.
 2.2 Architecture
 2.2.1 64-bit only: x86_64 or aarch64.
-2.2.2 All atomics used in this ABI MUST be lock-free on the target.
+2.2.2 All atomics used in this ABI MUST be lock-free on the target. Implementations MUST fail create/attach if this requirement is not met.
 2.3 Cache-line model
-2.3.1 Cache line size is fixed at 64 bytes for ABI layout and padding rules in v0.0.1.
+2.3.1 Cache line size is treated as 64 bytes for ABI layout and padding rules in v0.0.1. Implementations MUST follow the fixed offsets and cache-line separation requirements regardless of the host microarchitecture.
 	3.	Primitive model
 3.1 Data plane
 3.1.1 Producer writes a slot, then publishes head.
@@ -42,7 +42,7 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 4.4 used: head.wrapping_sub(tail).
 4.5 empty: used == 0.
 4.6 full: used == cap.
-4.7 epoch: a monotonically increasing 32-bit integer stored in doorbell words used as futex expected values.
+4.7 epoch: a 32-bit counter value stored in doorbell words, used as futex expected values. epoch is a wrapping counter modulo 2^32 (or modulo 2^31 if treated as i32); only equality comparison is relied upon.
 4.8 Fundamental correctness invariant (required)
 4.8.1 Producer MUST NOT advance head such that used would exceed cap.
 4.8.2 Consumer MUST NOT advance tail beyond head (i.e., MUST NOT consume when empty).
@@ -81,15 +81,15 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 7.3.1 All reserved bytes MUST be zero on create and MUST be validated as zero on attach.
 7.3.2 All reserved flag bits (7..31) MUST be zero on create and MUST be validated as zero on attach.
 7.4 Header offsets (from mapping base)
-7.4.1 0x000 magic: u64
-7.4.2 0x008 version_major: u16
-7.4.3 0x00A version_minor: u16
-7.4.4 0x00C header_size: u32 (MUST be 0x180)
-7.4.5 0x010 total_size: u64
-7.4.6 0x018 ring_offset: u64 (MUST be 0x180)
-7.4.7 0x020 ring_bytes: u64
-7.4.8 0x028 arena_offset: u64 (MUST be 0 in v0.0.1)
-7.4.9 0x030 arena_bytes: u64 (MUST be 0 in v0.0.1)
+7.4.1  0x000 magic: u64
+7.4.2  0x008 version_major: u16
+7.4.3  0x00A version_minor: u16
+7.4.4  0x00C header_size: u32 (MUST be 0x180)
+7.4.5  0x010 total_size: u64
+7.4.6  0x018 ring_offset: u64 (MUST be 0x180)
+7.4.7  0x020 ring_bytes: u64
+7.4.8  0x028 arena_offset: u64 (MUST be 0 in v0.0.1)
+7.4.9  0x030 arena_bytes: u64 (MUST be 0 in v0.0.1)
 7.4.10 0x038 capacity_pow2: u8
 7.4.11 0x039 reserved0: [u8; 7] (MUST be 0)
 7.4.12 0x040 slot_size: u32
@@ -149,7 +149,8 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 9.5 CORRUPT if used > cap.
 9.6 Wrap behavior
 9.6.1 Wrap is permitted. Correctness relies only on invariant 4.8 plus the used>cap corruption rule.
-9.6.2 Implementations MUST use wrapping_add for local head/tail increments.
+9.6.2 Note: With wrapping_sub, a valid state MUST always satisfy used <= cap even across 2^64 wrap, provided invariants 4.8.1-4.8.2 hold. Therefore, used > cap is always CORRUPT and requires no special-case for wrap.
+9.6.3 Implementations MUST use wrapping_add for local head/tail increments.
 9.7 On CORRUPT detection, implementation MUST
 9.7.1 set flags.SHUTDOWN (best-effort),
 9.7.2 wake both doorbells (see 12.9),
@@ -189,11 +190,13 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 11.7 PID fields
 11.7.1 producer_pid and consumer_pid are diagnostic only and MUST NOT be used for correctness.
 11.7.2 Implementations MAY expose them for observability, but MUST NOT implement automatic attachment stealing based on PIDs.
+11.7.3 Implementations SHOULD write producer_pid/consumer_pid (Relaxed) after successfully setting the corresponding ATTACHED bit, and MAY clear them (Relaxed) on close. These fields are best-effort and MAY be stale.
 	12.	Futex protocol (exact)
 12.1 Futex word requirements
 12.1.1 doorbell_ne and doorbell_nf are 32-bit aligned i32 in shared memory.
 12.1.2 Futex WAIT MUST use expected value equal to an epoch read from the doorbell word.
 12.1.3 Waiter MUST read epoch with Relaxed ordering immediately before futex_wait.
+12.1.4 The futex address passed to futex_wait/futex_wake MUST be the address of the shared 32-bit doorbell word in the mapping (the same location read/written by doorbell_* operations).
 12.2 Spurious wakeups and EINTR
 12.2.1 Waiter MUST treat any return from futex_wait as a prompt to recheck conditions in a loop.
 12.2.2 EINTR and EAGAIN MUST be handled as spurious returns.
@@ -204,6 +207,7 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 12.3.4 If remaining <= 0, blocking operation MUST return Timeout without calling futex_wait.
 12.3.5 If timeout is None, futex_wait MUST be called with NULL timeout.
 12.3.6 On ETIMEDOUT, blocking operation MUST return Timeout.
+12.3.7 Implementations SHOULD use a monotonic clock source for deadline tracking (e.g., CLOCK_MONOTONIC).
 12.4 Not-empty wait (consumer)
 12.4.1 Consumer waits only when empty.
 12.4.2 pop_blocking(timeout) loop
@@ -231,6 +235,7 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 12.5.2.4 If was_empty then
 12.5.2.4.1 doorbell_ne.fetch_add(1, Relaxed)
 12.5.2.4.2 futex_wake(doorbell_ne, 1); on failure return Syscall { op=FutexWakeNe, errno }.
+12.5.3 False-positive wakes are permitted. Implementations MAY wake even when the consumer is not actually waiting. Correctness MUST NOT rely on wake precision.
 12.6 Not-full wait (producer, optional)
 12.6.1 Enabled iff flags.NOT_FULL_ENABLED is set at init and observed after INITIALIZED.
 12.6.2 Producer waits only when full.
@@ -267,6 +272,8 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 12.9.2.1 flags.fetch_or(SHUTDOWN, Release)
 12.9.2.2 doorbell_ne.fetch_add(1, Relaxed); futex_wake(doorbell_ne, INT_MAX)
 12.9.2.3 doorbell_nf.fetch_add(1, Relaxed); futex_wake(doorbell_nf, INT_MAX)
+12.10 Futex rationale (non-normative but binding for interpretation)
+12.10.1 If a wake happens before a waiter enters FUTEX_WAIT, the waiter will observe an epoch mismatch and FUTEX_WAIT will return -EAGAIN, which is treated as a spurious return and triggers a user-space recheck. Therefore, epoch increment (Relaxed) followed by FUTEX_WAKE is sufficient; no additional barriers are required beyond head/tail Acquire/Release and the mandated rechecks.
 	13.	Ring operations (exact)
 13.1 Producer local state
 13.1.1 Producer MUST keep head_local in private memory.
@@ -322,21 +329,23 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 13.5.5.6 Publish head once with Release: head.store(Release, head_local + k modulo 2^64).
 13.5.5.7 If was_empty, perform exactly one not-empty wake.
 13.5.5.8 head_local = head_local + k modulo 2^64.
-13.5.6 pop_batch(up to k items)
-13.5.6.1 If k==0, return 0.
+13.5.5.9 Note: In v0.0.1 (SPSC), exactly one wake is sufficient.
+13.5.6 pop_batch(up to k items) (partial success permitted)
+13.5.6.1 If k==0, return 0 (or Ok(0) depending on API).
 13.5.6.2 If cached_head == tail_local:
-13.5.6.2.1 Read f = flags.load(Acquire). If f has SHUTDOWN, return 0 (and/or expose Shutdown via API). If f has PRODUCER_CLOSED, return 0. Else return 0.
+13.5.6.2.1 Read f = flags.load(Acquire). If f has SHUTDOWN, return Shutdown (or Ok(0) with Shutdown status). If f has PRODUCER_CLOSED, return Closed (or 0 with Closed status). Else return 0.
 13.5.6.3 If NOT_FULL_ENABLED, read h0 = head.load(Acquire) and compute was_full = (h0.wrapping_sub(tail_local) == cap).
-13.5.6.4 Pop n available items (0..=k).
+13.5.6.4 Pop n available items (0..=k) using the same slot decoding rules as 13.4 (including CorruptSlot and OutputTooSmall).
 13.5.6.5 Publish tail once with Release: tail.store(Release, tail_local + n modulo 2^64).
 13.5.6.6 If was_full and n>0, perform exactly one not-full wake.
+13.5.6.7 If n>0, pop_batch MUST return n regardless of concurrent flag changes; the caller observes Shutdown/Closed on a subsequent operation if applicable. If n==0, pop_batch MUST follow 13.5.6.2 flag handling.
 	14.	Close and shutdown semantics
 14.1 close_producer()
-14.1.1 Sets flags.PRODUCER_CLOSED via fetch_or(AcqRel or Release).
+14.1.1 Sets flags.PRODUCER_CLOSED via fetch_or(Release).
 14.1.2 Wakes doorbell_ne with wake-all.
 14.1.3 After close_producer, producer MUST NOT push.
 14.2 close_consumer()
-14.2.1 Sets flags.CONSUMER_CLOSED via fetch_or(AcqRel or Release).
+14.2.1 Sets flags.CONSUMER_CLOSED via fetch_or(Release).
 14.2.2 Wakes doorbell_nf with wake-all if NOT_FULL_ENABLED.
 14.2.3 After close_consumer, consumer MUST NOT pop.
 14.3 Return rules for non-blocking operations
@@ -377,12 +386,13 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 16.2.4 try_push, try_pop
 16.2.5 push_blocking, pop_blocking with optional timeout
 16.2.6 shutdown, close_producer, close_consumer
+16.2.7 Optional: push_batch, pop_batch as per 13.5
 16.3 Safety (mandatory)
 16.3.1 Public API MUST be memory-safe.
 16.3.2 Internal pointer arithmetic is unsafe but MUST be encapsulated.
-16.3.3 Implementation MUST NOT create Rust references (&T / &mut T) into shared memory for slot payload and slot headers.
-16.3.4 Non-atomic header fields MUST be accessed via explicit loads/stores from raw pointers (copy-in/copy-out).
-16.3.5 Atomic header fields MAY be accessed via properly aligned pointers to Atomic* types at the fixed offsets.
+16.3.3 Implementation MUST NOT create Rust references (&T / &mut T) to any non-atomic data in shared memory, including slot payload bytes and slot headers. All non-atomic access MUST be performed via raw pointers and explicit copy-in/copy-out.
+16.3.4 Implementation MUST NOT create Rust references (&T / &mut T) that alias shared memory regions which may be concurrently written by another process.
+16.3.5 Atomic header fields MAY be accessed via properly aligned pointers to Atomic* types at the fixed offsets. Forming &Atomic* is permitted only if: (a) the address is correctly aligned for the Atomic type, (b) the reference does not outlive the mapping, and (c) no &T/&mut T is ever formed for overlapping non-atomic regions.
 16.3.6 Access to shared memory MUST use atomics for atomic fields, and explicit copies for payload.
 16.3.7 All atomics MUST use core::sync::atomic and the orderings specified in section 10.
 	17.	Error model (required set)
@@ -434,6 +444,10 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 19.6.1 try_pop returns Closed when empty and PRODUCER_CLOSED is set.
 19.6.2 try_push returns Closed when CONSUMER_CLOSED is set.
 19.6.3 try_* return Shutdown when SHUTDOWN is set.
+19.7 Wrap-around test: head/tail cross u64::MAX and wrap to small values while preserving correctness (used <= cap) and no false CorruptIndices.
+19.8 Alignment test: all atomic fields are correctly aligned, and head/tail/doorbells do not share cache lines per section 6.3.4.
+19.9 False-wake resilience: inject spurious returns (EINTR/EAGAIN) and extra futex_wake calls; correctness must hold with recheck loops.
+19.10 NOT_FULL_ENABLED=false test: doorbell_nf is never waited on or woken (no futex_wait_nf/futex_wake_nf calls), and the memory location is not touched in the producer hot path.
 	20.	Compliance checklist
 20.1 Implements the header ABI exactly (fixed header_size, ring_offset, offsets) and validates on attach.
 20.2 Implements Acquire/Release orderings exactly as in section 10.
@@ -443,5 +457,6 @@ Title: ShmSpscFutexQueue Spec v0.0.1 (Linux, Rust, ASCII)
 20.6 For NOT_FULL_ENABLED, was_full detection MUST use a fresh head.load(Acquire).
 20.7 Creator MUST set arena_offset=0 and arena_bytes=0 in v0.0.1.
 20.8 Creator MUST set all reserved bytes and reserved flag bits to 0; attach MUST reject otherwise.
+20.9 Futex addresses passed to syscalls are the shared 32-bit doorbell words in the mapping.
 
 End of ShmSpscFutexQueue Spec v0.0.1
