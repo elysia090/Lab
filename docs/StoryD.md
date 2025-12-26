@@ -1,6 +1,6 @@
 Title: StoryD Editor Core Spec v0.0.1 (Single Binary, Offline, CAS+DAG, Scene-level, Markdown, Lexo-rank, UTF-8, Pinned UI)
 	0.	Status
-0.1 This document defines the frozen v0.0.1 specification for a self-contained editor server for stories/documents, including the pinned UI profile.
+0.1 This document defines the frozen v0.0.1 specification for a self-contained editor server for stories/documents, including the pinned UI profile and security headers.
 0.2 Target: single host, offline/air-gapped capable, non-realtime collaboration via branches and merge requests (MR).
 0.3 Normative keywords: MUST, MUST NOT, SHOULD, MAY.
 0.4 v0.0.1 compliant implementations MUST implement exactly the behavior and formats specified here.
@@ -38,11 +38,10 @@ Title: StoryD Editor Core Spec v0.0.1 (Single Binary, Offline, CAS+DAG, Scene-le
 
 4.2 Commands (normative interface)
 4.2.1 The executable MUST support:
-	•	serve –data-dir  –listen addr:port￼ [–config ]
-	•	export –data-dir  –out 
-	•	import –data-dir  –in 
-	•	maintenance rebalance –repo <repo_id> –chapter <chapter_id> –ref <ref_name>
-
+	•	serve --data-dir <path> --listen <addr:port> [--config <file>]
+	•	export --data-dir <path> --out <file>
+	•	import --data-dir <path> --in <file>
+	•	maintenance rebalance --repo <repo_id> --chapter <chapter_id> --ref <ref_name>
 4.2.2 Implementations MAY provide additional commands, but MUST NOT change the semantics of the above.
 
 4.3 Offline requirement
@@ -52,22 +51,20 @@ Title: StoryD Editor Core Spec v0.0.1 (Single Binary, Offline, CAS+DAG, Scene-le
 5.1 data-dir contents
 5.1.1 data-dir MUST contain:
 
-	•	/meta.db : SQLite database
-	•	/objects/ : CAS objects (immutable)
-
+	•	<data-dir>/meta.db : SQLite database
+	•	<data-dir>/objects/ : CAS objects (immutable)
 5.1.2 data-dir MAY contain:
-	•	/tmp/
-	•	/logs/ (optional)
+	•	<data-dir>/tmp/
+	•	<data-dir>/logs/ (optional)
 
 5.2 SQLite mode
 5.2.1 SQLite SHOULD use WAL mode for performance and crash safety.
-5.2.2 Export MUST produce a consistent snapshot regardless of WAL usage (see 23.4).
+5.2.2 Export MUST produce a consistent snapshot regardless of WAL usage (see §23.4).
 
 5.3 CAS object file path
 5.3.1 CAS objects MUST be stored under:
-	•	/objects/sha256//
-where  is the first 2 hex chars of the sha256 hex string and  is the full lowercase hex sha256.
-
+	•	<data-dir>/objects/sha256/<aa>/<hex64>
+where <aa> is the first 2 hex chars of <hex64> and <hex64> is the full lowercase sha256 hex string.
 5.3.2 The system MUST NOT overwrite an existing CAS object file.
 5.3.3 The system MUST write objects atomically (write temp then rename).
 5.3.4 The system MUST fsync the final object file and its parent directory, or otherwise ensure durability equivalent to atomic rename on the target platform.
@@ -86,9 +83,9 @@ where  is the first 2 hex chars of the sha256 hex string and  is the full lowerc
 6.2.2 Internally, tree/commit objects store raw sha256 bytes(32); externally they are represented as hex strings.
 
 6.3 Refs
-6.3.1 Branch ref names MUST use refs/heads/.
-6.3.2 Tag ref names MUST use refs/tags/.
-6.3.3  MUST match regex: [A-Za-z0-9._-]{1,64}.
+6.3.1 Branch ref names MUST use refs/heads/<name>.
+6.3.2 Tag ref names MUST use refs/tags/<name>.
+6.3.3 <name> MUST match regex: [A-Za-z0-9._-]{1,64}.
 6.3.4 Ref names MUST be case-sensitive.
 	7.	Text and Internationalization (UTF-8)
 7.1 UTF-8
@@ -104,7 +101,7 @@ where  is the first 2 hex chars of the sha256 hex string and  is the full lowerc
 	•	U+0001..U+001F and U+007F (control characters)
 EXCEPT:
 	•	LF (U+000A) is permitted inside body_md and commit.message.
-
+	•	TAB (U+0009) is permitted inside body_md.
 7.3.2 The server MUST reject bidi control characters:
 	•	U+202A..U+202E and U+2066..U+2069
 
@@ -124,13 +121,16 @@ EXCEPT:
 For any JSON-based stored object (Chapter, Scene, Manifest, Audit details_json, UI manifest):
 8.1.1 Validate UTF-8.
 8.1.2 Normalize to NFC for all text values.
-8.1.3 Reject forbidden characters (7.3) after NFC.
-8.1.4 Normalize newlines to LF for fields where LF normalization applies (body_md, commit.message).
+8.1.3 Reject forbidden characters (§7.3) after NFC.
+8.1.4 Normalize newlines to LF for fields where LF normalization applies:
+
+	•	body_md
+	•	commit.message (CRLF/CR -> LF)
 8.1.5 Apply JSON Canonicalization Scheme (JCS, RFC 8785).
 8.1.6 Hash the resulting canonical UTF-8 bytes with sha256 to obtain blob_id when stored in CAS as a JSON blob.
 
-8.2 JSON blobs (Chapter/Scene/Manifest)
-8.2.1 The server MUST canonicalize JSON blobs prior to storage as defined in 8.1.
+8.2 JSON blobs
+8.2.1 The server MUST canonicalize JSON blobs prior to storage as defined in §8.1.
 8.2.2 The API MUST return canonicalized JSON when returning stored chapter/scene blobs.
 
 8.3 Tree/Commit encoding
@@ -147,11 +147,9 @@ For any JSON-based stored object (Chapter, Scene, Manifest, Audit details_json, 
 9.2.2 Tree CBOR map MUST contain exactly:
 	•	“type” : “tree”
 	•	“entries” : array
-
 9.2.3 Each entry MUST be a CBOR map containing exactly:
-	•	“path” : text (absolute path, ASCII; see 10)
+	•	“path” : text (absolute path, ASCII; see §10)
 	•	“id” : bytes(32) (raw sha256 of the referenced blob)
-
 9.2.4 “entries” MUST be sorted by “path” ascending using bytewise comparison of UTF-8 bytes.
 9.2.5 Duplicate “path” values MUST be rejected (400).
 9.2.6 Tree MUST NOT contain any additional fields in v0.0.1.
@@ -164,10 +162,8 @@ For any JSON-based stored object (Chapter, Scene, Manifest, Audit details_json, 
 	•	“author” : map { “user_id”: text(UUIDv7), “handle”: text|null }
 	•	“message” : text
 	•	“created_at” : int (unix seconds, UTC)
-
 9.3.2 Commit MUST NOT include any additional fields (metadata fields are forbidden in v0.0.1).
-9.3.3 “parents” ordering MUST be deterministic:
-	•	sort by raw bytes(32) ascending.
+9.3.3 “parents” ordering MUST be deterministic: sort by raw bytes(32) ascending.
 9.3.4 Implementations MAY store additional operational metadata in meta.db, but MUST NOT affect commit_id/tree_id derivation.
 
 	10.	Tree Paths (Normative)
@@ -198,7 +194,7 @@ For any JSON-based stored object (Chapter, Scene, Manifest, Audit details_json, 
 
 11.2 Ref updates
 11.2.1 Ref updates MUST be atomic (single SQLite transaction).
-11.2.2 Ref update MUST implement compare-and-swap semantics when a caller supplies an expected_old_commit_id.
+11.2.2 Ref update MUST implement compare-and-swap semantics when a caller supplies expected_old_commit_id.
 11.2.3 If expected_old_commit_id is non-null and does not match the current ref value, the server MUST return 409 conflict.
 	12.	Chapter JSON (Normative)
 12.1 Chapter blob MUST be JCS-canonical JSON with fields:
@@ -210,16 +206,16 @@ For any JSON-based stored object (Chapter, Scene, Manifest, Audit details_json, 
 	•	rating: “general”|“r15”|“r18”
 	•	flags: string[]
 	•	tags: string[]
-	•	order_key: string (lexo-rank, 15)
-
+	•	order_key: string (lexo-rank, §15)
 12.2 chapter_id MUST equal the <chapter_id> in its path.
 12.3 tags and constraints.flags MAY be empty arrays but MUST be present (no null).
+
 	13.	Scene JSON (Normative)
 13.1 Scene blob MUST be JCS-canonical JSON with fields:
 
 	•	scene_id: string(UUIDv7)
 	•	chapter_id: string(UUIDv7)
-	•	order_key: string (lexo-rank, 15)
+	•	order_key: string (lexo-rank, §15)
 	•	title: string|null
 	•	body_md: string (Markdown, UTF-8, LF-normalized)
 	•	tags: string[]
@@ -230,17 +226,17 @@ For any JSON-based stored object (Chapter, Scene, Manifest, Audit details_json, 
 	•	provenance:
 	•	op: “create”|“edit”|“split_from”|“merge_of”|“move”
 	•	parents: array of { scene_id: UUIDv7, commit_id: sha256_hex }
-
 13.2 scene_id MUST equal the <scene_id> in its path.
 13.3 chapter_id MUST equal the <chapter_id> in its path.
 13.4 provenance.parents MAY be empty only when op=“create”.
 13.5 provenance.parents MUST NOT contain duplicates of (scene_id, commit_id).
+
 	14.	Markdown Rules
 14.1 CommonMark
 14.1.1 body_md MUST be rendered as CommonMark-compatible Markdown.
 
 14.2 Newline normalization
-14.2.1 The server MUST normalize stored body_md newlines to LF (\n).
+14.2.1 The server MUST normalize stored body_md newlines to LF (”\n”).
 14.2.2 Incoming CRLF and CR MUST be converted to LF before canonicalization and storage.
 
 14.3 Raw HTML
@@ -249,11 +245,10 @@ For any JSON-based stored object (Chapter, Scene, Manifest, Audit details_json, 
 14.4 XSS and link policy
 14.4.1 Rendered output MUST be XSS-safe.
 14.4.2 The UI MUST NOT execute scripts from rendered content.
-14.4.3 The renderer MUST NOT emit links with forbidden schemes. At minimum, the following schemes MUST be rejected (case-insensitive):
+14.4.3 The renderer MUST NOT emit links with forbidden schemes (case-insensitive):
 	•	javascript:
 	•	data:
 	•	vbscript:
-
 14.4.4 The renderer SHOULD allow only:
 	•	http
 	•	https
@@ -268,22 +263,21 @@ For any JSON-based stored object (Chapter, Scene, Manifest, Audit details_json, 
 
 15.2 Digit mapping (normative)
 15.2.1 The base62 alphabet is:
-	•	DIGITS: 0123456789
-	•	UPPER:  ABCDEFGHIJKLMNOPQRSTUVWXYZ
-	•	LOWER:  abcdefghijklmnopqrstuvwxyz
-15.2.2 digit(‘0’)=0 … digit(‘9’)=9, digit(‘A’)=10 … digit(‘Z’)=35, digit(‘a’)=36 … digit(‘z’)=61.
+	•	DIGITS: “0123456789”
+	•	UPPER:  “ABCDEFGHIJKLMNOPQRSTUVWXYZ”
+	•	LOWER:  “abcdefghijklmnopqrstuvwxyz”
+15.2.2 digit(‘0’)=0 .. digit(‘9’)=9, digit(‘A’)=10 .. digit(‘Z’)=35, digit(‘a’)=36 .. digit(‘z’)=61.
 
 15.3 Sentinels
-15.3.1 left_sentinel  = 0000000000000000
-15.3.2 right_sentinel = zzzzzzzzzzzzzzzz
-15.3.3 default_mid_digit = U (digit 30)
+15.3.1 left_sentinel  = “0000000000000000”
+15.3.2 right_sentinel = “zzzzzzzzzzzzzzzz”
+15.3.3 default_mid_digit = “U” (digit 30)
 
 15.4 Between(left, right) (deterministic, fixed width)
 15.4.1 Inputs:
 	•	left_key MAY be null (means -infinity -> left_sentinel)
 	•	right_key MAY be null (means +infinity -> right_sentinel)
 	•	If both non-null, left_key MUST be < right_key.
-
 15.4.2 Output MUST be a 16-char key strictly between.
 15.4.3 Algorithm:
 Let L = (left_key or left_sentinel), R = (right_key or right_sentinel).
@@ -300,8 +294,7 @@ output[i] = L[i]
 continue
 If the loop completes, there is no space at width 16:
 	•	return error ORDER_KEY_SPACE_EXHAUSTED (HTTP 409).
-
-15.4.4 Between(null, null) MUST return UUUUUUUUUUUUUUUU.
+15.4.4 Between(null, null) MUST return “UUUUUUUUUUUUUUUU”.
 
 15.5 Rebalance(chapter_id) (deterministic)
 15.5.1 Rebalance MUST assign fresh order_key values to all scenes within a chapter and MUST create a new commit.
@@ -326,8 +319,8 @@ order_key = base62_encode_fixed(key_num, width=16, pad=‘0’)
 	•	modified: same scene_id exists in both trees, blob differs
 	•	added: only in head tree
 	•	deleted: only in base tree
-	•	moved: same scene_id exists in both, but chapter_id/path differs
-	•	reordered: same scene_id exists in both, order_key differs
+	•	moved: same scene_id exists in both trees, but chapter_id/path differs
+	•	reordered: same scene_id exists in both trees, order_key differs
 
 16.3 Modified scene diff MUST include:
 	•	body_md line diff (LF normalized)
@@ -353,12 +346,14 @@ order_key = base62_encode_fixed(key_num, width=16, pad=‘0’)
 17.3 merge_base (deterministic)
 17.3.1 merge_base MUST be computed as a common ancestor in the commit DAG.
 17.3.2 If multiple common ancestors exist, the implementation MUST choose deterministically:
-Define dist(X, A) as the length of the shortest parent-edge path from commit X to ancestor A (non-negative integer).
+Define dist(X, A) as the length of the shortest parent-edge path from commit X to ancestor A.
 For each common ancestor A, compute tuple:
-T(A) = (max(dist(base_head, A), dist(head_head, A)),
+T(A) = (
+max(dist(base_head, A), dist(head_head, A)),
 dist(base_head, A) + dist(head_head, A),
-commit_id(A))
-Choose the ancestor A with lexicographically smallest T(A).
+commit_id(A)
+)
+Choose A with lexicographically smallest T(A).
 
 17.4 Conflict detection (scene-level)
 	•	content conflict: body_md changed on both sides since merge_base
@@ -389,15 +384,11 @@ Choose the ancestor A with lexicographically smallest T(A).
 18.3.3 All involved scenes MUST set provenance.op=“split_from”.
 18.3.4 provenance.parents MUST reference A@previous_commit.
 18.3.5 order_keys MUST reflect intended reading order.
-
-18.3.6 Split offsets
-18.3.6.1 split offsets are expressed as byte offsets into the LF-normalized UTF-8 bytes of body_md.
-18.3.6.2 Each byte_offset MUST be:
+18.3.6 Split offsets are expressed as byte offsets into LF-normalized UTF-8 bytes of body_md:
 	•	strictly increasing
 	•	in range 1..len(body_bytes)-1
 	•	on a valid UTF-8 codepoint boundary
-If any offset violates these rules, the server MUST return 400 invalid input.
-
+If violated, server MUST return 400 invalid input.
 18.3.7 If ORDER_KEY_SPACE_EXHAUSTED occurs during split:
 	•	the server MUST perform Rebalance on the target chapter in a new commit, then retry the split within the operation.
 	•	the operation MUST succeed or fail atomically.
@@ -438,7 +429,7 @@ If any offset violates these rules, the server MUST return 400 invalid input.
 	•	429 rate limited
 	•	500 internal error
 
-19.5 Minimal endpoints (required)
+19.5 Endpoints (required)
 Core:
 	•	GET  /health
 	•	POST /auth/login
@@ -470,17 +461,16 @@ Ops:
 	•	POST /repos/{repo_id}/ops/split-scene
 	•	POST /repos/{repo_id}/ops/merge-scenes
 	•	POST /repos/{repo_id}/ops/move-scene
-Admin and ACL (required for pinned UI settings route):
+Admin and ACL:
 	•	GET  /users
 	•	POST /users
 	•	GET  /users/{user_id}
 	•	GET  /repos/{repo_id}/acl
 	•	PUT  /repos/{repo_id}/acl
-Audit and export/import via UI (required):
+Audit and export/import:
 	•	GET  /repos/{repo_id}/audit?after_ts=<int|null>&limit=
 	•	GET  /export?repo_id=<UUIDv7|null>
 	•	POST /import
-
 UI serving:
 	•	GET  /ui/
 	•	GET  /ui/index.html
@@ -488,25 +478,19 @@ UI serving:
 	•	GET  /ui/assets/*
 
 19.6 Endpoint schemas (normative minimum)
-
 19.6.1 GET /health
-Response 200:
-{ “status”: “ok”, “spec_version”: “0.0.1” }
+Response 200: { “status”: “ok”, “spec_version”: “0.0.1” }
 
 19.6.2 POST /auth/login
-Request:
-{ “handle”: string, “password”: string }
-Response 200:
-{ “user_id”: UUIDv7, “handle”: string, “role_summary”: { “is_admin”: bool } }
+Request: { “handle”: string, “password”: string }
+Response 200: { “user_id”: UUIDv7, “handle”: string, “role_summary”: { “is_admin”: bool } }
 Rules:
-	•	On success, the server MUST set the session cookie.
-	•	On failure, the server MUST return 401 with code “AUTH_INVALID”.
+	•	On success, server MUST set session cookie.
+	•	On failure, server MUST return 401 with code “AUTH_INVALID”.
 
 19.6.3 POST /auth/logout
-Response 200:
-{ “ok”: true }
-Rules:
-	•	The server MUST clear the session cookie (set expired).
+Response 200: { “ok”: true }
+Rules: server MUST clear session cookie (expired).
 
 19.6.4 GET /auth/me
 Response 200:
@@ -514,55 +498,41 @@ Response 200:
 Response 401 if no valid session.
 
 19.6.5 POST /repos
-Request:
-{ “name”: string|null }
-Response 201:
-{ “repo_id”: UUIDv7, “default_ref”: “refs/heads/main”, “head_commit_id”: sha256_hex }
+Request: { “name”: string|null }
+Response 201: { “repo_id”: UUIDv7, “default_ref”: “refs/heads/main”, “head_commit_id”: sha256_hex }
 
 19.6.6 POST /repos/{repo_id}/refs
 Request:
 {
-“ref_name”: “refs/heads/” | “refs/tags/”,
+“ref_name”: string,
 “target_commit_id”: sha256_hex,
 “expected_old_commit_id”: sha256_hex|null
 }
-Response 200:
-{ “ref_name”: string, “commit_id”: sha256_hex }
+Rules:
+	•	ref_name MUST match: ^refs/(heads|tags)/[A-Za-z0-9._-]{1,64}$
+Response 200: { “ref_name”: string, “commit_id”: sha256_hex }
 
 19.6.7 POST /blobs
-Request:
-raw bytes, Content-Type required
-Response 201:
-{ “blob_id”: sha256_hex, “size”: int, “content_type”: string }
-
-19.6.7.1 content_type normalization
-The server MUST store a normalized content_type value in meta.db and return the normalized value:
+Request: raw bytes, Content-Type required
+Response 201: { “blob_id”: sha256_hex, “size”: int, “content_type”: string }
+Rules:
+	•	The server MUST store a normalized content_type value in meta.db and return the normalized value:
 	•	trim leading/trailing ASCII whitespace
-	•	reject NUL or control characters (7.3)
-The server MAY additionally lowercase the type/subtype; if it does, it MUST do so deterministically.
+	•	reject NUL or control characters (§7.3)
+	•	the server MAY additionally lowercase type/subtype deterministically
 
 19.6.8 POST /trees
 Request:
-{
-“entries”: [
-{ “path”: string, “blob_id”: sha256_hex }
-]
-}
-Response 201:
-{ “tree_id”: sha256_hex }
+{ “entries”: [ { “path”: string, “blob_id”: sha256_hex } ] }
 Rules:
-	•	path MUST comply with 10.3 and MUST be unique within the request.
+	•	path MUST comply with §10.3 and MUST be unique within request.
+	•	The server MUST reject any blob_id not present in CAS (404, code “CAS_BLOB_NOT_FOUND”).
 	•	The server MUST sort entries by path bytewise before canonical CBOR encoding.
-	•	The server MUST reject duplicate paths.
+Response 201: { “tree_id”: sha256_hex }
 
 19.6.9 GET /trees/{tree_id}
 Response 200:
-{
-“tree_id”: sha256_hex,
-“entries”: [
-{ “path”: string, “blob_id”: sha256_hex }
-]
-}
+{ “tree_id”: sha256_hex, “entries”: [ { “path”: string, “blob_id”: sha256_hex } ] }
 Rules:
 	•	returned list MUST be sorted by path bytewise.
 
@@ -575,41 +545,25 @@ Request:
 “message”: string,
 “created_at”: int
 }
-Response 201:
-{ “commit_id”: sha256_hex }
+Rules:
+	•	tree_id MUST exist (404, code “CAS_TREE_NOT_FOUND”).
+	•	each parent commit_id MUST exist (404, code “CAS_COMMIT_NOT_FOUND”).
+	•	server MUST sort parents by raw bytes ascending before canonical encoding.
+Response 201: { “commit_id”: sha256_hex }
 
 19.6.11 GET /repos/{repo_id}/diff
 Response 200:
 {
 “base”: { “kind”: “ref”|“commit”, “id”: string },
 “head”: { “kind”: “ref”|“commit”, “id”: string },
-“chapters”: {
-“added”: [chapter_id…],
-“deleted”: [chapter_id…],
-“modified”: [chapter_id…],
-“reordered”: [chapter_id…]
-},
-“scenes”: {
-“added”: [scene_id…],
-“deleted”: [scene_id…],
-“modified”: [scene_id…],
-“moved”: [scene_id…],
-“reordered”: [scene_id…]
-}
+“chapters”: { “added”: [UUIDv7…], “deleted”: [UUIDv7…], “modified”: [UUIDv7…], “reordered”: [UUIDv7…] },
+“scenes”: { “added”: [UUIDv7…], “deleted”: [UUIDv7…], “modified”: [UUIDv7…], “moved”: [UUIDv7…], “reordered”: [UUIDv7…] }
 }
 
 19.6.12 POST /repos/{repo_id}/mrs
-Request:
-{ “base_ref”: string, “head_ref”: string }
+Request: { “base_ref”: string, “head_ref”: string }
 Response 201:
-{
-“mr_id”: UUIDv7,
-“repo_id”: UUIDv7,
-“base_ref”: string,
-“head_ref”: string,
-“base_commit_id”: sha256_hex,
-“status”: “open”
-}
+{ “mr_id”: UUIDv7, “repo_id”: UUIDv7, “base_ref”: string, “head_ref”: string, “base_commit_id”: sha256_hex, “status”: “open” }
 
 19.6.13 POST /repos/{repo_id}/mrs/{mr_id}/merge
 Request:
@@ -625,26 +579,19 @@ Request:
 }
 ]
 }
-Response 200:
-{ “merged_commit_id”: sha256_hex }
+Response 200: { “merged_commit_id”: sha256_hex }
 
 19.6.14 POST /repos/{repo_id}/mrs/{mr_id}/cherry-pick
-Request:
-{ “scene_ids”: [UUIDv7…], “target_ref”: string }
-Response 200:
-{ “commit_id”: sha256_hex, “updated_ref”: string }
+Request: { “scene_ids”: [UUIDv7…], “target_ref”: string }
+Response 200: { “commit_id”: sha256_hex, “updated_ref”: string }
 
 19.6.15 POST /repos/{repo_id}/rank/between
-Request:
-{ “left_key”: string|null, “right_key”: string|null }
-Response 200:
-{ “order_key”: string }
+Request: { “left_key”: string|null, “right_key”: string|null }
+Response 200: { “order_key”: string }
 
 19.6.16 POST /repos/{repo_id}/rank/rebalance
-Request:
-{ “chapter_id”: UUIDv7, “ref”: string }
-Response 200:
-{ “commit_id”: sha256_hex, “updated_ref”: string }
+Request: { “chapter_id”: UUIDv7, “ref”: string }
+Response 200: { “commit_id”: sha256_hex, “updated_ref”: string }
 
 19.6.17 POST /repos/{repo_id}/ops/move-scene
 Request:
@@ -655,8 +602,7 @@ Request:
 “left_scene_id”: UUIDv7|null,
 “right_scene_id”: UUIDv7|null
 }
-Response 200:
-{ “commit_id”: sha256_hex, “updated_ref”: string, “new_order_key”: string }
+Response 200: { “commit_id”: sha256_hex, “updated_ref”: string, “new_order_key”: string }
 
 19.6.18 POST /repos/{repo_id}/ops/split-scene
 Request:
@@ -666,8 +612,7 @@ Request:
 “splits”: [ { “byte_offset”: int } ],
 “titles”: [string|null] | null
 }
-Response 200:
-{ “commit_id”: sha256_hex, “updated_ref”: string, “new_scene_ids”: [UUIDv7…] }
+Response 200: { “commit_id”: sha256_hex, “updated_ref”: string, “new_scene_ids”: [UUIDv7…] }
 
 19.6.19 POST /repos/{repo_id}/ops/merge-scenes
 Request:
@@ -679,8 +624,9 @@ Request:
 “right_scene_id”: UUIDv7|null,
 “joiner”: string
 }
-Response 200:
-{ “commit_id”: sha256_hex, “updated_ref”: string, “merged_scene_id”: UUIDv7 }
+Rules:
+	•	joiner MUST be processed under §7 and §8.1 (UTF-8, NFC, forbidden chars).
+Response 200: { “commit_id”: sha256_hex, “updated_ref”: string, “merged_scene_id”: UUIDv7 }
 
 19.6.20 GET /repos/{repo_id}/audit
 Response 200:
@@ -692,52 +638,45 @@ Response 200:
 }
 Rules:
 	•	events MUST be ordered by (ts, event_id) ascending.
-	•	details_json MUST be canonicalized per 8.1 when stored; API returns canonical form.
+	•	details_json MUST be canonicalized per §8.1 when stored; API returns canonical form.
 
 19.6.21 GET /export
 Response 200:
 	•	Content-Type: application/zstd
-	•	Body: tar.zst bytes as defined in 23.1-23.3
+	•	Body: tar.zst bytes as defined in §23
 Rules:
 	•	Access MUST require admin.
 	•	repo_id query parameter MAY be null; if null, export all repos.
-	•	The export bytes MUST correspond exactly to the deterministic archive rules (23).
+	•	export bytes MUST correspond exactly to deterministic archive rules (§23).
 
 19.6.22 POST /import
 Request:
 	•	Content-Type: application/zstd
 	•	Body: tar.zst bytes
-Response 200:
-{ “ok”: true, “imported_repo_ids”: [UUIDv7…] }
+Response 200: { “ok”: true, “imported_repo_ids”: [UUIDv7…] }
 Rules:
 	•	Access MUST require admin.
-	•	Import MUST be atomic per data-dir (23.5.4).
-	•	Import MUST fail on checksum mismatch (23.5.3).
+	•	Import MUST be atomic per data-dir (§23.5.4).
+	•	Import MUST fail on checksum mismatch (§23.5.3).
 
 19.6.23 Users and ACL (minimal)
 19.6.23.1 GET /users (admin)
-Response 200:
-{ “users”: [{ “user_id”: UUIDv7, “handle”: string, “created_at”: int }] }
+Response 200: { “users”: [{ “user_id”: UUIDv7, “handle”: string, “created_at”: int }] }
 
 19.6.23.2 POST /users (admin)
-Request:
-{ “handle”: string, “password”: string }
-Response 201:
-{ “user_id”: UUIDv7 }
+Request: { “handle”: string, “password”: string }
+Response 201: { “user_id”: UUIDv7 }
 
 19.6.23.3 GET /repos/{repo_id}/acl (maintainer+)
-Response 200:
-{ “entries”: [{ “user_id”: UUIDv7, “role”: “admin”|“maintainer”|“writer”|“reader” }] }
+Response 200: { “entries”: [{ “user_id”: UUIDv7, “role”: “admin”|“maintainer”|“writer”|“reader” }] }
 
 19.6.23.4 PUT /repos/{repo_id}/acl (admin or repo maintainer)
-Request:
-{ “entries”: [{ “user_id”: UUIDv7, “role”: “maintainer”|“writer”|“reader” }] }
-Response 200:
-{ “ok”: true }
+Request: { “entries”: [{ “user_id”: UUIDv7, “role”: “maintainer”|“writer”|“reader” }] }
+Response 200: { “ok”: true }
 
 19.7 UI static serving is normative
 19.7.1 The server MUST serve the UI from embedded bytes and MUST NOT require external assets for correctness.
-19.7.2 The server MUST expose /ui/ui_manifest.json as described in 21.7 and MUST serve exactly the bytes listed there.
+19.7.2 The server MUST expose /ui/ui_manifest.json as described in §20.3 and MUST serve exactly the bytes listed there.
 	20.	UI Requirements (Pinned, Normative)
 20.1 SPA embedding
 20.1.1 UI MUST be a static SPA served by the binary.
@@ -748,14 +687,12 @@ Response 200:
 	•	React 18.x
 	•	Vite 5.x
 	•	CodeMirror 6.x
-
 20.2.2 The UI build MUST be fully self-contained:
 	•	MUST NOT require external CDNs, external fonts, or remote scripts/styles.
 	•	MUST NOT require service workers for correctness (MAY use them if fully offline and deterministic).
-
 20.2.3 The binary MUST embed the exact UI build output bytes and serve them verbatim.
 20.2.4 The server MUST serve the UI at path prefix /ui/ and MUST redirect / to /ui/ (HTTP 302) or serve the UI directly at /.
-20.2.5 The server MUST set Content-Type correctly for .html, .js, .css, .json, .svg, .png, .woff2 (if used).
+20.2.5 The server MUST set Content-Type correctly for: .html, .js, .css, .json, .svg, .png, .woff2 (if used).
 20.2.6 The UI MUST be compatible with Chromium-based browsers and Firefox current stable at release time.
 
 20.3 UI asset layout (normative)
@@ -763,7 +700,6 @@ Response 200:
 	•	/ui/index.html
 	•	/ui/assets/
 	•	/ui/ui_manifest.json
-
 20.3.2 ui_manifest.json MUST be a JCS-canonical JSON blob with:
 	•	spec_version: “0.0.1”
 	•	build_ts: int (unix seconds, UTC)
@@ -772,7 +708,6 @@ Rules:
 	•	files MUST list every embedded UI file including index.html and all assets, excluding ui_manifest.json itself.
 	•	files MUST be sorted by path ascending (bytewise ASCII).
 	•	sha256_hex MUST be sha256 over the exact bytes served for that file.
-
 20.3.3 The server MUST expose the same ui_manifest.json bytes at GET /ui/ui_manifest.json.
 
 20.4 UI security headers (required)
@@ -782,12 +717,11 @@ Rules:
 	•	Cross-Origin-Resource-Policy: same-origin
 	•	Cross-Origin-Opener-Policy: same-origin
 	•	Cross-Origin-Embedder-Policy: require-corp
-
 20.4.2 The server MUST send a Content-Security-Policy header for /ui/ that enforces at minimum:
 	•	default-src ‘none’
 	•	script-src ‘self’
 	•	style-src ‘self’
-	•	img-src ‘self’ data:
+	•	img-src ‘self’
 	•	font-src ‘self’
 	•	connect-src ‘self’
 	•	base-uri ‘none’
@@ -808,12 +742,10 @@ Rules:
 20.6.1 Default view MUST read a selected ref (default: refs/heads/main) as:
 	•	chapters sorted by (chapter.order_key, chapter_id)
 	•	scenes sorted by (scene.order_key, scene_id)
-
 20.6.2 Branch/DAG graph views MUST NOT be required for basic reading.
 20.6.3 Branch surfacing rule (anti-noise):
 	•	UI MUST NOT show an unbounded list of forks at any reading point.
-	•	UI SHOULD show at most 3 recommended alternate routes, with the rest behind an explicit more interaction.
-
+	•	UI SHOULD show at most 3 recommended alternate routes, with the rest behind an explicit “more” interaction.
 20.6.4 Scene detail MUST provide a lineage view derived from provenance (split_from / merge_of parents).
 
 20.7 Editor UX (normative)
@@ -831,15 +763,15 @@ Rules:
 	•	tags (string[])
 	•	entities (string[])
 	•	updated_at (unix seconds)
-20.7.3.4 The UI MUST provide a visible indicator when a draft differs from the last committed version.
+20.7.3.4 UI MUST provide a visible indicator when a draft differs from last committed version.
 
 20.7.4 Commit UX
-20.7.4.1 The UI MUST allow an auto-generated default commit message (editable).
-20.7.4.2 The UI MUST NOT force a long message on every commit.
+20.7.4.1 UI MUST allow an auto-generated default commit message (editable).
+20.7.4.2 UI MUST NOT force a long message on every commit.
 20.7.4.3 On commit, the UI MUST:
 	•	validate inputs locally where possible (length limits, forbidden chars)
 	•	send mutation requests with Idempotency-Key
-	•	display the resulting commit_id and updated ref head
+	•	display resulting commit_id and updated ref head
 
 20.8 Diff and MR UX (normative)
 20.8.1 MR list page MUST show: mr_id, base_ref, head_ref, status, updated_at.
@@ -850,24 +782,19 @@ Rules:
 	•	content: base/head/manual
 	•	meta: base/head/manual (manual MAY provide helpers such as union of tags/entities)
 	•	order: base/head/manual (manual allows chapter_id + order_key)
-20.8.4 If many order conflicts exist, UI SHOULD propose merge then rebalance as a one-click follow-up action.
-20.8.5 The UI MUST display a stable line-based diff for body_md (LF normalized).
+20.8.4 If many order conflicts exist, UI SHOULD propose “merge then rebalance” as a one-click follow-up action.
+20.8.5 UI MUST display a stable line-based diff for body_md (LF normalized).
 
 20.9 Network and caching rules (normative)
-20.9.1 The UI MUST communicate with the server using fetch() to same-origin endpoints only.
-20.9.2 The UI MUST NOT store authentication tokens in localStorage.
-20.9.3 The UI MUST support cookie-based sessions (HttpOnly, SameSite=Lax or Strict).
-20.9.4 The server SHOULD set Cache-Control for /ui/assets/* to immutable with a long max-age if filenames are content-hashed by the build.
-20.9.5 The server MUST set Cache-Control: no-store for API responses that contain sensitive data (users, ACL, audit, auth/me).
+20.9.1 UI MUST communicate with the server using fetch() to same-origin endpoints only.
+20.9.2 UI MUST NOT store authentication tokens in localStorage.
+20.9.3 UI MUST support cookie-based sessions (HttpOnly, SameSite=Lax or Strict).
+20.9.4 Server SHOULD set Cache-Control for /ui/assets/* to immutable with long max-age if filenames are content-hashed.
+20.9.5 Server MUST set Cache-Control: no-store for API responses that contain sensitive data (users, ACL, audit, auth/me).
 
 20.10 Accessibility and keyboard (required)
-20.10.1 The UI MUST be usable with keyboard-only navigation for core flows (read, edit, MR resolve, merge).
-20.10.2 The UI MUST include visible focus indicators.
-20.10.3 The UI SHOULD provide shortcuts at minimum:
-	•	next/prev scene in reading view
-	•	open search within chapter
-	•	commit current draft (when authorized)
-
+20.10.1 UI MUST be usable with keyboard-only navigation for core flows (read, edit, MR resolve, merge).
+20.10.2 UI MUST include visible focus indicators.
 	21.	Auth, RBAC, Audit (Server-side)
 21.1 Local auth
 21.1.1 MUST support local authentication (no external IdP required).
@@ -916,7 +843,7 @@ Rules:
 
 23.2 Archive contents (normative)
 23.2.1 Archive MUST contain:
-	•	meta.db (a consistent snapshot, see 23.4)
+	•	meta.db (a consistent snapshot, see §23.4)
 	•	objects/sha256// (all CAS object files)
 	•	manifest.json
 
@@ -932,9 +859,9 @@ Rules:
 
 23.4 SQLite snapshot rule (required)
 23.4.1 Export MUST archive a consistent meta.db snapshot even if SQLite WAL is enabled.
-23.4.2 Implementations MUST satisfy 23.4.1 by one of:
+23.4.2 Implementations MUST satisfy §23.4.1 by one of:
 	•	using SQLite Online Backup API to write a snapshot meta.db file, then archiving that snapshot
-	•	taking an equivalent consistent snapshot mechanism that guarantees transactional consistency
+	•	an equivalent mechanism that guarantees transactional consistency
 23.4.3 Export MUST NOT rely on copying meta.db alone when WAL is enabled unless it also guarantees inclusion or checkpointing of all committed data.
 
 23.5 Import (normative)
@@ -966,6 +893,6 @@ Rules:
 25.7 Split produces new scene_ids; merge-of produces a new scene_id.
 25.8 Rebalance and conflict resolutions always create new commits; no in-place edits of history.
 25.9 Export/import restores identical object IDs and repository state; import fails on checksum mismatch.
-25.10 UI is pinned to the specified toolchain and is served from embedded bytes with minimum security headers and CSP.
+25.10 UI is pinned to specified toolchain and is served from embedded bytes with minimum security headers and CSP.
 
 End of v0.0.1
