@@ -1184,3 +1184,341 @@ C) MANUAL_MERGE (optional; per-scene editor reuse)
 23.4 The UI MUST only connect to same-origin endpoints.
 
 End of v0.0.1 UI Spec (Micro-adjustments v2)
+
+Title: StoryD Editor Core Spec v0.0.1 Addendum A (Micro-adjustments v2, Optional High-level View and Publish APIs, ASCII)
+	0.	Status
+0.1 This addendum defines OPTIONAL endpoints and OPTIONAL behaviors for v0.0.1 servers to reduce UI complexity, improve perceived latency, and make caching and refetch deterministic.
+0.2 This addendum does not change any existing v0.0.1 requirements. Existing endpoints and semantics remain normative.
+0.3 Implementations claiming compliance with “v0.0.1 + Addendum A v2” MUST implement all requirements in this document.
+0.4 Normative keywords: MUST, MUST NOT, SHOULD, MAY.
+	1.	New Terms
+1.1 view_id: either a ref name (refs/heads/* or refs/tags/*) or a commit_id (sha256 hex).
+1.2 head_commit_id: current commit id pointed by a ref at the time of evaluation.
+1.3 change_set: a set of modifications expressed in terms of chapters/scenes, not trees.
+1.4 upsert: insert if missing, otherwise replace the current blob for that object.
+1.5 delete: remove an object from the resulting tree (no tombstones).
+1.6 noop: resulting tree entries are byte-identical to base tree entries.
+1.7 body_mode: “none”|“all”|“selected” controlling which scene bodies are returned by /view.
+1.8 etag: a cache validator derived deterministically from snapshot identity and body selection parameters.
+	2.	Endpoint: GET /repos/{repo_id}/view (Optional, Read-optimized)
+2.1 Purpose
+2.1.1 Return a read-optimized snapshot of chapters and scenes for a given view_id.
+2.1.2 This endpoint is intended for UI reading, selection restore, and predictable sorting.
+2.1.3 This endpoint MAY support cache validation (ETag / If-None-Match) for faster reloads.
+
+2.2 Request
+2.2.1 Method: GET
+2.2.2 Path: /repos/{repo_id}/view
+2.2.3 Query parameters:
+2.2.3.1 id: string (REQUIRED) view_id (ref name or commit_id)
+2.2.3.2 limit_body_bytes: int (OPTIONAL, default 1048576) applies when body_mode != “none”
+2.2.3.3 body_mode: “none”|“all”|“selected” (OPTIONAL, default “none”)
+2.2.3.4 selected_scene_id: UUIDv7 (OPTIONAL, REQUIRED when body_mode=“selected”)
+2.2.3.5 after_chapter: UUIDv7 (OPTIONAL) pagination cursor
+2.2.3.6 after_scene: UUIDv7 (OPTIONAL) pagination cursor (applies within the returned chapter window)
+2.2.4 Cache validation headers (optional but recommended)
+2.2.4.1 The server SHOULD support If-None-Match on this endpoint.
+
+2.2.5 Auth and ACL
+2.2.5.1 Same ACL rules as read endpoints in v0.0.1 MUST apply.
+
+2.3 Response 200 (Normative)
+2.3.1 The response MUST be JSON:
+{
+“repo_id”: “”,
+“etag”: “”,
+“view”: {
+“kind”: “ref” | “commit”,
+“id”: “”,
+“resolved_commit_id”: “<sha256_hex>”
+},
+“chapters”: [
+{
+“chapter_id”: “”,
+“order_key”: “<16 base62>”,
+“title”: “”,
+“summary”: “<string|null>”,
+“constraints”: { “rating”: “general”|“r15”|“r18”, “flags”: [””…] },
+“tags”: [””…]
+}
+],
+“scenes”: [
+{
+“scene_id”: “”,
+“chapter_id”: “”,
+“order_key”: “<16 base62>”,
+“title”: “<string|null>”,
+“tags”: [””…],
+“entities”: [””…],
+“constraints”: { “rating”: “general”|“r15”|“r18”, “flags”: [””…] },
+“provenance”: {
+“op”: “create”|“edit”|“split_from”|“merge_of”|“move”,
+“parents”: [ { “scene_id”: “”, “commit_id”: “<sha256_hex>” } … ]
+},
+“body_md”: “” | null,
+“body_truncated”: true | false
+}
+],
+“next”: {
+“after_chapter”: “<UUIDv7|null>”,
+“after_scene”: “<UUIDv7|null>”
+}
+}
+
+2.3.2 Ordering
+2.3.2.1 chapters MUST be sorted by (order_key, chapter_id) ascending.
+2.3.2.2 scenes MUST be sorted by:
+2.3.2.2.1 chapter order (as in chapters list), then
+2.3.2.2.2 (scene.order_key, scene.scene_id) ascending.
+
+2.3.3 Body inclusion (body_mode)
+2.3.3.1 If body_mode=“none”:
+2.3.3.1.1 body_md MUST be null for all scenes.
+2.3.3.1.2 body_truncated MUST be false for all scenes.
+2.3.3.2 If body_mode=“all”:
+2.3.3.2.1 server MUST return full body_md when its UTF-8 byte length <= limit_body_bytes
+2.3.3.2.2 otherwise server MUST return the first limit_body_bytes bytes truncated at a valid UTF-8 codepoint boundary and set body_truncated=true
+2.3.3.2.3 Truncation MUST be applied after stored LF normalization.
+2.3.3.3 If body_mode=“selected”:
+2.3.3.3.1 selected_scene_id MUST be provided; otherwise server MUST return 400 code “VIEW_SELECTED_SCENE_REQUIRED”.
+2.3.3.3.2 For selected_scene_id, server MUST apply the same truncation rules as 2.3.3.2.
+2.3.3.3.3 For all other scenes, body_md MUST be null and body_truncated MUST be false.
+
+2.3.4 ETag header and derivation
+2.3.4.1 The server MUST emit header: ETag: “”
+2.3.4.2 ETag MUST be a deterministic function of:
+2.3.4.2.1 repo_id
+2.3.4.2.2 resolved_commit_id
+2.3.4.2.3 body_mode
+2.3.4.2.4 limit_body_bytes_decimal
+2.3.4.3 A RECOMMENDED construction is:
+2.3.4.3.1 etag = “W/sha256:” + sha256_hex( repo_id || “\n” || resolved_commit_id || “\n” || body_mode || “\n” || limit_body_bytes_decimal )
+2.3.4.4 The server MAY use another deterministic scheme, but MUST remain stable for identical inputs.
+
+2.3.5 Errors
+2.3.5.1 If id is an unknown ref name, server MUST return 404 with code “REF_NOT_FOUND”.
+2.3.5.2 If id is an unknown commit_id, server MUST return 404 with code “CAS_COMMIT_NOT_FOUND”.
+
+2.4 Response 304 (Optional but recommended)
+2.4.1 If If-None-Match matches the current ETag, server SHOULD return 304 with empty body.
+2.4.2 If responding 304, server MUST still include ETag and SHOULD include Cache-Control.
+2.4.3 304 MUST NOT include a response body.
+	3.	Endpoint: POST /repos/{repo_id}/ops/publish (Optional, High-level)
+3.1 Purpose
+3.1.1 Apply a change_set onto a base ref head, producing a new commit and updating the ref atomically.
+3.1.2 publish MUST perform all canonicalization, hashing, tree construction, and commit creation server-side.
+3.1.3 publish MUST eliminate UI dependence on tree path manipulation.
+3.1.4 chapters_delete/scenes_delete remove the need for exposing raw paths_delete to the UI, reducing foot-guns.
+
+3.2 Request
+3.2.1 Method: POST
+3.2.2 Path: /repos/{repo_id}/ops/publish
+3.2.3 Headers:
+3.2.3.1 Idempotency-Key: REQUIRED.
+3.2.4 Body JSON (Normative):
+{
+“ref”: “refs/heads/”,
+“expected_old_commit_id”: “<sha256_hex|null>”,
+“author”: { “user_id”: “”, “handle”: “<string|null>” },
+“message”: “”,
+“created_at”: ,
+“changes”: {
+“chapters_upsert”: [  … ],
+“chapters_delete”: [ “” … ],
+“scenes_upsert”:   [  … ],
+“scenes_delete”:   [ “” … ]
+},
+“options”: {
+“allow_create_missing_chapter”: true|false,
+“reject_if_noop”: true|false,
+“noop_mode”: “error”|“return_noop”|“allow_commit”,
+“max_new_objects”: <int|null>,
+“max_total_body_bytes”: <int|null>
+}
+}
+
+3.2.5 Defaults and backward compatibility
+3.2.5.1 If options.noop_mode is absent, it MUST default to “return_noop”.
+3.2.5.2 If reject_if_noop=true is present, it MUST be treated as noop_mode=“error”.
+
+3.2.6 Constraints
+3.2.6.1 ref MUST be a refs/heads/* name. Server MUST reject refs/tags/* with 400 code “PUBLISH_REF_INVALID”.
+3.2.6.2 expected_old_commit_id semantics MUST match v0.0.1 ref CAS behavior:
+3.2.6.2.1 If expected_old_commit_id is non-null and does not match current ref head, server MUST return 409 code “REF_CONFLICT” and include current head in details (see 3.6.4.2).
+3.2.6.3 chapters_upsert and scenes_upsert items MUST comply with v0.0.1 canonicalization and schema rules (§7, §8, §12, §13).
+3.2.6.4 chapters_delete and scenes_delete MUST NOT contain duplicates; duplicates MUST be rejected with 400 code “PUBLISH_DUPLICATE_OBJECT”.
+3.2.6.5 If a UUID appears in both upsert and delete for the same type (chapter or scene), server MUST reject with 400 code “PUBLISH_AMBIGUOUS_CHANGE”.
+3.2.6.6 If options.max_total_body_bytes is provided, server MUST reject when the sum of UTF-8 byte lengths of body_md across scenes_upsert exceeds the limit with 413 code “PUBLISH_TOO_LARGE”.
+3.2.6.7 If options.max_new_objects is provided, server MUST reject when the publish would create more than that many new CAS objects (blobs + tree + commit) with 413 code “PUBLISH_TOO_MANY_OBJECTS”.
+
+3.3 Server-side processing (Normative)
+3.3.1 Base selection
+3.3.1.1 Server MUST resolve head_commit_id for the given ref at the start of processing (within the transaction boundary).
+3.3.1.2 If expected_old_commit_id is provided, server MUST apply 3.2.6.2.
+
+3.3.2 Load base tree
+3.3.2.1 Server MUST load the tree referenced by head_commit_id.
+
+3.3.3 Apply change_set deterministically
+3.3.3.1 Chapter upserts
+3.3.3.1.1 For each chapter in chapters_upsert, server MUST canonicalize (NFC, forbidden chars reject, JCS) and store as a JSON blob in CAS.
+3.3.3.1.2 Server MUST set/replace the tree entry for /chapters/<chapter_id>.json to that blob_id.
+3.3.3.2 Scene upserts
+3.3.3.2.1 For each scene in scenes_upsert, server MUST canonicalize and store as a JSON blob in CAS.
+3.3.3.2.2 Server MUST set/replace the tree entry for /chapters/<chapter_id>/scenes/<scene_id>.json to that blob_id.
+3.3.3.3 Scene deletes
+3.3.3.3.1 For each scene_id in scenes_delete, server MUST remove /chapters//scenes/<scene_id>.json if present.
+3.3.3.3.2 If the same scene_id exists under multiple chapters (should not happen under correct operation), server MUST remove all occurrences.
+3.3.3.3.3 Deleting a non-existent scene_id MUST be a no-op.
+3.3.3.4 Chapter deletes
+3.3.3.4.1 For each chapter_id in chapters_delete, server MUST remove /chapters/<chapter_id>.json if present.
+
+3.3.4 Cross-object validation
+3.3.4.1 If options.allow_create_missing_chapter=false:
+3.3.4.1.1 For each scenes_upsert.chapter_id, a chapter blob at /chapters/<chapter_id>.json MUST exist either in base tree (after chapter deletes are applied) or be included in chapters_upsert.
+3.3.4.1.2 Otherwise server MUST return 400 code “CHAPTER_MISSING”.
+3.3.4.2 Layout enforcement
+3.3.4.2.1 Resulting tree MUST contain only:
+3.3.4.2.1.1 /chapters/<chapter_id>.json
+3.3.4.2.1.2 /chapters/<chapter_id>/scenes/<scene_id>.json
+3.3.4.2.2 Any attempt to write outside the v0.0.1 layout MUST be rejected with 500 code “TREE_PATH_INVALID_INTERNAL” (implementation error), since this endpoint does not accept raw paths.
+3.3.4.3 Chapter delete safety
+3.3.4.3.1 If deleting a chapter would leave orphan scene objects under /chapters/<chapter_id>/scenes/* in the resulting tree, server MUST return 409 code “CHAPTER_NOT_EMPTY” unless those scenes are removed by scenes_delete or moved via scenes_upsert to a different chapter_id within the same publish.
+
+3.3.5 No-op handling (Normative)
+3.3.5.1 Define noop as in 1.6.
+3.3.5.2 If noop_mode=“error” and noop occurs:
+3.3.5.2.1 server MUST return 409 code “PUBLISH_NOOP” and include base_commit_id in details.
+3.3.5.3 If noop_mode=“return_noop” and noop occurs:
+3.3.5.3.1 server MUST return 200 and MUST NOT update the ref.
+3.3.5.3.2 server MUST set noop=true in the response.
+3.3.5.3.3 server MUST set commit_id = base_commit_id in the response.
+3.3.5.4 If noop_mode=“allow_commit” and noop occurs:
+3.3.5.4.1 server MAY create a new commit and update the ref.
+3.3.5.4.2 If it does, the commit MUST be deterministic given identical inputs and base head_commit_id.
+
+3.3.6 Changed-ids computation (Normative)
+3.3.6.1 The server MUST compute changed ids relative to the base snapshot (base tree) after applying change_set.
+3.3.6.2 A chapter is “changed” if /chapters/<chapter_id>.json is added, deleted, or points to a different blob_id.
+3.3.6.3 A scene is “changed” if any path /chapters//scenes/<scene_id>.json is added, deleted, points to a different blob_id, or the scene moved chapters (path changed).
+3.3.6.4 The server MUST NOT include body_md bytes in any changed-ids structure.
+
+3.3.7 Tree and commit creation
+3.3.7.1 In all non-noop cases, server MUST create a canonical CBOR Tree object from the resulting entries and store it as a new tree_id.
+3.3.7.2 In all non-noop cases, server MUST create a canonical CBOR Commit object:
+3.3.7.2.1 tree = resulting tree_id
+3.3.7.2.2 parents = [ head_commit_id ]
+3.3.7.2.3 author/message/created_at from request after v0.0.1 canonicalization rules (UTF-8 validity, NFC for text, forbidden chars reject, LF normalization for message)
+3.3.7.3 In all non-noop cases, server MUST update the ref atomically to the new commit_id in the same transaction that validates expected_old_commit_id.
+3.3.7.4 Idempotency MUST apply as in v0.0.1 (§19.2).
+
+3.4 Response 200 (Normative)
+3.4.1 Response JSON MUST be:
+{
+“repo_id”: “”,
+“ref”: “<refs/heads/name>”,
+“base_commit_id”: “<sha256_hex>”,
+“commit_id”: “<sha256_hex>”,
+“tree_id”: “<sha256_hex|null>”,
+“noop”: true|false,
+“head”: { “ref”: “<refs/heads/name>”, “before”: “<sha256_hex>”, “after”: “<sha256_hex>” },
+“changed”: {
+“chapter_ids”: [””…],
+“scene_ids”: [””…]
+},
+“updated_ref”: { “ref_name”: “”, “commit_id”: “<sha256_hex>” } | null,
+“summary”: {
+“chapters_upserted”: ,
+“chapters_deleted”: ,
+“scenes_upserted”: ,
+“scenes_deleted”: ,
+“objects_written”: 
+}
+}
+
+3.4.2 updated_ref rules
+3.4.2.1 If noop=true and noop_mode=“return_noop”, updated_ref MUST be null and head.after MUST equal head.before.
+3.4.2.2 Otherwise updated_ref MUST be present and head.after MUST equal updated_ref.commit_id.
+
+3.4.3 tree_id rules
+3.4.3.1 In non-noop cases, tree_id MUST be non-null.
+3.4.3.2 In noop_mode=“return_noop” cases, tree_id MAY be null.
+
+3.4.4 changed ordering
+3.4.4.1 changed.chapter_ids MUST be sorted lexicographically by UUID string.
+3.4.4.2 changed.scene_ids MUST be sorted lexicographically by UUID string.
+
+3.4.5 objects_written definition
+3.4.5.1 objects_written MUST count newly created CAS objects during this publish:
+3.4.5.1.1 JSON blobs created by upserts
+3.4.5.1.2 the resulting tree object (if created)
+3.4.5.1.3 the resulting commit object (if created)
+3.4.5.2 If an upsert reuses an existing identical blob_id already present in CAS, it MUST NOT increase objects_written.
+
+3.5 Errors (Normative)
+3.5.1 400 invalid input
+3.5.1.1 code “PUBLISH_REF_INVALID”
+3.5.1.2 code “PUBLISH_DUPLICATE_OBJECT”
+3.5.1.3 code “PUBLISH_AMBIGUOUS_CHANGE”
+3.5.1.4 code “CHAPTER_MISSING”
+3.5.1.5 code “VIEW_SELECTED_SCENE_REQUIRED”
+3.5.2 401 unauthenticated, 403 unauthorized as per ACL
+3.5.3 404 not found
+3.5.3.1 code “REF_NOT_FOUND”
+3.5.3.2 code “CAS_COMMIT_NOT_FOUND” (if base commit referenced by ref is missing, indicates corruption)
+3.5.4 409 conflict
+3.5.4.1 code “REF_CONFLICT”
+3.5.4.2 For “REF_CONFLICT”, error details_json SHOULD include:
+{
+“ref”: “<refs/heads/name>”,
+“expected_old_commit_id”: “<sha256_hex|null>”,
+“current_head_commit_id”: “<sha256_hex>”
+}
+3.5.4.3 code “PUBLISH_NOOP” with details_json including:
+{
+“ref”: “<refs/heads/name>”,
+“base_commit_id”: “<sha256_hex>”
+}
+3.5.4.4 code “CHAPTER_NOT_EMPTY” with details_json including:
+{
+“chapter_id”: “”,
+“remaining_scene_count”: 
+}
+3.5.5 413 payload too large
+3.5.5.1 code “PUBLISH_TOO_MANY_OBJECTS”
+3.5.5.2 code “PUBLISH_TOO_LARGE”
+3.5.6 429 rate limited
+3.5.7 500 internal error
+	4.	Audit Requirements for Addendum A (Normative)
+4.1 publish audit
+4.1.1 Server MUST append an audit entry with:
+4.1.1.1 action = “publish”
+4.1.1.2 repo_id = repo_id
+4.1.1.3 details_json MUST include at minimum:
+{
+“ref”: “<refs/heads/name>”,
+“base_commit_id”: “<sha256_hex>”,
+“commit_id”: “<sha256_hex>”,
+“tree_id”: “<sha256_hex|null>”,
+“noop”: true|false,
+“changed”: { “chapter_ids”: [””…], “scene_ids”: [””…] },
+“summary”: {
+“chapters_upserted”: ,
+“chapters_deleted”: ,
+“scenes_upserted”: ,
+“scenes_deleted”: 
+}
+}
+4.1.2 Audit details_json MUST NOT include body_md bytes.
+
+4.2 view audit
+4.2.1 GET /view SHOULD NOT be audited by default.
+4.2.2 If audited, it MUST NOT include body_md bytes.
+	5.	UI Binding Notes (Non-normative)
+5.1 /repos/{repo_id}/view enables fast read route hydration and stable selection restore.
+5.2 ETag + If-None-Match enables instant reloads and route restores without refetching full payloads when unchanged.
+5.3 body_mode=“selected” enables fast navigation lists while keeping only the focused scene body hot.
+5.4 /repos/{repo_id}/ops/publish removes client-side tree/commit construction and eliminates raw path foot-guns.
+5.5 publish changed-ids enables minimal refetch: UI can refresh only affected chapter/scene entries and preserve selection.
+
+End of Addendum A v2
