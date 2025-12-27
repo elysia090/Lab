@@ -896,3 +896,291 @@ Rules:
 25.10 UI is pinned to specified toolchain and is served from embedded bytes with minimum security headers and CSP.
 
 End of v0.0.1
+
+Title: StoryD Pinned UI Spec v0.0.1 (Micro-adjustments v2, React 18, Vite 5, CodeMirror 6, Offline, Latency Budgets)
+	0.	Status
+0.1 This document defines the frozen StoryD UI specification v0.0.1 with additional micro-adjustments (v2) for UX sharpness, failure-mode clarity, and implementability.
+0.2 Normative keywords: MUST, MUST NOT, SHOULD, MAY.
+0.3 v0.0.1 compliant implementations MUST implement exactly the behavior described here.
+0.4 The UI MAY implement additional features and routes, but MUST NOT change the semantics of requirements herein.
+	1.	Scope
+1.1 This spec applies to the browser UI served by the StoryD single-binary server under /ui/.
+1.2 This spec assumes the StoryD Editor Core Spec v0.0.1 server API exists and is authoritative for validation and persistence.
+1.3 This spec defines UI behavior, UI state machines, and latency budgets; it does not redefine server behavior.
+	2.	Goals
+2.1 Provide a time-series reading UX (chapters -> scenes) that is stable, deep-linkable, and fast.
+2.2 Provide a scene-first editor optimized for high-frequency structural work: move, reorder, split, merge.
+2.3 Provide MR and diff UX optimized for per-scene review and deterministic conflict resolution.
+2.4 Run fully offline for correctness (no external dependencies required).
+2.5 Provide pinned performance and latency budgets measurable in the UI runtime.
+	3.	Non-goals
+3.1 Real-time concurrent editing (OT/CRDT).
+3.2 Marketplace, billing, licensing enforcement, DRM.
+3.3 Git wire-protocol UX or DAG visualization as a required workflow.
+	4.	Terminology
+4.1 SPA: single page application served from embedded bytes by the server.
+4.2 Draft: browser-local uncommitted edits persisted in IndexedDB.
+4.3 Baseline: last loaded committed scene state used for dirty detection and conflict flows.
+4.4 Ref: mutable pointer name (refs/heads/, refs/tags/).
+4.5 Head: current commit_id of a ref.
+4.6 MR: merge request between base_ref and head_ref with captured base_commit_id.
+4.7 Optimistic UI: UI updates visible state before server acknowledgement, then reconciles.
+4.8 Latency: measured interval defined in section 19.
+	5.	Global UX Invariants (Normative)
+5.1 Draft vs committed separation
+5.1.1 Draft changes MUST be local-only and MUST NOT be visible to other users until committed.
+5.1.2 Committed state MUST be the server’s ref/commit state and MUST be treated as source of truth.
+5.2 Deterministic navigation
+5.2.1 Deep links MUST be stable across reloads.
+5.2.2 Reload MUST restore route, repo selection, ref selection, and selected scene when present.
+5.3 Stable identity visibility
+5.3.1 The UI MUST provide a discoverable display of:
+5.3.1.1 repo_id
+5.3.1.2 current view id (ref name or commit id)
+5.3.1.3 for edit views, active ref name (refs/heads/*) and its head commit id
+5.4 No remote dependencies
+5.4.1 UI correctness MUST NOT require external networks or CDNs.
+5.5 Keyboard-first viability
+5.5.1 Core flows MUST be usable with keyboard-only navigation: read, edit, commit, MR review, conflict resolution, merge.
+5.6 Error transparency
+5.6.1 All error surfaces MUST show server error code and message when provided.
+5.6.2 The UI MUST show X-Request-Id when present (copyable).
+5.6.3 The UI MUST show the operation name that failed (e.g., COMMIT, MOVE_SCENE, SPLIT_SCENE, MERGE_MR).
+	6.	Pinned Implementation Profile (Normative)
+6.1 The UI MUST be implemented as a static SPA built with TypeScript (ES2022), React 18.x, Vite 5.x, CodeMirror 6.x.
+6.2 The build MUST be self-contained and MUST NOT require external CDNs, fonts, scripts, or styles for correctness.
+6.3 Service workers MUST NOT be required for correctness.
+6.4 The UI MUST communicate with the server via same-origin fetch() only.
+	7.	Routes (Normative)
+7.1 Required routes
+7.1.1 /ui/
+7.1.2 /ui/repos/:repo_id/read?ref=<ref_name_or_commit_id>[&scene=<scene_id>]
+7.1.3 /ui/repos/:repo_id/edit?ref=<ref_name>[&scene=<scene_id>]
+7.1.4 /ui/repos/:repo_id/mrs
+7.1.5 /ui/repos/:repo_id/mrs/:mr_id
+7.1.6 /ui/repos/:repo_id/settings
+7.1.7 /ui/system
+7.2 Optional route
+7.2.1 The UI MAY implement /ui/login as a client-side route.
+7.3 Route constraints
+7.3.1 read route ref MAY be a ref name or commit id.
+7.3.2 edit route ref MUST be a refs/heads/* name; the UI MUST reject editing refs/tags/* or raw commit ids in the editor.
+7.3.3 If edit route is requested with an invalid ref, the UI MUST redirect to read route for the same repo with the same ref string (best-effort) and show an explanatory banner.
+	8.	Screen Model (Normative)
+8.1 Shell layout
+8.1.1 The UI MUST provide a persistent shell with:
+8.1.1.1 top bar: identity, global status, and actions
+8.1.1.2 left panel: chapter list and scene list
+8.1.1.3 main panel: route content
+8.2 Global status indicators (required)
+8.2.1 Network indicator states: ONLINE, OFFLINE, DEGRADED.
+8.2.2 Draft indicator states per selected scene: CLEAN, DIRTY, SAVING, SAVE_FAILED.
+8.2.3 Commit indicator states: IDLE, COMMITTING, COMMIT_FAILED, COMMITTED.
+8.2.4 Indicators MUST be non-blocking and MUST NOT steal focus during typing.
+8.3 Global toasts (required)
+8.3.1 Success toasts MUST be time-limited and non-modal.
+8.3.2 Error toasts MUST remain until dismissed or replaced by a newer error for the same operation.
+8.3.3 Toasts MUST include: operation name, error code, and request id when present.
+	9.	Data Fetching and Caching (Normative)
+9.1 Request cancellation
+9.1.1 All requests MUST be cancellable via AbortController on route changes.
+9.2 GET deduplication and caching
+9.2.1 The UI MUST dedupe in-flight GET requests by (method, url).
+9.2.2 The UI SHOULD maintain a bounded in-memory cache for GET responses with explicit invalidation.
+9.2.3 Cache invalidation MUST occur after successful mutations that affect those resources.
+9.3 Session model
+9.3.1 The UI MUST rely on HttpOnly cookie-based sessions.
+9.3.2 The UI MUST NOT store auth tokens in localStorage.
+9.4 Mutation rules and idempotency
+9.4.1 All mutating requests MUST include Idempotency-Key.
+9.4.2 The UI MUST generate Idempotency-Key per user intent and MUST reuse it across retries.
+9.4.3 The UI MUST implement exponential backoff for retries on network errors and 429 only.
+9.4.4 The UI MUST NOT auto-retry 409 conflicts; it MUST show a conflict flow.
+9.5 Offline behavior
+9.5.1 If network requests fail, the UI MUST remain usable for typing and draft persistence.
+9.5.2 The UI MUST display OFFLINE state and queue only UI-local intents; server mutations MUST NOT be queued implicitly.
+	10.	Selection Addressing (Normative)
+10.1 The UI SHOULD encode selected scene in query parameter scene.
+10.2 Default selection
+10.2.1 If scene is absent, the UI MUST select the first scene of the first chapter if available; otherwise empty state.
+10.3 Missing selection
+10.3.1 If selected scene does not exist at current view id, the UI MUST select nearest in reading order; else first available; else empty state.
+	11.	Draft Model and Persistence (Normative)
+11.1 Draft storage
+11.1.1 Drafts MUST be persisted in IndexedDB.
+11.1.2 Draft key MUST be (repo_id, ref_name, scene_id).
+11.1.3 Draft value MUST include body_md, title, tags, entities, updated_at.
+11.2 Baseline rules
+11.2.1 Baseline MUST be loaded from committed state for the active ref when entering edit route.
+11.2.2 Baseline MUST be updated after a successful commit that includes the scene.
+11.3 Dirty detection
+11.3.1 Dirty MUST be computed as draft != baseline over fields exposed in editor.
+11.3.2 Dirty computation MUST be stable and MUST NOT depend on transient UI formatting.
+11.4 Autosave rules
+11.4.1 Autosave MUST be incremental and MUST NOT block typing latency budgets.
+11.4.2 Autosave trigger MUST be:
+11.4.2.1 after 1000ms of typing inactivity, AND
+11.4.2.2 at least once every 3000ms during continuous typing.
+11.4.3 Autosave MUST also occur on blur and before unload.
+11.4.4 Autosave MUST write only the selected scene draft, not the entire repo.
+11.4.5 On failure, Draft indicator MUST become SAVE_FAILED and the UI MUST retry with exponential backoff without blocking typing.
+11.5 Multi-tab handling (required minimum)
+11.5.1 If multiple tabs edit the same draft key, the UI MUST detect updated_at changes and prompt resolve.
+11.5.2 The UI MUST provide actions: KEEP_LOCAL, TAKE_OTHER, MANUAL_MERGE.
+	12.	Reading UX (Normative)
+12.1 Ordering
+12.1.1 Chapters displayed sorted by (chapter.order_key, chapter_id).
+12.1.2 Scenes displayed sorted by (scene.order_key, scene_id).
+12.2 Reader content
+12.2.1 Reader MUST display title, rendered Markdown body, tags, entities.
+12.2.2 Raw HTML MUST be disabled.
+12.2.3 Links MUST be sanitized; forbidden schemes MUST NOT be emitted.
+12.3 Lineage
+12.3.1 Reader SHOULD provide lineage derived from provenance with navigable parent links when possible.
+	13.	Editor UX (Normative)
+13.1 CodeMirror invariants
+13.1.1 body_md editor MUST be CodeMirror 6.x.
+13.1.2 IME composition MUST NOT be interrupted.
+13.1.3 CodeMirror MUST NOT be re-mounted during normal typing.
+13.2 Focus and navigation rules
+13.2.1 UI MUST NOT steal focus from editor during active typing unless user explicitly navigates.
+13.2.2 After navigation within edit route, UI SHOULD restore focus to editor automatically.
+13.3 Preview
+13.3.1 Preview SHOULD be available and MUST be safe (no script execution).
+13.3.2 Preview render MUST be incremental for large body_md to protect latency budgets.
+	14.	Commit UX (Normative)
+14.1 Commit meaning and labels
+14.1.1 Commit MUST be presented as PUBLISH (shared) and MUST be visually distinct from Draft autosave.
+14.1.2 The UI MUST show the active ref name that will be updated by publish.
+14.2 Publish state machine (required)
+14.2.1 States: IDLE -> PRECHECK -> IN_FLIGHT -> SUCCESS | FAILED | CONFLICT
+14.2.2 PRECHECK MUST validate locally when feasible and MUST compute a minimal change summary.
+14.2.3 IN_FLIGHT MUST keep the editor editable; only publish action may be disabled.
+14.2.4 SUCCESS MUST update baseline for included scenes and MUST clear dirty indicators for those scenes.
+14.2.5 FAILED MUST preserve drafts and allow RETRY with same Idempotency-Key.
+14.2.6 CONFLICT (409) MUST enter the conflict flow in 14.3 and MUST preserve drafts.
+14.3 Conflict flow for publish (409)
+14.3.1 Steps:
+14.3.1.1 fetch latest head for the active ref
+14.3.1.2 show per-scene changes baseline -> new head
+14.3.1.3 offer actions:
+A) REAPPLY_DRAFT (attempt publish again on new head)
+B) DISCARD_DRAFT (restore baseline to new head)
+C) MANUAL_MERGE (optional; per-scene editor reuse)
+14.3.2 The UI MUST require explicit user choice; it MUST NOT auto-resolve conflicts.
+	15.	Scene Operations UX (Normative)
+15.1 Create scene
+15.1.1 Create action MUST navigate to the created scene in edit route with editor focused.
+15.2 Move and reorder
+15.2.1 Move/reorder MUST be available via context menu and keyboard shortcuts.
+15.2.2 Optimistic update MUST be visible within latency budgets.
+15.2.3 On rejection, UI MUST revert and show actionable error.
+15.3 Split
+15.3.1 Split-at-cursor MUST be supported and MUST produce exactly one new scene.
+15.3.2 UI MUST preview which text stays vs moves before confirmation.
+15.3.3 ORDER_KEY_SPACE_EXHAUSTED (409) MUST offer REBALANCE_THEN_RETRY while preserving inputs.
+15.4 Merge scenes
+15.4.1 Merge scenes MUST be available via multi-select.
+15.4.2 Default joiner MUST be “\n\n”.
+15.4.3 On success, UI MUST navigate to merged scene.
+	16.	MR and Diff UX (Normative)
+16.1 MR list
+16.1.1 MUST show mr_id, base_ref, head_ref, status, updated_at.
+16.1.2 MUST allow filter by status.
+16.2 MR detail
+16.2.1 MUST show base_ref, head_ref, base_commit_id, head_commit_id, merge_base_commit_id when available.
+16.2.2 Default view MUST be scene-first grouped change list.
+16.2.3 Body diffs MUST NOT be expanded by default.
+16.3 Per-scene diff view
+16.3.1 Body diff MUST be stable deterministic line diff (LF normalized).
+16.3.2 Structured diffs MUST be shown for: title, tags, entities, constraints, order_key, chapter_id, provenance.
+16.4 MR merge action
+16.4.1 Merge MUST require explicit confirmation.
+16.4.2 Merge UI MUST show mode (ff/merge/squash) and the effect on base_ref.
+16.4.3 On success, UI MUST show merged_commit_id and updated base_ref head and provide link to read.
+	17.	Conflict Resolution UX (Normative)
+17.1 Per-scene independent choices
+17.1.1 For each conflicted scene, UI MUST provide:
+17.1.1.1 content choice: base, head, manual
+17.1.1.2 meta choice: base, head, manual
+17.1.1.3 order choice: base, head, manual
+17.2 Manual tools
+17.2.1 Manual content MUST provide editor and preview.
+17.2.2 Manual meta SHOULD provide union helpers for tags/entities.
+17.2.3 Manual order MUST allow selecting chapter and placement and MUST derive order_key via rank/between.
+17.3 Bulk flows (optional but recommended)
+17.3.1 The UI SHOULD provide BULK_APPLY for order conflicts (apply head or base to all) with per-scene overrides.
+17.4 High-volume order conflicts
+17.4.1 If many order conflicts exist, UI SHOULD propose MERGE_THEN_REBALANCE.
+17.5 Save and submit
+17.5.1 Switching resolution choice MUST update preview within latency budgets.
+17.5.2 Merge submission MUST include all chosen resolutions.
+	18.	Keyboard Shortcuts (Required Minimum)
+18.1 The UI MUST provide shortcuts for:
+18.1.1 next scene, previous scene
+18.1.2 focus scene list, focus editor
+18.1.3 publish action
+18.1.4 open MR list
+18.1.5 in MR detail: next changed scene, previous changed scene
+18.1.6 in conflict resolution: next conflict, previous conflict
+18.2 The UI MUST provide a help surface listing shortcuts.
+18.3 Shortcut design MUST avoid conflicts with IME and common browser/system shortcuts.
+	19.	Performance and Latency Profile (Pinned, Normative)
+19.1 Measurement
+19.1.1 Input timestamp t0 is when the browser receives the input event.
+19.1.2 Output timestamp t1 is the first paint after UI state reflecting the intent is committed.
+19.1.3 Latency = t1 - t0.
+19.1.4 Percentiles p50/p95/p99 computed over rolling window N=200 per session.
+19.2 Main-thread constraints
+19.2.1 During active typing, main-thread tasks > 50ms SHOULD NOT occur.
+19.2.2 If they occur, UI MUST postpone non-critical work to protect typing.
+19.3 Editor latency
+19.3.1 Keystroke-to-paint (body_md): p50 <= 16ms MUST, p95 <= 32ms MUST, p99 <= 50ms SHOULD.
+19.3.2 Autosave MUST NOT cause p95 to exceed 32ms.
+19.4 Navigation latency
+19.4.1 Route change to first usable paint: p95 <= 250ms in-memory MUST, <= 800ms localhost fetch MUST, <= 1500ms LAN SHOULD.
+19.4.2 Scene selection to content visible: p95 <= 100ms in-memory MUST, <= 400ms localhost fetch MUST.
+19.5 Scene operations
+19.5.1 Move/reorder optimistic update visible within 100ms p95 MUST.
+19.5.2 Split/merge pending state within 100ms p95 MUST; success navigation within 1200ms p95 localhost SHOULD, 2000ms p95 LAN SHOULD.
+19.6 Publish/commit
+19.6.1 Publish to committed state p95 <= 1500ms localhost SHOULD, <= 3000ms LAN SHOULD.
+19.7 MR and diff
+19.7.1 MR list first usable paint p95 <= 1000ms localhost MUST, <= 2000ms LAN MUST.
+19.7.2 MR detail change list visible p95 <= 1200ms localhost MUST, <= 2500ms LAN MUST.
+19.7.3 Open single scene diff p95 <= 300ms cached MUST, <= 1200ms compute SHOULD.
+19.8 Conflict resolution
+19.8.1 Switch choice updates preview within 100ms p95 MUST.
+19.8.2 Save local resolution state within 50ms p95 MUST.
+19.9 Instrumentation (offline-safe)
+19.9.1 UI MAY record local performance metrics in memory.
+19.9.2 If persisted, metrics MUST be local-only and erasable.
+19.9.3 Instrumentation MUST NOT violate typing latency budgets.
+	20.	Accessibility (Required)
+20.1 Visible focus indicators MUST exist.
+20.2 Controls MUST be reachable by Tab in logical order.
+20.3 Icon-only controls MUST have accessible labels.
+20.4 The UI MUST not rely on color alone to convey state.
+	21.	Error UX (Normative)
+21.1 Error surfaces
+21.1.1 Fatal route errors MUST render an error screen.
+21.1.2 Non-fatal errors MUST render banners or toasts without blocking typing.
+21.2 Retry rules
+21.2.1 The UI MUST NOT retry mutations without reusing Idempotency-Key.
+21.2.2 Auto-retry is allowed only for network errors and 429, with backoff; never for 409.
+21.3 Error guidance
+21.3.1 413 MUST suggest splitting content.
+21.3.2 429 SHOULD show retry-after if provided.
+21.3.3 500 MUST display request id when present.
+	22.	Asset and Cache Behavior (Normative)
+22.1 /ui/assets/* SHOULD use content-hashed filenames.
+22.2 If content-hashed, assets SHOULD be cacheable as immutable by the server.
+22.3 Sensitive API responses MUST be treated as no-store beyond in-memory cache.
+22.4 UI correctness MUST not depend on cache presence.
+	23.	UI-side Security Expectations (Normative)
+23.1 The UI MUST never execute content-derived scripts.
+23.2 The UI MUST not render raw HTML from Markdown.
+23.3 The UI MUST not store secrets or tokens in localStorage.
+23.4 The UI MUST only connect to same-origin endpoints.
+
+End of v0.0.1 UI Spec (Micro-adjustments v2)
