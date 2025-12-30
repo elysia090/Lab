@@ -1,7 +1,7 @@
 Title: storyed Integrated Spec v0.0.1 (Single Binary, Offline, CAS+DAG, Scene-level, Markdown, Lexo-rank, UTF-8, Pinned UI, Git/Worktree Interop)
 	0.	Status
-0.1 This document defines the frozen v0.0.1 integrated specification for storyed: a self-contained editor server for stories/documents and its pinned browser UI, including security headers, UI behavior, latency budgets, deterministic export/import, deterministic worktree export/import, and Git ecosystem interop via worktrees.
-0.2 Target: single host, offline/air-gapped capable, non-realtime collaboration via branches and merge requests (MR), with optional Git workflows by exporting a deterministic worktree, editing with external tools, and importing with strong safety guards.
+0.1 This document defines the frozen v0.0.1 integrated specification for storyed: a self-contained editor server for stories/documents and its pinned browser UI, including security headers, UI behavior, latency budgets, deterministic export/import, and Git/worktree interop.
+0.2 Target: single host, offline/air-gapped capable, non-realtime collaboration via branches and merge requests (MR), with optional Git ecosystem interop via deterministic worktree export and import.
 0.3 Normative keywords: MUST, MUST NOT, SHOULD, MAY.
 0.4 v0.0.1 compliant implementations MUST implement exactly the ABIs and semantics in this document. No forward-compat behavior is defined in v0.0.1.
 	1.	Goals
@@ -12,9 +12,9 @@ Title: storyed Integrated Spec v0.0.1 (Single Binary, Offline, CAS+DAG, Scene-le
 1.5 Provide deterministic export/import that restores identical object IDs and repository state.
 1.6 Provide pinned UI implementation and security profile such that UI correctness does not depend on external resources.
 1.7 Provide pinned UI behavior, state machines, and measurable latency budgets for core flows.
-1.8 Provide deterministic worktree export/import for external editors and Git workflows with strong safety guards (no silent ref updates).
+1.8 Provide deterministic worktree export/import for Git and external editor interop with strong safety guards (no silent ref updates).
 1.9 Provide predictable conflict handling such that 409 conflicts are normal flows with explicit user choices.
-1.10 Provide operational hardening for the critical path (single-writer guarantees, crash-safe export/import, explicit maintenance).
+1.10 Eliminate operational rituals by standardizing operation receipts, preflight checks, and conflict-resolution operations that remain explicit but one-step.
 	2.	Non-goals
 2.1 Real-time concurrent editing (OT/CRDT).
 2.2 Payments/marketplace/licensing enforcement.
@@ -22,7 +22,7 @@ Title: storyed Integrated Spec v0.0.1 (Single Binary, Offline, CAS+DAG, Scene-le
 2.4 Git wire protocol compatibility.
 2.5 Required DAG visualization as a primary workflow.
 2.6 Background or implicit server-side queueing of mutations while offline (mutations must be explicit).
-2.7 Automatic server-side merge of conflicting committed content without explicit user resolutions.
+2.7 Silent auto-resolution of 409 conflicts.
 	3.	Terminology
 3.1 Repo: repository (one work/document).
 3.2 CAS: content-addressed storage (immutable objects).
@@ -42,8 +42,7 @@ Title: storyed Integrated Spec v0.0.1 (Single Binary, Offline, CAS+DAG, Scene-le
 3.16 Optimistic UI: UI updates visible state before server acknowledgement, then reconciles.
 3.17 Worktree: deterministic filesystem projection of a repo/ref view for external tools (editors/Git).
 3.18 Worktree guard: deterministic metadata file binding a worktree to (repo_id, ref_name, base_commit_id).
-3.19 Data-dir: the server data directory containing meta.db and CAS objects.
-3.20 Data-dir lock: an exclusive runtime lock preventing multiple concurrent writers against the same data-dir.
+3.19 Operation receipt: a deterministic response record for a mutation, describing what changed and which ref/head was affected (see 19.7).
 	4.	Packaging and Runtime (L3)
 4.1 Single executable
 4.1.1 The system MUST be delivered as a single executable file.
@@ -55,8 +54,8 @@ Title: storyed Integrated Spec v0.0.1 (Single Binary, Offline, CAS+DAG, Scene-le
 4.2.1 The executable MUST support:
 4.2.1.1 serve –data-dir  –listen addr:port￼ [–config ]
 4.2.1.2 export –data-dir  –out <file.tar.zst> [–repo <repo_id>|–all]
-4.2.1.3 import –data-dir  –in <file.tar.zst>
-4.2.1.4 maintenance rebalance –data-dir  –repo <repo_id> –chapter <chapter_id> –ref <ref_name>
+4.2.1.3 import –data-dir  –in <file.tar.zst> [–run-verify 0|1]
+4.2.1.4 maintenance rebalance –repo <repo_id> –chapter <chapter_id> –ref <ref_name>
 4.2.1.5 export-md –data-dir  –repo <repo_id> –ref <ref_name|commit_id> –out 
 4.2.1.6 import-md –data-dir  –repo <repo_id> –ref <ref_name> –in  –expected-head <commit_id>
 4.2.1.7 worktree add –data-dir  –repo <repo_id> –ref <ref_name> –path  –expected-head <commit_id|null>
@@ -69,15 +68,6 @@ Title: storyed Integrated Spec v0.0.1 (Single Binary, Offline, CAS+DAG, Scene-le
 4.3 Offline requirement
 4.3.1 The process MUST run offline (no mandatory external network calls).
 4.3.2 UI assets MUST NOT require external CDNs for correctness.
-
-4.4 Data-dir locking (required)
-4.4.1 The server MUST prevent multiple concurrent writer processes from operating on the same data-dir.
-4.4.2 On startup, serve MUST acquire an exclusive data-dir lock before opening meta.db for writes or mutating objects/.
-4.4.3 The lock MUST be held for the lifetime of the process.
-4.4.4 If the lock cannot be acquired, serve MUST fail fast with a clear error and MUST NOT partially start.
-4.4.5 export MAY acquire a shared lock; import/pack/rebalance MUST acquire an exclusive lock.
-4.4.6 Implementations SHOULD use an OS-level advisory lock (e.g., flock) on a lock file under data-dir.
-4.4.7 Lock metadata MAY be written for observability, but MUST NOT affect any content IDs or deterministic exports.
 	5.	Storage Layout
 5.1 data-dir contents
 5.1.1 data-dir MUST contain:
@@ -86,7 +76,6 @@ Title: storyed Integrated Spec v0.0.1 (Single Binary, Offline, CAS+DAG, Scene-le
 5.1.2 data-dir MAY contain:
 5.1.2.1 /tmp/
 5.1.2.2 /logs/ (optional)
-5.1.2.3 /lock (implementation-specific lock file)
 
 5.2 SQLite mode
 5.2.1 SQLite SHOULD use WAL mode for performance and crash safety.
@@ -153,7 +142,7 @@ EXCEPT:
 7.5.1.2 details: { field: , reason: , offset: <int|null> }
 	8.	Canonicalization and Hash Stability (Required)
 8.1 Canonicalization order (normative)
-For any JSON-based stored object (Chapter, Scene, manifest.json, Audit details_json, ui_manifest.json, worktree guard files, order.json):
+For any JSON-based stored object (Chapter, Scene, manifest.json, Audit details_json, ui_manifest.json, worktree guard files, order.json, and operation receipts when persisted):
 8.1.1 Validate UTF-8.
 8.1.2 Normalize to NFC for all text values.
 8.1.3 Reject forbidden characters (7.3) after NFC.
@@ -171,11 +160,7 @@ For any JSON-based stored object (Chapter, Scene, manifest.json, Audit details_j
 8.3.1 Tree and Commit objects MUST be encoded using Canonical CBOR (RFC 8949 canonical rules).
 8.3.2 Canonical CBOR output bytes are hashed for tree_id/commit_id.
 8.3.3 The server MUST be the source of truth for canonicalization.
-
-8.4 Deterministic commit timestamps (v0.0.1)
-8.4.1 In v0.0.1, commit.created_at MUST be 0 for all newly created commits.
-8.4.2 Real event times MUST be recorded in the audit log ts field, not in commit objects.
-8.4.3 Any API field named created_at for commits MUST be ignored by the server (treated as input-only legacy) and the stored commit.created_at MUST be 0.
+8.3.4 commit_id depends on created_at and message; identical trees can yield different commit_id values.
 	9.	CAS Object Formats (Normative)
 9.1 Blob
 9.1.1 Blob is raw bytes stored exactly as written (post-canonicalization if the blob is a canonical JSON blob).
@@ -200,7 +185,7 @@ For any JSON-based stored object (Chapter, Scene, manifest.json, Audit details_j
 9.3.1.3 “parents” : array of bytes(32) (0..n)
 9.3.1.4 “author” : map { “user_id”: text(UUIDv7), “handle”: text|null }
 9.3.1.5 “message” : text
-9.3.1.6 “created_at” : int (unix seconds, UTC), MUST be 0 in v0.0.1
+9.3.1.6 “created_at” : int (unix seconds, UTC)
 9.3.2 Commit MUST NOT include any additional fields (metadata fields are forbidden in v0.0.1).
 9.3.3 “parents” ordering MUST be deterministic: sort by raw bytes(32) ascending.
 9.3.4 Implementations MAY store additional operational metadata in meta.db, but MUST NOT affect commit_id/tree_id derivation.
@@ -344,18 +329,18 @@ For any JSON-based stored object (Chapter, Scene, manifest.json, Audit details_j
 15.4.3 Algorithm:
 15.4.3.1 Let L = (left_key or left_sentinel), R = (right_key or right_sentinel).
 15.4.3.2 For i in 0..15:
-li = digit(L[i])
-ri = digit(R[i])
-If li == ri: output L[i] at i and continue
-If ri - li >= 2:
+	•	li = digit(L[i])
+	•	ri = digit(R[i])
+	•	If li == ri: output L[i] at i and continue
+	•	If ri - li >= 2:
 output[i] = value(floor((li+ri)/2))
 output[i+1..15] = default_mid_digit
 return output
-If ri - li == 1:
+	•	If ri - li == 1:
 output[i] = L[i]
 continue
 15.4.3.3 If the loop completes, there is no space at width 16:
-return error ORDER_KEY_SPACE_EXHAUSTED (HTTP 409).
+	•	return error ORDER_KEY_SPACE_EXHAUSTED (HTTP 409).
 15.4.4 Between(null, null) MUST return “UUUUUUUUUUUUUUUU”.
 
 15.5 Rebalance(chapter_id) (deterministic)
@@ -364,8 +349,8 @@ return error ORDER_KEY_SPACE_EXHAUSTED (HTTP 409).
 15.5.3 Rebalance output algorithm:
 15.5.3.1 Define GAP = 62^4
 15.5.3.2 For scene index i from 1..n:
-key_num = i * GAP
-order_key = base62_encode_fixed(key_num, width=16, pad=“0”)
+	•	key_num = i * GAP
+	•	order_key = base62_encode_fixed(key_num, width=16, pad=“0”)
 15.5.4 base62_encode_fixed encodes most significant digit first; left-pad with “0” to width 16.
 
 15.6 Stable sorting (UI)
@@ -384,6 +369,10 @@ order_key = base62_encode_fixed(key_num, width=16, pad=“0”)
 15.7.5 For any scene in the chapter tree, order.json MUST contain an item for that scene_id.
 15.7.6 order.json MUST NOT reference any scene_id not present in the chapter tree.
 15.7.7 If order.json is missing or invalid for a chapter with scenes, the server MUST return 500 with code “ORDER_CORRUPT” and MUST NOT guess.
+
+15.8 Rebalance pressure (operational signal, non-canonical)
+15.8.1 Implementations SHOULD compute and expose per-chapter “rebalance_pressure” metrics derived from order_key density, without changing canonical objects.
+15.8.2 Metrics MUST NOT affect commit_id/tree_id derivation.
 	16.	Diff Semantics (Scene-first)
 16.1 Diff(base, head) MUST report:
 16.1.1 chapters: added/deleted/modified/reordered
@@ -412,6 +401,10 @@ order_key = base62_encode_fixed(key_num, width=16, pad=“0”)
 16.5.1.1 summary diff: classification only (no body diff)
 16.5.1.2 scene diff: per-scene body and structured diffs
 16.5.2 summary diff MUST be O(number of changed paths) and MUST NOT compute body line diffs.
+
+16.6 Diff caching (implementation freedom)
+16.6.1 Implementations MAY cache diff-scene results keyed by (base_commit_id, head_commit_id, scene_id, base_blob_id, head_blob_id).
+16.6.2 Cache MUST NOT affect determinism of API outputs.
 	17.	Merge Requests (MR)
 17.1 MR record MUST include:
 17.1.1 mr_id, repo_id
@@ -450,11 +443,7 @@ commit_id(A)
 17.6.1 Conflict resolutions MUST result in a new commit (immutable history).
 17.6.2 The merge operation MUST update base_ref to the resulting commit_id atomically.
 17.6.3 MR merge MUST honor expected_head_commit_id (11.3) for base_ref updates.
-
-17.7 Conflict audit events (required)
-17.7.1 On any 409 REF_HEAD_MISMATCH for a mutating operation, the server MUST append an audit event:
-17.7.1.1 action: “CONFLICT_DETECTED”
-17.7.1.2 details_json includes { op: , repo_id, ref, expected, actual }
+17.6.4 MR merge MUST return an operation receipt (19.7).
 	18.	Scene Operations (First-class)
 18.0 Common rules for ops/*
 18.0.1 All ops/* endpoints MUST:
@@ -463,6 +452,7 @@ commit_id(A)
 18.0.1.3 produce exactly one new commit on success
 18.0.1.4 update the target ref to that commit atomically
 18.0.1.5 return previous_head_commit_id for reversible UX (18.0.3)
+18.0.1.6 return an operation receipt (19.7) describing head before/after and changed items
 18.0.2 If an op requires ORDER_KEY_SPACE_EXHAUSTED handling:
 18.0.2.1 the server MUST compute the rebalance result and the requested op result against that rebalance in-memory
 18.0.2.2 the server MUST commit the final state as a single commit
@@ -499,36 +489,43 @@ If violated, server MUST return 400 invalid input.
 18.4.3 N sets provenance.op=“merge_of” with parents referencing each source scene_id and commit_id.
 18.4.4 order.json MUST be updated to place N according to left/right anchors.
 
-18.5 Publish operations (required, optimized)
-18.5.1 The server MUST provide operation endpoints that perform the full publish sequence server-side:
-18.5.1.1 It MUST create canonical scene blobs, create the new tree, create the new commit, and update the ref atomically.
+18.5 Publish-scene operation (required, optimized)
+18.5.1 The server MUST provide an operation endpoint that performs the full publish sequence server-side:
+18.5.1.1 It MUST create the scene blob (canonicalize on server), create the new tree, create the new commit, and update the ref atomically.
 18.5.2 It MUST honor expected_head_commit_id (11.3).
 18.5.3 It MUST produce exactly one new commit on success.
-18.5.4 The server MUST NOT auto-merge committed content; any merge MUST be explicit via MR merge resolutions or explicit manual publish conflict flow.
 
-18.6 Publish single scene
-18.6.1 ops/publish-scene publishes exactly one scene into exactly one new commit.
+18.6 Preflight operations (ritual elimination, no mutation)
+18.6.1 The server MUST provide preflight endpoints that validate inputs and predict effects without mutating state:
+18.6.1.1 preflight-publish (single scene or staged set)
+18.6.1.2 preflight-worktree-import
+18.6.2 Preflight MUST:
+18.6.2.1 validate text rules (7), markdown rules (14), and ordering consistency (15.7) as applicable
+18.6.2.2 validate expected_head_commit_id if provided; on mismatch return 409 REF_HEAD_MISMATCH
+18.6.2.3 return predicted changed_paths and changed_scene_ids deterministically
+18.6.2.4 return stable error codes and locations similar to lint (43.6)
+18.6.3 Preflight MUST NOT create blobs, trees, commits, audit rows, or idempotency records.
 
-18.7 Publish staged set (required)
-18.7.1 The server MUST provide ops/publish-staged to publish a batch of staged scenes into exactly one new commit.
-18.7.2 ops/publish-staged MUST apply scene updates in deterministic order:
-18.7.2.1 sort by (chapter_id, order_key, scene_id) as defined at the base head snapshot supplied by the caller.
-18.7.3 ops/publish-staged MUST be all-or-nothing:
-18.7.3.1 if any scene fails validation, the entire operation MUST fail (no partial commit).
-18.7.4 ops/publish-staged MUST record a single audit event “PUBLISH_STAGED” including counts and changed_scene_ids.
+18.7 Explicit conflict-resolution operations (ritual elimination, still explicit)
+18.7.1 The server MUST provide an explicit “rebase-staged” operation to reduce multi-step 409 handling into a single explicit call.
+18.7.2 rebase-staged MUST:
+18.7.2.1 require base_head_commit_id (the head at stage time)
+18.7.2.2 require expected_head_commit_id (the current head expected by caller)
+18.7.2.3 compute latest head; if mismatch, return 409 REF_HEAD_MISMATCH
+18.7.2.4 apply staged changes in deterministic order (same as batch publish)
+18.7.2.5 on conflict, return 409 with code “REBASE_CONFLICT” and include conflict descriptors per scene/field
+18.7.2.6 on success, create exactly one new commit and update the ref atomically, returning a receipt
+18.7.3 rebase-staged MUST NOT auto-resolve conflicts.
 	19.	API (HTTP) (Normative)
 19.1 OpenAPI
 19.1.1 MUST expose OpenAPI at /openapi.json.
 
 19.2 Common headers
 19.2.1 All responses SHOULD include X-Request-Id.
-19.2.2 All mutating requests (except auth endpoints) SHOULD support Idempotency-Key.
+19.2.2 All mutating requests SHOULD support Idempotency-Key.
 19.2.3 Server MUST store idempotency results for at least 24 hours (configurable), keyed by:
 19.2.3.1 (actor_id, method, path, idempotency_key).
 19.2.4 On idempotent replay, the server MUST return the stored response status code and body, and MUST NOT perform the mutation again.
-19.2.5 Idempotency MUST NOT be applied to:
-19.2.5.1 /auth/login
-19.2.5.2 /auth/logout
 
 19.3 Auth and sessions (required)
 19.3.1 Mutating endpoints MUST require authentication.
@@ -551,68 +548,68 @@ If violated, server MUST return 400 invalid input.
 19.4.2.7 429 rate limited
 19.4.2.8 500 internal error
 
-19.4.3 Additional 409 codes (required for interoperability)
-19.4.3.1 WORKTREE_BASE_MISMATCH: worktree guard base_commit_id does not match the imported base or expected head.
-19.4.3.2 STAGE_BASE_MISMATCH: staged base_head_commit_id does not match the current head when attempting publish-staged.
-
 19.5 Endpoints (required)
 19.5.1 Core:
-GET  /health
-POST /auth/login
-POST /auth/logout
-GET  /auth/me
+	•	GET  /health
+	•	POST /auth/login
+	•	POST /auth/logout
+	•	GET  /auth/me
 19.5.2 Repos and refs:
-POST /repos
-GET  /repos/{repo_id}
-POST /repos/{repo_id}/refs
-GET  /repos/{repo_id}/refs
-GET  /repos/{repo_id}/head?ref=<ref_name>
+	•	POST /repos
+	•	GET  /repos/{repo_id}
+	•	POST /repos/{repo_id}/refs
+	•	GET  /repos/{repo_id}/refs
+	•	GET  /repos/{repo_id}/head?ref=<ref_name>
 19.5.3 CAS:
-POST /blobs
-GET  /blobs/{blob_id}
-POST /trees
-GET  /trees/{tree_id}
+	•	POST /blobs
+	•	GET  /blobs/{blob_id}
+	•	POST /trees
+	•	GET  /trees/{tree_id}
 19.5.4 Commits and diffs:
-POST /repos/{repo_id}/commits
-GET  /repos/{repo_id}/commits/{commit_id}
-GET  /repos/{repo_id}/diff-summary?base=<ref|commit>&head=<ref|commit>
-GET  /repos/{repo_id}/diff-scene?base=<ref|commit>&head=<ref|commit>&scene_id=
+	•	POST /repos/{repo_id}/commits
+	•	GET  /repos/{repo_id}/commits/{commit_id}
+	•	GET  /repos/{repo_id}/diff-summary?base=<ref|commit>&head=<ref|commit>
+	•	GET  /repos/{repo_id}/diff-scene?base=<ref|commit>&head=<ref|commit>&scene_id=
 19.5.5 MR:
-POST /repos/{repo_id}/mrs
-GET  /repos/{repo_id}/mrs
-GET  /repos/{repo_id}/mrs/{mr_id}
-POST /repos/{repo_id}/mrs/{mr_id}/merge
-POST /repos/{repo_id}/mrs/{mr_id}/cherry-pick
+	•	POST /repos/{repo_id}/mrs
+	•	GET  /repos/{repo_id}/mrs
+	•	GET  /repos/{repo_id}/mrs/{mr_id}
+	•	POST /repos/{repo_id}/mrs/{mr_id}/merge
+	•	POST /repos/{repo_id}/mrs/{mr_id}/cherry-pick
 19.5.6 Ops:
-POST /repos/{repo_id}/rank/between
-POST /repos/{repo_id}/rank/rebalance
-POST /repos/{repo_id}/ops/publish-scene
-POST /repos/{repo_id}/ops/publish-staged
-POST /repos/{repo_id}/ops/split-scene
-POST /repos/{repo_id}/ops/merge-scenes
-POST /repos/{repo_id}/ops/move-scene
-POST /repos/{repo_id}/ops/revert-ref
+	•	POST /repos/{repo_id}/rank/between
+	•	POST /repos/{repo_id}/rank/rebalance
+	•	POST /repos/{repo_id}/ops/publish-scene
+	•	POST /repos/{repo_id}/ops/publish-staged
+	•	POST /repos/{repo_id}/ops/preflight-publish
+	•	POST /repos/{repo_id}/ops/rebase-staged
+	•	POST /repos/{repo_id}/ops/split-scene
+	•	POST /repos/{repo_id}/ops/merge-scenes
+	•	POST /repos/{repo_id}/ops/move-scene
+	•	POST /repos/{repo_id}/ops/revert-ref
 19.5.7 Admin and ACL:
-GET  /users
-POST /users
-GET  /users/{user_id}
-GET  /repos/{repo_id}/acl
-PUT  /repos/{repo_id}/acl
+	•	GET  /users
+	•	POST /users
+	•	GET  /users/{user_id}
+	•	GET  /repos/{repo_id}/acl
+	•	PUT  /repos/{repo_id}/acl
 19.5.8 Audit and export/import:
-GET  /repos/{repo_id}/audit?after_ts=<int|null>&limit=
-GET  /export?repo_id=<UUIDv7|null>
-POST /import
+	•	GET  /repos/{repo_id}/audit?after_ts=<int|null>&limit=
+	•	GET  /export?repo_id=<UUIDv7|null>
+	•	POST /import?run_verify=0|1
 19.5.9 Worktree and MD interop:
-GET  /repos/{repo_id}/worktree/export?ref=<ref|commit>
-POST /repos/{repo_id}/worktree/import?ref=&expected_head_commit_id=
+	•	GET  /repos/{repo_id}/worktree/export?ref=<ref|commit>
+	•	POST /repos/{repo_id}/worktree/preflight-import?ref=&expected_head_commit_id=
+	•	POST /repos/{repo_id}/worktree/import?ref=&expected_head_commit_id=
 19.5.10 UI serving:
-GET  /ui/
-GET  /ui/index.html
-GET  /ui/ui_manifest.json
-GET  /ui/assets/*
-19.5.11 Maintenance:
-POST /maintenance/pack
-POST /maintenance/verify
+	•	GET  /ui/
+	•	GET  /ui/index.html
+	•	GET  /ui/ui_manifest.json
+	•	GET  /ui/assets/*
+19.5.11 Maintenance and diagnostics:
+	•	POST /maintenance/pack?dry_run=0|1
+	•	POST /maintenance/verify
+	•	GET  /system/diagnostics
 
 19.6 Endpoint schemas (normative minimum)
 19.6.1 GET /health
@@ -622,8 +619,8 @@ Response 200: { “status”: “ok”, “spec_version”: “0.0.1” }
 Request: { “handle”: string, “password”: string }
 Response 200: { “user_id”: UUIDv7, “handle”: string, “role_summary”: { “is_admin”: bool } }
 Rules:
-On success, server MUST set session cookie.
-On failure, server MUST return 401 with code “AUTH_INVALID”.
+	•	On success, server MUST set session cookie.
+	•	On failure, server MUST return 401 with code “AUTH_INVALID”.
 
 19.6.3 POST /auth/logout
 Response 200: { “ok”: true }
@@ -648,57 +645,54 @@ Response 200: { “ref_name”: string, “commit_id”: sha256_hex }
 Request:
 { “ref_name”: string, “target_commit_id”: sha256_hex, “expected_old_commit_id”: sha256_hex|null }
 Rules:
-ref_name MUST match: ^refs/(heads|tags)/[A-Za-z0-9._-]{1,64}$
+	•	ref_name MUST match: ^refs/(heads|tags)/[A-Za-z0-9._-]{1,64}$
 Response 200: { “ref_name”: string, “commit_id”: sha256_hex }
 
 19.6.9 GET /repos/{repo_id}/refs
 Response 200:
 { “refs”: [{ “ref_name”: string, “commit_id”: sha256_hex, “updated_at”: int }] }
 Rules:
-refs MUST be sorted by ref_name ascending (bytewise ASCII).
+	•	refs MUST be sorted by ref_name ascending (bytewise ASCII).
 
 19.6.10 POST /blobs
 Request: raw bytes, Content-Type required
 Response 201: { “blob_id”: sha256_hex, “size”: int, “content_type”: string }
 Rules:
-The server MUST store a normalized content_type value in meta.db and return it:
-trim leading/trailing ASCII whitespace
-reject NUL or control characters (7.3)
-lowercase type/subtype deterministically
+	•	The server MUST store a normalized content_type value in meta.db and return the normalized value:
+	•	trim leading/trailing ASCII whitespace
+	•	reject NUL or control characters (7.3)
+	•	additionally lowercase type/subtype deterministically
 
 19.6.11 GET /blobs/{blob_id}
 Response 200: raw bytes of the blob
 Rules:
-Content-Type SHOULD be the stored normalized content_type if known; otherwise application/octet-stream.
+	•	Content-Type SHOULD be the stored normalized content_type if known; otherwise application/octet-stream.
 
 19.6.12 POST /trees
 Request: { “entries”: [ { “path”: string, “blob_id”: sha256_hex } ] }
 Rules:
-path MUST comply with 10.3 and MUST be unique within request.
-The server MUST reject any blob_id not present in CAS (404, code “CAS_BLOB_NOT_FOUND”).
-The server MUST sort entries by path bytewise before canonical CBOR encoding.
+	•	path MUST comply with 10.3 and MUST be unique within request.
+	•	The server MUST reject any blob_id not present in CAS (404, code “CAS_BLOB_NOT_FOUND”).
+	•	The server MUST sort entries by path bytewise before canonical CBOR encoding.
 Response 201: { “tree_id”: sha256_hex }
 
 19.6.13 GET /trees/{tree_id}
 Response 200: { “tree_id”: sha256_hex, “entries”: [ { “path”: string, “blob_id”: sha256_hex } ] }
 Rules:
-returned list MUST be sorted by path bytewise.
+	•	returned list MUST be sorted by path bytewise.
 
 19.6.14 POST /repos/{repo_id}/commits
 Request:
-{ “tree_id”: sha256_hex, “parents”: [sha256_hex…], “author”: { “user_id”: UUIDv7, “handle”: string|null }, “message”: string, “created_at”: int|null }
+{ “tree_id”: sha256_hex, “parents”: [sha256_hex…], “author”: { “user_id”: UUIDv7, “handle”: string|null }, “message”: string, “created_at”: int }
 Rules:
-tree_id MUST exist (404, code “CAS_TREE_NOT_FOUND”).
-each parent commit_id MUST exist (404, code “CAS_COMMIT_NOT_FOUND”).
-server MUST sort parents by raw bytes ascending before canonical encoding.
-server MUST ignore created_at and store created_at=0 (8.4).
+	•	tree_id MUST exist (404, code “CAS_TREE_NOT_FOUND”).
+	•	each parent commit_id MUST exist (404, code “CAS_COMMIT_NOT_FOUND”).
+	•	server MUST sort parents by raw bytes ascending before canonical encoding.
 Response 201: { “commit_id”: sha256_hex }
 
 19.6.15 GET /repos/{repo_id}/commits/{commit_id}
 Response 200:
 { “commit_id”: sha256_hex, “tree_id”: sha256_hex, “parents”: [sha256_hex…], “author”: { “user_id”: UUIDv7, “handle”: string|null }, “message”: string, “created_at”: int }
-Rules:
-created_at MUST be 0 in v0.0.1.
 
 19.6.16 GET /repos/{repo_id}/diff-summary
 Response 200:
@@ -741,12 +735,12 @@ Request:
 ]
 }
 Rules:
-expected_base_head_commit_id, if provided, MUST be enforced as expected_head_commit_id against base_ref (11.3).
-Response 200: { “merged_commit_id”: sha256_hex }
+	•	expected_base_head_commit_id, if provided, MUST be enforced as expected_head_commit_id against base_ref (11.3).
+Response 200: { “merged_commit_id”: sha256_hex, “receipt”: object(19.7) }
 
 19.6.20 POST /repos/{repo_id}/mrs/{mr_id}/cherry-pick
 Request: { “scene_ids”: [UUIDv7…], “target_ref”: string, “expected_head_commit_id”: sha256_hex|null }
-Response 200: { “commit_id”: sha256_hex, “updated_ref”: string, “previous_head_commit_id”: sha256_hex }
+Response 200: { “commit_id”: sha256_hex, “updated_ref”: string, “previous_head_commit_id”: sha256_hex, “receipt”: object(19.7) }
 
 19.6.21 POST /repos/{repo_id}/rank/between
 Request: { “left_key”: string|null, “right_key”: string|null }
@@ -754,7 +748,7 @@ Response 200: { “order_key”: string }
 
 19.6.22 POST /repos/{repo_id}/rank/rebalance
 Request: { “chapter_id”: UUIDv7, “ref”: string, “expected_head_commit_id”: sha256_hex|null }
-Response 200: { “commit_id”: sha256_hex, “updated_ref”: string, “previous_head_commit_id”: sha256_hex }
+Response 200: { “commit_id”: sha256_hex, “updated_ref”: string, “previous_head_commit_id”: sha256_hex, “receipt”: object(19.7) }
 
 19.6.23 POST /repos/{repo_id}/ops/publish-scene
 Request:
@@ -773,9 +767,9 @@ Request:
 “message”: string|null
 }
 Rules:
-fields MUST be validated per 7 and 14; server is source of truth for canonicalization (8.1).
-server MUST update provenance.op=“edit” and include parent (scene_id, commit_id_of_previous_head_used_for_parent) deterministically.
-Response 200: { “commit_id”: sha256_hex, “updated_ref”: string, “previous_head_commit_id”: sha256_hex }
+	•	fields MUST be validated per 7 and 14; server is source of truth for canonicalization (8.1).
+	•	server MUST update provenance.op=“edit” and include parent (scene_id, head_before) deterministically.
+Response 200: { “commit_id”: sha256_hex, “updated_ref”: string, “previous_head_commit_id”: sha256_hex, “receipt”: object(19.7) }
 
 19.6.24 POST /repos/{repo_id}/ops/publish-staged
 Request:
@@ -783,29 +777,49 @@ Request:
 “ref”: string,
 “expected_head_commit_id”: sha256_hex|null,
 “base_head_commit_id”: sha256_hex,
-“staged”: [
-{
-“scene_id”: UUIDv7,
-“chapter_id”: UUIDv7,
-“fields”: {
-“title”: string|null,
-“body_md”: string,
-“tags”: [string…],
-“entities”: [string…],
-“constraints”: { “rating”: string, “flags”: [string…] }
-}
-}
-],
-“message”: string|null
+“items”: [
+{ “scene_id”: UUIDv7, “chapter_id”: UUIDv7, “fields”: object, “message”: string|null }
+]
 }
 Rules:
-base_head_commit_id MUST equal expected_head_commit_id when expected_head_commit_id is provided; otherwise server MUST treat base_head_commit_id as required expected head and enforce it.
-If base_head_commit_id does not match current head, return 409 STAGE_BASE_MISMATCH with details { ref, base_head, actual_head }.
-server MUST apply updates in deterministic order sorted by (chapter_id, order_key, scene_id) from the base head snapshot.
-server MUST create exactly one new commit and update ref atomically on success.
-Response 200: { “commit_id”: sha256_hex, “updated_ref”: string, “previous_head_commit_id”: sha256_hex }
+	•	items MUST be applied in deterministic order:
+	•	sort by (chapter_id, order_key, scene_id) from the base_head_commit_id snapshot.
+	•	server MUST reject if base_head_commit_id does not match the committed state used to derive the order (409, code “STAGE_BASE_MISMATCH”).
+Response 200: { “commit_id”: sha256_hex, “updated_ref”: string, “previous_head_commit_id”: sha256_hex, “receipt”: object(19.7) }
 
-19.6.25 POST /repos/{repo_id}/ops/move-scene
+19.6.25 POST /repos/{repo_id}/ops/preflight-publish
+Request:
+{
+“ref”: string,
+“expected_head_commit_id”: sha256_hex|null,
+“mode”: “scene”|“staged”,
+“scene”?: { “scene_id”: UUIDv7, “chapter_id”: UUIDv7, “fields”: object },
+“staged”?: { “base_head_commit_id”: sha256_hex, “items”: [object…] }
+}
+Response 200:
+{
+“ok”: bool,
+“errors”: [ { “code”: string, “path”?: string, “field”?: string, “message”: string, “offset”: int|null } ],
+“predicted”: {
+“changed_paths”: [string…],
+“changed_scene_ids”: [UUIDv7…]
+}
+}
+Rules:
+	•	MUST NOT mutate any persistent state.
+
+19.6.26 POST /repos/{repo_id}/ops/rebase-staged
+Request:
+{
+“ref”: string,
+“expected_head_commit_id”: sha256_hex,
+“base_head_commit_id”: sha256_hex,
+“items”: [object…]
+}
+Response 200: { “commit_id”: sha256_hex, “updated_ref”: string, “previous_head_commit_id”: sha256_hex, “receipt”: object(19.7) }
+Response 409: code “REBASE_CONFLICT” with details describing per-scene conflict types.
+
+19.6.27 POST /repos/{repo_id}/ops/move-scene
 Request:
 {
 “ref”: string,
@@ -815,9 +829,9 @@ Request:
 “left_scene_id”: UUIDv7|null,
 “right_scene_id”: UUIDv7|null
 }
-Response 200: { “commit_id”: sha256_hex, “updated_ref”: string, “previous_head_commit_id”: sha256_hex, “new_order_key”: string }
+Response 200: { “commit_id”: sha256_hex, “updated_ref”: string, “previous_head_commit_id”: sha256_hex, “new_order_key”: string, “receipt”: object(19.7) }
 
-19.6.26 POST /repos/{repo_id}/ops/split-scene
+19.6.28 POST /repos/{repo_id}/ops/split-scene
 Request:
 {
 “ref”: string,
@@ -826,9 +840,9 @@ Request:
 “splits”: [ { “byte_offset”: int } ],
 “titles”: [string|null] | null
 }
-Response 200: { “commit_id”: sha256_hex, “updated_ref”: string, “previous_head_commit_id”: sha256_hex, “new_scene_ids”: [UUIDv7…] }
+Response 200: { “commit_id”: sha256_hex, “updated_ref”: string, “previous_head_commit_id”: sha256_hex, “new_scene_ids”: [UUIDv7…], “receipt”: object(19.7) }
 
-19.6.27 POST /repos/{repo_id}/ops/merge-scenes
+19.6.29 POST /repos/{repo_id}/ops/merge-scenes
 Request:
 {
 “ref”: string,
@@ -840,10 +854,10 @@ Request:
 “joiner”: string
 }
 Rules:
-joiner MUST be processed under 7 and 8.1 (UTF-8, NFC, forbidden chars).
-Response 200: { “commit_id”: sha256_hex, “updated_ref”: string, “previous_head_commit_id”: sha256_hex, “merged_scene_id”: UUIDv7 }
+	•	joiner MUST be processed under 7 and 8.1 (UTF-8, NFC, forbidden chars).
+Response 200: { “commit_id”: sha256_hex, “updated_ref”: string, “previous_head_commit_id”: sha256_hex, “merged_scene_id”: UUIDv7, “receipt”: object(19.7) }
 
-19.6.28 POST /repos/{repo_id}/ops/revert-ref
+19.6.30 POST /repos/{repo_id}/ops/revert-ref
 Request:
 {
 “ref”: string,
@@ -852,10 +866,10 @@ Request:
 “message”: string
 }
 Rules:
-MUST create a new commit whose tree equals to_commit_id.tree and update ref atomically.
-Response 200: { “commit_id”: sha256_hex, “updated_ref”: string, “previous_head_commit_id”: sha256_hex }
+	•	MUST create a new commit whose tree equals to_commit_id.tree and update ref atomically.
+Response 200: { “commit_id”: sha256_hex, “updated_ref”: string, “previous_head_commit_id”: sha256_hex, “receipt”: object(19.7) }
 
-19.6.29 GET /repos/{repo_id}/audit
+19.6.31 GET /repos/{repo_id}/audit
 Response 200:
 {
 “events”: [
@@ -864,39 +878,100 @@ Response 200:
 “next_after_ts”: int|null
 }
 Rules:
-events MUST be ordered by (ts, event_id) ascending.
-details_json MUST be canonicalized per 8.1 when stored; API returns canonical form.
+	•	events MUST be ordered by (ts, event_id) ascending.
+	•	details_json MUST be canonicalized per 8.1 when stored; API returns canonical form.
 
-19.6.30 GET /export
+19.6.32 GET /export
 Response 200:
-Content-Type: application/zstd
-Body: tar.zst bytes as defined in 40
+	•	Content-Type: application/zstd
+	•	Body: tar.zst bytes as defined in 40
 Rules:
-Access MUST require admin.
-repo_id query parameter MAY be null; if null, export all repos.
-export bytes MUST correspond exactly to deterministic archive rules (40.6).
+	•	Access MUST require admin.
+	•	repo_id query parameter MAY be null; if null, export all repos.
+	•	export bytes MUST correspond exactly to deterministic archive rules (40.6).
 
-19.6.31 POST /import
+19.6.33 POST /import?run_verify=0|1
 Request:
-Content-Type: application/zstd
-Body: tar.zst bytes
-Response 200: { “ok”: true, “imported_repo_ids”: [UUIDv7…] }
+	•	Content-Type: application/zstd
+	•	Body: tar.zst bytes
+Response 200: { “ok”: true, “imported_repo_ids”: [UUIDv7…], “verify”: object|null }
 Rules:
-Access MUST require admin.
-Import MUST be atomic per data-dir (40.5.4).
-Import MUST fail on checksum mismatch (40.5.3).
+	•	Access MUST require admin.
+	•	Import MUST be atomic per data-dir (40.5.4).
+	•	Import MUST fail on checksum mismatch (40.5.3).
+	•	If run_verify=1, server MUST run verify after import and return results.
 
-19.6.32 Users and ACL (minimal)
-19.6.32.1 GET /users (admin)
+19.6.34 Worktree endpoints
+19.6.34.1 GET /repos/{repo_id}/worktree/export?ref=<ref|commit>
+Response 200: tar.zst or zip bytes (implementation choice), containing worktree layout (43.2)
+Rules:
+	•	Export MUST be deterministic for the same (repo_id, view id) state.
+	•	Export MUST include .storyed/worktree.json with export_ts=0.
+
+19.6.34.2 POST /repos/{repo_id}/worktree/preflight-import
+Request: { “ref”: string, “expected_head_commit_id”: sha256_hex, “archive_bytes”: bytes }
+Response 200: same schema as 19.6.25 with mode=“worktree”
+Rules:
+	•	MUST NOT mutate persistent state.
+
+19.6.34.3 POST /repos/{repo_id}/worktree/import
+Request: { “ref”: string, “expected_head_commit_id”: sha256_hex, “archive_bytes”: bytes }
+Response 200: { “commit_id”: sha256_hex, “updated_ref”: string, “previous_head_commit_id”: sha256_hex, “receipt”: object(19.7) }
+
+19.6.35 Users and ACL (minimal)
+19.6.35.1 GET /users (admin)
 Response 200: { “users”: [{ “user_id”: UUIDv7, “handle”: string, “created_at”: int }] }
-19.6.32.2 POST /users (admin)
+19.6.35.2 POST /users (admin)
 Request: { “handle”: string, “password”: string }
 Response 201: { “user_id”: UUIDv7 }
-19.6.32.3 GET /repos/{repo_id}/acl (maintainer+)
+19.6.35.3 GET /repos/{repo_id}/acl (maintainer+)
 Response 200: { “entries”: [{ “user_id”: UUIDv7, “role”: “admin”|“maintainer”|“writer”|“reader” }] }
-19.6.32.4 PUT /repos/{repo_id}/acl (admin or repo maintainer)
+19.6.35.4 PUT /repos/{repo_id}/acl (admin or repo maintainer)
 Request: { “entries”: [{ “user_id”: UUIDv7, “role”: “maintainer”|“writer”|“reader” }] }
 Response 200: { “ok”: true }
+
+19.6.36 POST /maintenance/verify
+Response 200: { “ok”: bool, “checks”: [ { “name”: string, “status”: “pass”|“fail”, “details”?: any } ] }
+
+19.6.37 POST /maintenance/pack?dry_run=0|1
+Request: { “repo_id”: UUIDv7|null }
+Response 200:
+	•	if dry_run=1: { “dry_run”: true, “target_object_count”: int, “estimated_pack_bytes”: int, “predicted_pack_id”: sha256_hex|null }
+	•	else: { “dry_run”: false, “pack_id”: sha256_hex, “object_count”: int }
+Rules:
+	•	pack MUST be explicit and MUST NOT run automatically.
+	•	pack MUST NOT change any content IDs; it is a storage optimization only.
+
+19.6.38 GET /system/diagnostics
+Response 200:
+{
+“spec_version”: “0.0.1”,
+“db”: { “page_count”: int, “wal_bytes”: int|null },
+“cas”: { “loose_object_count”: int, “pack_count”: int },
+“rebalance”: { “chapters”: [ { “chapter_id”: UUIDv7, “pressure”: string, “min_gap_hint”: string|null } ] },
+“perf”: { “p95_publish_ms”: int|null, “p95_diff_scene_ms”: int|null }
+}
+Rules:
+	•	Diagnostics MUST be offline-safe and MUST NOT expose secrets.
+
+19.7 Operation receipt (required for mutations)
+19.7.1 Any successful mutation that updates a ref MUST return a receipt object:
+19.7.1.1 {
+“op_name”: string,
+“repo_id”: UUIDv7,
+“ref”: string,
+“expected_head_commit_id”: sha256_hex|null,
+“head_before”: sha256_hex,
+“head_after”: sha256_hex,
+“commit_id”: sha256_hex,
+“changed_paths”: [string…],
+“changed_scene_ids”: [UUIDv7…],
+“request_id”: string|null
+}
+19.7.2 changed_paths MUST be sorted ascending (bytewise ASCII).
+19.7.3 changed_scene_ids MUST be sorted ascending (bytewise UUID string).
+19.7.4 receipt MUST be deterministic given identical inputs and repository state.
+19.7.5 receipt MUST NOT affect CAS IDs.
 	20.	UI Static Serving (Normative)
 20.1 SPA embedding
 20.1.1 UI MUST be a static SPA served by the binary.
@@ -963,6 +1038,7 @@ Rules:
 21.3.1.1 repo_id
 21.3.1.2 current view id (ref name or commit id)
 21.3.1.3 for edit views, active ref name (refs/heads/*) and its head commit id
+21.3.2 The UI MUST show the last mutation receipt (19.7) in a copyable panel for the current session.
 
 21.4 No remote dependencies
 21.4.1 UI correctness MUST NOT require external networks or CDNs.
@@ -973,15 +1049,16 @@ Rules:
 21.6 Error transparency
 21.6.1 All error surfaces MUST show server error code and message when provided.
 21.6.2 The UI MUST show X-Request-Id when present (copyable).
-21.6.3 The UI MUST show the operation name that failed (e.g., PUBLISH, PUBLISH_STAGED, MOVE_SCENE, SPLIT_SCENE, MERGE_MR, WORKTREE_PUSH).
+21.6.3 The UI MUST show the operation name that failed (e.g., PUBLISH, MOVE_SCENE, SPLIT_SCENE, MERGE_MR, WORKTREE_PUSH).
+21.6.4 For any mutation failure, the UI MUST show the attempted expected_head_commit_id and current head (if known).
 
 21.7 Ref targeting guard
 21.7.1 All ref-mutating UI actions MUST display target ref name and expected head commit id prior to confirmation.
 21.7.2 The UI MUST NOT allow ref mutations without sending expected_head_commit_id when available.
 
-21.8 Conflict surfacing (required)
-21.8.1 Any 409 conflict response MUST trigger a visible UI surface (toast or banner).
-21.8.2 If the server returns code “CONFLICT_DETECTED” via audit events, the UI MUST surface it in the system screen.
+21.8 Ritual elimination invariants
+21.8.1 The UI MUST implement one-click flows that internally use preflight endpoints (18.6) before performing dangerous or failure-prone mutations.
+21.8.2 The UI MUST surface explicit single-step options for 409 handling using rebase-staged (18.7) when applicable.
 	22.	UI Routes (Normative)
 22.1 Required routes under /ui/
 22.1.1 /ui/
@@ -992,6 +1069,7 @@ Rules:
 22.1.6 /ui/repos/:repo_id/mrs/:mr_id
 22.1.7 /ui/repos/:repo_id/settings
 22.1.8 /ui/system
+22.1.9 /ui/system/diagnostics
 
 22.2 Optional route
 22.2.1 The UI MAY implement /ui/login as a client-side route.
@@ -1006,6 +1084,7 @@ Rules:
 23.1.1.1 top bar: identity, global status, and actions
 23.1.1.2 left panel: chapter list and scene list
 23.1.1.3 main panel: route content
+23.1.2 top bar MUST show: repo_id, view id, active ref (if any), head commit id, and last receipt summary.
 
 23.2 Global status indicators (required)
 23.2.1 Network indicator states: ONLINE, OFFLINE, DEGRADED.
@@ -1042,7 +1121,7 @@ Rules:
 24.3.2 The UI MUST NOT store auth tokens in localStorage.
 
 24.4 Mutation rules and idempotency
-24.4.1 All mutating requests (except auth endpoints) MUST include Idempotency-Key.
+24.4.1 All mutating requests MUST include Idempotency-Key.
 24.4.2 The UI MUST generate Idempotency-Key per user intent and MUST reuse it across retries.
 24.4.3 The UI MUST implement exponential backoff for retries on network errors and 429 only.
 24.4.4 The UI MUST NOT auto-retry 409 conflicts; it MUST show a conflict flow.
@@ -1052,7 +1131,10 @@ Rules:
 24.5.1 If network requests fail, the UI MUST remain usable for typing and local stage persistence.
 24.5.2 The UI MUST display OFFLINE state.
 24.5.3 The UI MUST NOT implicitly queue server mutations.
-24.5.4 While OFFLINE, publish and worktree push MUST be disabled.
+
+24.6 Worker offload (typing safety)
+24.6.1 Markdown preview rendering and large diff formatting SHOULD be performed in a WebWorker to protect typing latency budgets.
+24.6.2 Worker outputs MUST be deterministic for identical inputs.
 	25.	UI Draft and Stage Model and Persistence (Normative)
 25.1 Draft storage
 25.1.1 Drafts MUST be persisted in IndexedDB.
@@ -1071,7 +1153,8 @@ Rules:
 25.2.3.1 staged_fields (subset of editable fields)
 25.2.3.2 base_head_commit_id (sha256_hex) captured at stage time
 25.2.3.3 summary (deterministic summary for display)
-25.2.3.4 updated_at (unix seconds)
+25.2.3.4 summary_hash (sha256_hex of canonical staged_fields)
+25.2.3.5 updated_at (unix seconds)
 
 25.3 Baseline rules
 25.3.1 Baseline MUST be loaded from committed state for the active ref when entering edit route.
@@ -1140,14 +1223,14 @@ Rules:
 28.2.1.2 the staged set for the active ref (batch publish), producing exactly one commit for the batch.
 
 28.3 Publish protocol (required, deterministic)
-28.3.1 UI MUST publish a single scene via POST /repos/{repo_id}/ops/publish-scene.
-28.3.2 UI MUST publish the staged set via POST /repos/{repo_id}/ops/publish-staged.
-28.3.3 UI MUST treat the server as source of truth for canonicalization; UI MAY pre-validate but MUST rely on server rejection for final validity.
+28.3.1 UI MUST publish via POST /repos/{repo_id}/ops/publish-scene for single-scene publish.
+28.3.2 For batch publish, UI MUST call POST /repos/{repo_id}/ops/publish-staged.
+28.3.3 UI MUST run preflight before publish using /ops/preflight-publish and display any errors in-place.
 28.3.4 UI MUST include expected_head_commit_id for all publish operations.
 
 28.4 Publish state machine (required)
-28.4.1 States: IDLE -> PRECHECK -> IN_FLIGHT -> SUCCESS | FAILED | CONFLICT
-28.4.2 PRECHECK MUST validate locally when feasible and MUST compute a minimal change summary.
+28.4.1 States: IDLE -> PREFLIGHT -> IN_FLIGHT -> SUCCESS | FAILED | CONFLICT
+28.4.2 PREFLIGHT MUST validate locally when feasible and MUST rely on server preflight for final validation.
 28.4.3 IN_FLIGHT MUST keep the editor editable; only publish action may be disabled.
 28.4.4 SUCCESS MUST update baseline for published scenes and MUST clear dirty indicator for those scenes.
 28.4.5 FAILED MUST preserve drafts and staged changes and allow RETRY with same Idempotency-Key.
@@ -1158,7 +1241,7 @@ Rules:
 28.5.1.1 fetch latest head for the active ref
 28.5.1.2 compute diff head_at_stage -> latest_head for affected scenes
 28.5.1.3 offer actions:
-A) REBASE_STAGED (reapply staged on latest head)
+A) REBASE_STAGED (call /ops/rebase-staged)
 B) TAKE_HEAD (discard staged and drafts for those scenes)
 C) MANUAL_MERGE (editor + preview + structured merge)
 28.5.2 UI MUST require explicit user choice; it MUST NOT auto-resolve conflicts.
@@ -1202,6 +1285,7 @@ C) MANUAL_MERGE (editor + preview + structured merge)
 30.4.1 Merge MUST require explicit confirmation.
 30.4.2 Merge UI MUST show mode (ff/merge/squash) and the effect on base_ref.
 30.4.3 On success, UI MUST show merged_commit_id and updated base_ref head and provide link to read.
+30.4.4 UI MUST display the returned receipt.
 	31.	UI Conflict Resolution UX (Normative)
 31.1 Per-scene independent choices
 31.1.1 For each conflicted scene, UI MUST provide:
@@ -1221,7 +1305,7 @@ C) MANUAL_MERGE (editor + preview + structured merge)
 31.4.1 If many order conflicts exist, UI SHOULD propose MERGE_THEN_REBALANCE.
 
 31.5 Save and submit
-31.5.1 Switching resolution choice MUST update preview within latency budgets.
+31.5.1 Switching resolution choice MUST update preview within 100ms p95 MUST.
 31.5.2 Merge submission MUST include all chosen resolutions.
 	32.	UI Keyboard Shortcuts (Required Minimum)
 32.1 The UI MUST provide shortcuts for:
@@ -1322,7 +1406,6 @@ C) MANUAL_MERGE (editor + preview + structured merge)
 38.3.2.5 export/import
 38.3.2.6 maintenance operations (rebalance, pack, verify, GC if any)
 38.3.2.7 worktree import operations
-38.3.2.8 conflict detection events (17.7)
 38.3.3 Audit entries MUST include:
 38.3.3.1 event_id (UUIDv7)
 38.3.3.2 ts (unix seconds)
@@ -1399,14 +1482,15 @@ C) MANUAL_MERGE (editor + preview + structured merge)
 40.6.3.3 mtime = 0
 40.6.3.4 devmajor = 0, devminor = 0
 40.6.3.5 mode:
-regular files: 0644
-directories: 0755
+	•	regular files: 0644
+	•	directories: 0755
 40.6.4 TAR MUST NOT include PAX headers except those strictly required for long path support; if PAX headers are used, their content MUST be deterministic and MUST NOT include time fields (atime/ctime).
 40.6.5 Zstandard compression MUST be deterministic:
 40.6.5.1 compression level MUST be fixed by config default (default SHOULD be 3)
 40.6.5.2 threads MUST be 1
 40.6.5.3 checksum MUST be enabled or disabled deterministically (default SHOULD be enabled)
 40.6.6 Implementations MUST NOT include any extra files beyond 40.2.1.
+
 	41.	SQLite meta.db Minimum Schema (Required)
 41.1 Required tables
 41.1.1 repos(repo_id TEXT PRIMARY KEY, name TEXT NULL, created_at INTEGER NOT NULL)
@@ -1415,7 +1499,7 @@ directories: 0755
 41.1.4 audit(event_id TEXT PRIMARY KEY, ts INTEGER NOT NULL, actor_id TEXT NOT NULL, action TEXT NOT NULL, repo_id TEXT NULL, details_json TEXT NOT NULL)
 41.1.5 users(user_id TEXT PRIMARY KEY, handle TEXT UNIQUE NOT NULL, created_at INTEGER NOT NULL, password_hash BLOB NOT NULL, password_params_json TEXT NOT NULL)
 41.1.6 repo_acl(repo_id TEXT NOT NULL, user_id TEXT NOT NULL, role TEXT NOT NULL, PRIMARY KEY(repo_id, user_id))
-41.1.7 idempotency(actor_id TEXT NOT NULL, method TEXT NOT NULL, path TEXT NOT NULL, key TEXT NOT NULL, created_at INTEGER NOT NULL, response_status INTEGER NOT NULL, response_headers_json TEXT NOT NULL, response_body BLOB NOT NULL, PRIMARY KEY(actor_id, method, path, key))
+41.1.7 idempotency(actor_id TEXT NOT NULL, method TEXT NOT NULL, path TEXT NOT NULL, key TEXT NOT NULL, created_at INTEGER NOT NULL, response_status INTEGER NOT NULL, response_body BLOB NOT NULL, PRIMARY KEY(actor_id, method, path, key))
 41.1.8 sessions(session_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)
 
 41.2 Atomicity
@@ -1438,9 +1522,10 @@ directories: 0755
 42.10 UI is pinned to specified toolchain and is served from embedded bytes with required security headers and CSP.
 42.11 All ref-mutating operations support expected_head_commit_id and return 409 REF_HEAD_MISMATCH on mismatch.
 42.12 Publish uses server-side canonicalization and results in exactly one new commit on the active ref when successful.
-42.13 Publish-staged produces exactly one new commit for the staged set and is all-or-nothing.
-42.14 Worktree push/import never updates refs without explicit expected_head_commit_id and base verification.
-42.15 commit.created_at is always 0 in v0.0.1; timestamps are recorded in audit.
+42.13 Worktree import never updates refs without explicit expected_head_commit_id.
+42.14 All ref-mutating mutations return deterministic operation receipts.
+42.15 Preflight endpoints exist for publish and worktree import and do not mutate state.
+42.16 A single-step explicit rebase-staged operation exists to reduce multi-step 409 rituals without auto-resolution.
 	43.	Worktree and Markdown Interop (Required)
 43.1 Purpose
 43.1.1 Worktree interop provides a deterministic filesystem projection for external editing tools and Git workflows.
@@ -1463,7 +1548,7 @@ directories: 0755
 43.3.1.4 “base_commit_id”: sha256_hex (the commit exported)
 43.3.1.5 “export_ts”: int (unix seconds); determinism rule: export_ts MUST be 0 in v0.0.1
 43.3.2 worktree.json MUST be validated under 7 and 8.1 and treated as canonical text.
-43.3.3 worktree push/import MUST fail if worktree.json is missing or invalid.
+43.3.3 worktree import MUST fail if worktree.json is missing or invalid.
 
 43.4 Worktree export semantics
 43.4.1 Export MUST be deterministic for the same (repo_id, view id) state.
@@ -1476,11 +1561,9 @@ directories: 0755
 43.5.2.2 JSON canonicalization (8.1) and forbidden chars (7.3)
 43.5.2.3 LF normalization of .md (14.2)
 43.5.2.4 order.json consistency (15.7)
-43.5.2.5 worktree base consistency:
-worktree.json.base_commit_id MUST equal the commit being imported as the base for diffs; otherwise return 409 WORKTREE_BASE_MISMATCH.
 43.5.3 Import MUST map each <scene_id>.md + <scene_id>.meta.json to the corresponding Scene JSON update.
 43.5.4 Import MUST create exactly one new commit on success, updating the target ref atomically.
-43.5.5 Import MUST record an audit event with action “WORKTREE_IMPORT” and details including file counts and changed_scene_ids.
+43.5.5 Import MUST record an audit event with action “WORKTREE_IMPORT” and details including file counts and changed scene_ids.
 
 43.6 Lint (required)
 43.6.1 storyed lint MUST validate worktree directories according to 43.2-43.5.
@@ -1495,6 +1578,7 @@ worktree.json.base_commit_id MUST equal the commit being imported as the base fo
 43.7.2.1 charset = utf-8
 43.7.2.2 end_of_line = lf
 43.7.2.3 insert_final_newline = true
+43.7.3 worktree add SHOULD generate .gitattributes and .editorconfig by default to prevent ritual fixes.
 	44.	Git Interop Profile (Deterministic, Local)
 44.1 Scope
 44.1.1 v0.0.1 does not require Git protocol compatibility.
@@ -1515,14 +1599,14 @@ worktree.json.base_commit_id MUST equal the commit being imported as the base fo
 45.2.1 The server MUST support packing CAS loose objects into deterministic pack files (48) via POST /maintenance/pack.
 45.2.2 pack MUST be explicit and MUST NOT run automatically.
 45.2.3 pack MUST NOT change any content IDs; it is a storage optimization only.
+45.2.4 pack SHOULD support dry_run to eliminate operational rituals.
 	46.	Worktree and Publish Safety (Required)
 46.1 No implicit ref updates
-46.1.1 storyed MUST NOT update any ref due to filesystem changes without explicit worktree push/import by a user.
-46.1.2 UI MUST never auto-publish; publish and worktree push require explicit user action.
+46.1.1 storyed MUST NOT update any ref due to filesystem changes without explicit worktree import by a user.
+46.1.2 UI MUST never auto-publish; publish and worktree import require explicit user action.
 
 46.2 Expected head enforcement
-46.2.1 worktree push/import MUST include expected_head_commit_id and MUST fail on mismatch with 409 REF_HEAD_MISMATCH.
-46.2.2 publish-staged MUST reject if staged base does not match actual head (409 STAGE_BASE_MISMATCH).
+46.2.1 worktree import MUST include expected_head_commit_id and MUST fail on mismatch with 409 REF_HEAD_MISMATCH.
 	47.	Deterministic Optimizations (Implementation Constraints)
 47.1 Server-side publish ops
 47.1.1 Implementations MUST use server-side publish operations for UI publish flows (18.5, 19.5.6).
@@ -1530,6 +1614,8 @@ worktree.json.base_commit_id MUST equal the commit being imported as the base fo
 47.2.1 Implementations MUST implement diff-summary and diff-scene split (16.5, 19.5.4).
 47.3 IndexedDB non-blocking behavior
 47.3.1 Implementations MUST ensure draft/stage persistence does not violate UI typing budgets (33.3).
+47.4 Tree update efficiency (implementation choice)
+47.4.1 Implementations SHOULD avoid rebuilding full trees for single-scene updates and SHOULD apply sorted-entry merges to reduce CPU and allocations, without changing canonical outputs.
 	48.	CAS Pack Format (Deterministic, v0.0.1)
 48.1 Pack purpose
 48.1.1 Packs reduce filesystem overhead by grouping many objects into fewer files while preserving object immutability and IDs.
@@ -1540,50 +1626,30 @@ worktree.json.base_commit_id MUST equal the commit being imported as the base fo
 48.2.2 Pack MUST consist of:
 48.2.2.1 pack data file: pack-<pack_id>.dat
 48.2.2.2 pack index file: pack-<pack_id>.idx
-48.2.3 pack_id MUST be sha256_hex of the canonical bytes of the index file (48.6).
+48.2.3 pack_id MUST be sha256_hex of the canonical bytes of the index file (48.4).
 
-48.3 Pack data file entries
-48.3.1 The data file MUST contain concatenated raw blob bytes, each preceded by a fixed entry header:
-48.3.1.1 magic “SDPK” (4 bytes)
-48.3.1.2 version u32 = 1 (little-endian)
-48.3.1.3 blob_id raw bytes(32)
-48.3.1.4 length u64 (little-endian)
-48.3.1.5 payload bytes(length)
-48.3.2 The server MUST validate blob_id matches sha256(payload) when reading, unless a verified cache is used.
+48.3 Pack entries
+48.3.1 The index MUST map blob_id -> (offset, length) into the data file.
+48.3.2 The data file MUST contain concatenated raw blob bytes, each preceded by a fixed header:
+48.3.2.1 magic “SDPK” (4 bytes)
+48.3.2.2 version u32 = 1
+48.3.2.3 blob_id raw bytes(32)
+48.3.2.4 length u64 (little-endian)
+48.3.2.5 payload bytes(length)
+48.3.3 The server MUST validate blob_id matches sha256(payload) when reading, unless a verified cache is used.
 
-48.4 Pack data file footer (required for rebuild)
-48.4.1 The data file MUST end with a fixed footer enabling deterministic index rebuild:
-48.4.1.1 magic “SDFT” (4 bytes)
-48.4.1.2 version u32 = 1 (little-endian)
-48.4.1.3 entry_count u64 (little-endian)
-48.4.1.4 index_sha256 bytes(32) (sha256 over the exact index bytes)
-48.4.2 The footer MUST be written after all entries and after the index bytes are finalized.
-48.4.3 When rebuilding, implementations MAY ignore index_sha256 if no index is present, but MUST validate entry payload hashes.
+48.4 Determinism
+48.4.1 pack entries MUST be sorted by blob_id ascending (bytewise over raw 32 bytes).
+48.4.2 The index file MUST be a canonical binary encoding:
+48.4.2.1 magic “SDIX” (4 bytes)
+48.4.2.2 version u32 = 1
+48.4.2.3 count u64
+48.4.2.4 repeated count times:
+	•	blob_id raw bytes(32)
+	•	offset u64
+	•	length u64
+48.4.3 pack_id = sha256(index_bytes).
+48.4.4 pack creation MUST be deterministic given identical input object set and bytes.
 
-48.5 Index goals (required)
-48.5.1 The index MUST support efficient lookup by blob_id without loading the entire index into memory.
-48.5.2 The index MUST be deterministic given identical input object set and bytes.
-
-48.6 Pack index file format (canonical binary with fanout)
-48.6.1 The index file MUST be a canonical binary encoding:
-48.6.1.1 magic “SDIX” (4 bytes)
-48.6.1.2 version u32 = 2 (little-endian)
-48.6.1.3 count u64 (little-endian)
-48.6.1.4 fanout[256] u32 array (little-endian)
-48.6.1.5 ids[count] as blob_id raw bytes(32) sorted ascending (bytewise over raw 32 bytes)
-48.6.1.6 offsets[count] u64 (little-endian) offsets into the data file where the corresponding entry header begins
-48.6.1.7 lengths[count] u64 (little-endian) payload lengths
-48.6.2 fanout rule:
-48.6.2.1 fanout[i] = number of ids whose first byte <= i
-48.6.3 Determinism:
-48.6.3.1 ids MUST be sorted ascending; fanout computed from that order; offsets correspond to the data layout.
-48.6.4 pack_id = sha256(index_bytes).
-
-48.7 Rebuild rules (operational)
-48.7.1 If an index file is missing or corrupt, the server MAY rebuild it by scanning the data file sequentially:
-48.7.1.1 parse entries until footer is reached
-48.7.1.2 validate each payload hash
-48.7.1.3 collect (blob_id, offset, length), sort by blob_id, write deterministic index (48.6)
-48.7.2 Rebuild MUST NOT change any blob IDs; it only restores the index for an existing pack.
 	49.	End
 End of v0.0.1
