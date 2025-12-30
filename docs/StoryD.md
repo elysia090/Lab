@@ -1651,5 +1651,220 @@ C) MANUAL_MERGE (editor + preview + structured merge)
 48.4.3 pack_id = sha256(index_bytes).
 48.4.4 pack creation MUST be deterministic given identical input object set and bytes.
 
-	49.	End
-End of v0.0.1
+		49.	Operational Profile (Pinned, Normative)
+
+49.1 Scope
+49.1.1 This section defines the mandatory operational profile for storyed v0.0.1.
+49.1.2 The intent is to make day-to-day operation and recovery deterministic, testable, and low-ritual.
+
+49.2 Supported backup method (single source of truth)
+49.2.1 The only supported backup mechanism is the built-in deterministic archive export defined in Section 40.
+49.2.2 Operators MUST NOT treat a raw copy of data-dir (including rsync, filesystem snapshot without verification, or manual file copy) as a supported backup method.
+49.2.3 Implementations MUST document this restriction in built-in help text for serve/export/import.
+
+49.3 Export requirements (operational hardening)
+49.3.1 export MUST produce an archive that passes internal verification before returning success.
+49.3.2 export MUST perform, at minimum, these checks prior to returning 200:
+49.3.2.1 manifest.json exists and is valid JCS-canonical JSON as per 40.3
+49.3.2.2 all manifest file checksums match the archived bytes
+49.3.2.3 refs -> commits -> trees -> blobs reachability holds (no dangling references)
+49.3.2.4 order.json consistency holds for all chapters (15.7)
+49.3.3 If any check fails, export MUST fail with 500 code “EXPORT_VERIFY_FAILED” and MUST NOT output a partial archive as success.
+
+49.4 Import requirements (operational hardening)
+49.4.1 import MUST be atomic per data-dir (40.5.4).
+49.4.2 import MUST support a dry-run mode:
+49.4.2.1 CLI: import –data-dir  –in <file.tar.zst> –dry-run
+49.4.2.2 HTTP: POST /import?dry_run=true
+49.4.3 In dry-run mode, the system MUST NOT modify the target data-dir.
+49.4.4 dry-run MUST perform the same validations as a real import, including checksum validation (40.5.3) and internal consistency verification (45.1).
+49.4.5 import MUST implement atomicity using one of these fixed strategies:
+49.4.5.1 extract to a fresh sibling directory, verify, then rename-swap the directory
+49.4.5.2 an equivalent mechanism that provides the same atomic cutover semantics
+49.4.6 If atomic cutover fails after extraction, the implementation MUST leave the original data-dir intact and MUST remove or quarantine the extracted temporary directory.
+
+49.5 Maintenance exclusivity (required)
+49.5.1 The system MUST enforce mutual exclusion for all maintenance operations and all import operations.
+49.5.2 At most one of the following may run at a time:
+49.5.2.1 import (dry-run or real)
+49.5.2.2 maintenance verify
+49.5.2.3 maintenance pack
+49.5.2.4 maintenance repair-order (49.9)
+49.5.2.5 maintenance prune-idempotency (49.10)
+49.5.2.6 maintenance init-admin (49.11)
+49.5.2.7 maintenance reset-password (49.12)
+49.5.3 If a conflicting operation is requested, the server MUST return 409 with code “MAINTENANCE_BUSY” and details including the active operation name if known.
+49.5.4 The mutual exclusion mechanism MUST be crash-safe. If implemented using a lock file, it MUST include a monotonic token and MUST be validated to avoid stale-lock deadlocks (e.g., by PID plus start-time, or a lease with explicit renewal).
+
+49.6 Disk space guard (required)
+49.6.1 The system MUST implement a free-space guard with a configurable threshold min_free_bytes.
+49.6.2 The default min_free_bytes SHOULD be 1 GiB.
+49.6.3 If free bytes on the filesystem containing data-dir are below min_free_bytes:
+49.6.3.1 the server MUST report degraded status in /health (49.13)
+49.6.3.2 all mutating operations MUST fail fast with a deterministic error as defined in 50.2
+49.6.4 Implementations MUST check free space at least:
+49.6.4.1 once at startup
+49.6.4.2 before starting any mutation transaction
+49.6.4.3 before writing any new CAS object or pack segment
+
+49.7 Process shutdown contract (required)
+49.7.1 On SIGTERM or equivalent graceful shutdown signal, the server MUST:
+49.7.1.1 stop accepting new requests
+49.7.1.2 allow in-flight requests to complete up to a configured timeout shutdown_timeout_secs (default SHOULD be 30)
+49.7.1.3 close SQLite connections cleanly
+49.7.2 The server MUST NOT attempt background mutations during shutdown beyond completing in-flight work.
+
+49.8 Routine schedule (normative recommendation)
+49.8.1 Operators SHOULD run:
+49.8.1.1 export daily
+49.8.1.2 maintenance verify at least weekly
+49.8.1.3 an import dry-run of the latest export at least monthly (disaster recovery drill)
+
+49.9 Repair order.json (required recovery path)
+49.9.1 The system MUST provide a deterministic repair operation for order.json:
+49.9.1.1 CLI: maintenance repair-order –data-dir  –repo <repo_id> –chapter <chapter_id> –ref <ref_name> –mode derive
+49.9.1.2 HTTP: POST /maintenance/repair-order
+49.9.2 repair-order MUST be explicit and MUST NOT run automatically.
+49.9.3 repair-order mode derive MUST:
+49.9.3.1 read the chapter tree at the head of the provided ref
+49.9.3.2 enumerate scenes in that chapter
+49.9.3.3 sort by (scene.order_key, scene_id) ascending
+49.9.3.4 write a new canonical order.json consistent with 15.7
+49.9.4 repair-order MUST create exactly one new commit and update the target ref atomically.
+49.9.5 repair-order MUST append an audit event with action “REPAIR_ORDER” and details including chapter_id and scene count.
+
+49.10 Prune idempotency (required)
+49.10.1 The system MUST provide a deterministic prune operation for idempotency records:
+49.10.1.1 CLI: maintenance prune-idempotency –data-dir  –older-than 
+49.10.1.2 HTTP: POST /maintenance/prune-idempotency
+49.10.2 prune-idempotency MUST delete rows with created_at < (now - older-than) deterministically.
+49.10.3 prune-idempotency MUST be explicit and MUST NOT run automatically in v0.0.1.
+
+49.11 Init admin (required)
+49.11.1 The system MUST provide an explicit one-time admin initialization command:
+49.11.1.1 CLI: maintenance init-admin –data-dir  –handle  –password 
+49.11.2 init-admin MUST succeed only if no users exist.
+49.11.3 On success, init-admin MUST create exactly one admin user and MUST append an audit event “INIT_ADMIN”.
+49.11.4 init-admin MUST fail with 409 code “ADMIN_ALREADY_INITIALIZED” if users already exist.
+
+49.12 Reset password (required)
+49.12.1 The system MUST provide an explicit password reset command:
+49.12.1.1 CLI: maintenance reset-password –data-dir  –user-id  –password 
+49.12.2 reset-password MUST append an audit event “RESET_PASSWORD” including user_id.
+49.12.3 reset-password MUST NOT reveal password material in logs.
+
+49.13 Health and readiness (required)
+49.13.1 GET /health response MUST be extended to:
+49.13.1.1 { “status”: “ok”|“degraded”|“fail”, “spec_version”: “0.0.1”, “checks”: { … } }
+49.13.2 checks MUST include at least:
+49.13.2.1 db_rw: bool
+49.13.2.2 cas_rw: bool
+49.13.2.3 free_space_ok: bool
+49.13.2.4 schema_ok: bool
+49.13.2.5 maintenance_lock_free: bool
+49.13.3 If any required check is false, status MUST be “degraded” or “fail”.
+49.13.4 status MUST be “fail” if schema_ok is false or db_rw is false.
+
+49.14 Metrics (required minimum, offline-safe)
+49.14.1 The server MUST expose GET /metrics.
+49.14.2 /metrics MUST be text/plain; charset=utf-8 and MUST NOT require authentication by default (deployers may protect it at the reverse proxy layer).
+49.14.3 /metrics format MUST be stable key-value lines:
+49.14.3.1  
+49.14.3.2 {k=“v”,…}  MAY be used
+49.14.4 /metrics MUST include at least:
+49.14.4.1 storyed_http_requests_total{code,route}
+49.14.4.2 storyed_op_latency_ms_p95{op}
+49.14.4.3 storyed_sqlite_busy_total
+49.14.4.4 storyed_cas_read_errors_total
+49.14.4.5 storyed_cas_write_errors_total
+49.14.4.6 storyed_free_bytes
+	50.	Failure Modes and Required Behavior (Normative)
+
+50.1 General rule
+50.1.1 Failures MUST be surfaced as deterministic error codes and MUST NOT silently corrupt state.
+50.1.2 If a mutation fails after partial work, the server MUST roll back such that the visible ref state is unchanged.
+
+50.2 Storage full / low space (required)
+50.2.1 If a mutation cannot proceed due to insufficient storage, the server MUST return:
+50.2.1.1 HTTP 507
+50.2.1.2 code: “STORAGE_FULL”
+50.2.1.3 details: { “op”: string, “path”: string|null, “free_bytes”: int|null, “required_bytes_estimate”: int|null }
+50.2.2 The UI MUST treat STORAGE_FULL as non-destructive to Draft/Stage and MUST advise the user that local drafts remain.
+
+50.3 Maintenance lock contention (required)
+50.3.1 If an operation is rejected due to 49.5 exclusivity, the server MUST return:
+50.3.1.1 HTTP 409
+50.3.1.2 code: “MAINTENANCE_BUSY”
+50.3.1.3 details: { “active_op”: string|null }
+
+50.4 Dangling CAS references (required)
+50.4.1 If a requested commit/tree/blob cannot be fully materialized due to missing referenced objects, the server MUST return:
+50.4.1.1 HTTP 500
+50.4.1.2 code: “CAS_DANGLING_REFERENCE”
+50.4.1.3 details: { “missing”: [{ “kind”: “blob”|“tree”|“commit”, “id”: string, “referenced_by”: any|null }] }
+50.4.2 maintenance verify MUST detect this condition.
+
+50.5 order.json corruption (required)
+50.5.1 If order.json is missing or invalid for a chapter with scenes, behavior remains as 15.7.7.
+50.5.2 maintenance verify MUST report the failing chapter_id and a minimal reason code:
+50.5.2.1 reason: “MISSING”|“INVALID_JSON”|“DUP_SCENE_ID”|“SCENE_MISSING”|“EXTRA_SCENE”|“CHAPTER_ID_MISMATCH”
+
+50.6 Import checksum mismatch (required)
+50.6.1 On manifest checksum mismatch, import MUST fail fast with:
+50.6.1.1 HTTP 400
+50.6.1.2 code: “IMPORT_CHECKSUM_MISMATCH”
+50.6.1.3 details including the first mismatching path
+	51.	Maintenance Commands and Endpoints (Normative)
+
+51.1 Required CLI additions
+51.1.1 In addition to Section 4.2, the executable MUST support:
+51.1.1.1 maintenance verify –data-dir  [–repo <repo_id>|–all]
+51.1.1.2 maintenance repair-order –data-dir  –repo <repo_id> –chapter <chapter_id> –ref <ref_name> –mode derive
+51.1.1.3 maintenance prune-idempotency –data-dir  –older-than 
+51.1.1.4 maintenance init-admin –data-dir  –handle  –password 
+51.1.1.5 maintenance reset-password –data-dir  –user-id <user_id> –password 
+51.1.2 These commands MUST NOT perform network calls and MUST be offline-capable.
+
+51.2 Required HTTP endpoints
+51.2.1 The server MUST additionally expose:
+51.2.1.1 POST /maintenance/repair-order
+51.2.1.2 POST /maintenance/prune-idempotency
+51.2.2 These endpoints MUST be admin-only.
+51.2.3 These endpoints MUST honor maintenance exclusivity (49.5).
+
+51.3 maintenance verify output (required)
+51.3.1 POST /maintenance/verify response MUST be:
+51.3.1.1 { “ok”: bool, “errors”: [ … ] }
+51.3.2 Each error entry MUST include:
+51.3.2.1 code: string
+51.3.2.2 scope: “repo”|“chapter”|“cas”|“db”|“import”
+51.3.2.3 identifiers: object (e.g., repo_id, chapter_id, commit_id)
+51.3.2.4 message: string
+	52.	Disaster Recovery Runbook (Normative)
+
+52.1 Definitions
+52.1.1 “backup artifact” means an export archive produced by storyed export.
+52.1.2 “restore target” means a fresh empty directory intended to become the new data-dir.
+
+52.2 Backup procedure (daily)
+52.2.1 Operators SHOULD run export daily and store the resulting archive on independent storage.
+52.2.2 Operators SHOULD keep at least N=7 daily backups and N=4 weekly backups.
+
+52.3 Restore drill (monthly)
+52.3.1 Operators SHOULD run:
+52.3.1.1 import –dry-run against the latest backup artifact
+52.3.1.2 a real import into a restore target (non-production) at least monthly
+52.3.2 The drill MUST verify:
+52.3.2.1 /health returns status ok
+52.3.2.2 maintenance verify returns ok=true
+52.3.2.3 a sample repo can be read and a no-op publish can complete
+
+52.4 Actual restore procedure (when production is compromised)
+52.4.1 Create a fresh restore target directory on a healthy filesystem with sufficient free space.
+52.4.2 Run import –dry-run against the chosen backup artifact.
+52.4.3 If dry-run passes, run real import into the restore target.
+52.4.4 Start serve pointing at the restore target.
+52.4.5 Run maintenance verify and require ok=true before declaring recovery complete.
+52.4.6 Preserve the compromised original data-dir for forensic inspection; do not modify it.
+
+End of v0.0.1  
