@@ -1,289 +1,239 @@
 TITLE
-Counterfactual Boolean Circuits with Exact Compaction
-A Semantics-Preserving Execution Model and an Optimization Stack
+Multi-seed Boolean Forward-mode AD over GF(2) with Exact Sparsity-aware Compaction
+A Semantics-preserving Dual-value Execution Model with Stable Packing
 
 STATUS
 Draft, self-contained, ASCII, English
 
 ABSTRACT
-We present Counterfactual Boolean Circuits (CFC), an exact evaluation model for Boolean circuits under a set of W tracked single-bit interventions. Each node carries a base value a and a W-bit counterfactual difference mask d that equals the PIVOT mask for that node. We then define COMPACT, a semantics-preserving transform that eliminates provably inactive masks and evaluates only the active subset using stable packing. We refine COMPACT into a strict three-phase pipeline ACTIVE, PROJECT, EVALUATE-PACKED and prove soundness requirements. Finally, we provide an optimization stack that reduces predicate overhead and improves packed throughput while preserving exactness (no false negatives). The resulting system approaches O(N*L*p) time in freezing regimes (where the active ratio p is small), while retaining O(N*L) worst-case behavior via adaptive fallback in melting regimes.
+We formalize a semantics-preserving execution model for Boolean circuits seen as straight-line programs over GF(2). For a fixed set of W tracked single-bit flip directions, each node carries a dual value (a,d) where a is the base evaluation at x and d is the W-lane vector of directional discrete differences Delta_{S[k]}. We give exact propagation laws for NOT, XOR, AND; in particular AND uses the GF(2) discrete Leibniz identity a_u d_w xor a_w d_u xor (d_u and d_w), eliminating case splits. We then define an exact sparsity-aware compaction operator that removes and does not store provably zero d-vectors while preserving full semantics. Compaction is specified as a strict stable-packing contract driven by an exact nonzero predicate, producing packed dual differences plus a dense-to-packed map. We separate mathematical correctness (dual semantics) from representation contracts (bit-packed lanes, summary trees, optional exact interning), and we state soundness and completeness requirements for compaction. The resulting system performs multi-directional Boolean forward-mode AD in one pass and can exploit exact zero-sparsity without approximation.
+	1.	ALGEBRAIC SETTING
 
-1. INTRODUCTION
-   Counterfactual queries for Boolean systems often require evaluating f(x) and many perturbed values f(x xor e_i). A naive approach evaluates the circuit W times for W perturbations. CFC compresses these evaluations by propagating a single base value and a vector of counterfactual differences. The central observation is that, under Boolean operations, counterfactual differences obey exact local laws. This makes counterfactual evaluation an instance of exact mask calculus.
+1.1 Field and operations
+Let F2 = {0,1} be the field with addition xor and multiplication and.
+Negation is defined as not a := 1 xor a.
+All vector operations on masks are lane-wise over F2 unless stated otherwise.
 
-The second observation is that counterfactual masks tend to become sparse or vanish in many circuits and regimes. When a node mask is identically zero, the node does not contribute to any tracked counterfactual outcome. COMPACT leverages this to remove inactive computation without approximation. The remaining challenge is that deciding inactivity can be expensive if done naively. We therefore define strict soundness conditions and provide optimizations that reduce predicate work and improve locality, while preserving exactness.
+1.2 Inputs and directions
+Let x in F2^n be an input assignment.
+Fix W tracked directions S[0..W-1], where each S[k] is an integer in [0..n-1].
+Direction k corresponds to flipping the input bit at index S[k], i.e. x xor e_{S[k]}.
 
-2. MODEL
-   Inputs
-   x in {0,1}^n
+1.3 Discrete difference operator
+For any function f : F2^n -> F2 and index i in [0..n-1], define the discrete difference
+Delta_i f(x) := f(x) xor f(x xor e_i).
 
-Tracked interventions
-S[0..W-1] where each S[k] in [0..n-1]
-World k corresponds to flipping x at index S[k], i.e., x^(S[k]) = x xor e_{S[k]}
+For the tracked directions, define for each k:
+Delta_{S[k]} f(x) := f(x) xor f(x xor e_{S[k]}).
+	2.	CIRCUIT MODEL
 
-Circuit
-A circuit is a DAG of nodes v.
-Each internal node has opcode in {NOT, XOR, AND} and references its operands.
-Leaves are IN(j) or CONST(c).
+2.1 Circuit
+A circuit is a finite DAG of nodes. Each node v is one of:
+CONST(c) where c in F2
+IN(j) where j in [0..n-1]
+NOT(u)
+XOR(u,w)
+AND(u,w)
+Edges point from operands to the operator node. The circuit has one or more designated outputs.
 
-Node state
-a(v) in {0,1} is the base value at x.
-d(v) in {0,1}^W is the difference mask:
-d(v)[k] = value(v, x) xor value(v, x^(S[k])).
+2.2 Base semantics
+For a node v, val(v,x) in F2 denotes the usual Boolean evaluation at input x.
 
-Output semantics
-For output node out computing f:
-a(out) = f(x)
-d(out) = PIVOT_S(f, x)
-HOLD is:
-HOLD_S(f,x) = not d(out)
+2.3 Directional counterfactual semantics
+For a node v and tracked direction k, define
+diff(v,x,k) := val(v,x) xor val(v, x xor e_{S[k]}).
+This is exactly the directional discrete difference of the node function at x.
+	3.	MULTI-SEED FORWARD-MODE DUAL SEMANTICS
 
-3. EXACT GATE LAWS
-   Masks use lane-wise Boolean operations. Let L = ceil(W/64) be the number of machine words.
+3.1 Dual value
+Each node v carries a dual value
+J(v) = (a(v), d(v))
+where
+a(v) in F2 is the base value
+d(v) in F2^W is the W-lane difference vector
 
-Leaf initialization
+The intended meaning is:
+a(v) = val(v,x)
+d(v)[k] = diff(v,x,k) = Delta_{S[k]} val(v, . )(x)
+
+3.2 Seed vectors
+For each input index j, define the W-lane seed vector s_j in F2^W by:
+s_j[k] = 1 iff S[k] = j else 0.
+
+3.3 Leaf initialization rules
 CONST(c):
 a = c
 d = 0^W
 
-```
 IN(j):
-  a = x[j]
-  d[k] = 1 iff S[k] == j else 0
-```
+a = x[j]
+d = s_j
+	4.	EXACT FORWARD PROPAGATION LAWS
 
-NOT
-a = not a_u
-d = d_u
+All laws below are exact and define how to compute J(out) from J(operands).
+All operations on d are lane-wise.
 
-XOR
-a = a_u xor a_w
-d = d_u xor d_w
+4.1 NOT
+Given J(u) = (a_u, d_u),
+J(NOT(u)) = (1 xor a_u, d_u).
 
-AND (4-case exact delta law, conditioned on base values)
-a = a_u and a_w
-If (a_u,a_w) = (0,0): d = d_u and d_w
-If (a_u,a_w) = (0,1): d = d_u and not d_w
-If (a_u,a_w) = (1,0): d = d_w and not d_u
-If (a_u,a_w) = (1,1): d = d_u or d_w
+4.2 XOR
+Given J(u) = (a_u, d_u), J(w) = (a_w, d_w),
+J(XOR(u,w)) = (a_u xor a_w, d_u xor d_w).
 
-4. PRIMITIVES
-   We define minimal operators needed for exact execution and compaction.
+4.3 AND (GF(2) discrete Leibniz rule)
+Given J(u) = (a_u, d_u), J(w) = (a_w, d_w),
+J(AND(u,w)) = (a_u and a_w, d_out),
+where
+d_out = (a_u * d_w) xor (a_w * d_u) xor (d_u and d_w).
 
-Mask predicates (exact)
-ZERO(d): true iff d == 0^W
-EQUAL(d,e): true iff d == e
-NONEMPTY(d): true iff not ZERO(d)
-INTERSECTS(d,e): true iff NONEMPTY(d and e)
-SUBSET(d,e): true iff ZERO(d and not e)
-DISJOINT(d,e): true iff ZERO(d and e)
+Here scalar-by-vector multiplication uses:
+(0 * d) = 0^W
+(1 * d) = d
 
-Stable packing (PROJECT)
+4.4 Equivalent per-lane form
+For each lane k:
+d_out[k] = (a_u and d_w[k]) xor (a_w and d_u[k]) xor (d_u[k] and d_w[k]).
+	5.	CORRECTNESS OF DUAL SEMANTICS
+
+Theorem 5.1 (Dual correctness)
+For every node v in the circuit, if J(v) is computed using the initialization rules in 3.3 and the propagation laws in 4, then:
+a(v) = val(v,x)
+and for all k in [0..W-1]:
+d(v)[k] = val(v,x) xor val(v, x xor e_{S[k]}).
+
+Proof sketch
+Proceed by induction over a topological order of the DAG.
+Leaves hold by definition.
+For NOT and XOR, use that negation does not change differences and xor is linear in F2.
+For AND, use the identity for each lane:
+(pq) xor (p’ q’) = p (q xor q’) xor q’ (p xor p’) xor (p xor p’) (q xor q’)
+with p=a_u, p’=val(u, x xor e_{S[k]}), q=a_w, q’=val(w, x xor e_{S[k]}),
+and note that (p xor p’) = d_u[k], (q xor q’) = d_w[k]. This yields the rule in 4.3.
+
+Corollary 5.2 (Output semantics)
+For any output node out computing f, a(out)=f(x) and d(out)[k]=Delta_{S[k]} f(x).
+	6.	ZERO-SPARSITY AND EXACT COMPACTION
+
+6.1 Zero predicate and activity
+Define the exact zero predicate:
+ZERO(d) is true iff d = 0^W.
+
+Define node activity:
+ACTIVE(v) := not ZERO(d(v)).
+
+If ACTIVE(v) is false, then v contributes no directional differences to any downstream computation under the tracked directions, because its d-vector is identically zero.
+
+6.2 Batch compaction problem
+Let B be a batch of m mutually independent nodes v_0..v_{m-1} whose operands have already been computed.
+The goal is to compute:
+a(v_i) densely for all i,
+and store d(v_i) only for ACTIVE(v_i)=true, using stable packed storage.
+
+6.3 Stable packing contract
 Input:
-A[0..m-1] in {0,1} activity flags
-X[0..m-1] items
+A[0..m-1] activity flags where A[i]=1 iff ACTIVE(v_i).
+X[0..m-1] items (here, d(v_i) values, or references to them).
+
 Output:
-Y is the stable packed list of X[i] where A[i]=1, in increasing i order
-Implementation contract:
-There exists pos[i] = rank(A,i)-1 for A[i]=1 such that Y[pos[i]] = X[i]
+Y is the stable packed list of X[i] with A[i]=1, preserving increasing i order.
+There exists pos[i] such that:
+if A[i]=1 then pos[i] = rank(A,i) - 1 and Y[pos[i]] = X[i],
+if A[i]=0 then pos[i] is undefined.
 
-Mapping (dense to packed)
-map[i] = pos[i] if A[i]=1 else -1
+Define the dense-to-packed map:
+map[i] = pos[i] if A[i]=1 else -1.
 
-5. STRICT COMPACT
-   COMPACT operates on a batch of independent gates (e.g., a circuit level).
-   It preserves semantics exactly.
+6.4 Compaction output contract
+Compaction produces:
+a_out[0..m-1] (dense)
+map_out[0..m-1] (dense)
+pack_out[0..p-1] (packed), where p = sum_i A[i]
 
-Inputs
-A batch of m gates with operands referring to already-computed previous-level nodes.
+with the semantic invariant:
+map_out[i] = -1 iff d(v_i) = 0^W
+map_out[i] = r >= 0 implies pack_out[r] = d(v_i)
+and packing is stable with respect to i.
 
-Outputs
-a values for all m gates (dense)
-d masks for active gates only (packed), plus map[0..m-1]
+6.5 Soundness and completeness of compaction
+Soundness requirement (mandatory):
+If map_out[i] = -1 then d(v_i) = 0^W.
 
-Phase 1 ACTIVE (exact activity)
-Determine A_gate[i] = 1 iff the output mask of gate i is nonzero under the exact gate law.
+Completeness requirement (optional but performance-critical):
+If d(v_i) = 0^W then map_out[i] = -1.
 
-```
-Exact activity conditions
-  NOT(u):
-    active iff u is active
+If both hold, compaction exactly corresponds to eliminating and not storing zero difference vectors.
 
-  XOR(u,w):
-    if both inactive -> inactive
-    if exactly one active -> active
-    if both active -> active iff not EQUAL(d_u, d_w)
+6.6 Fused compute-and-compact schedule (normative)
+For each batch B:
+	1.	Compute all base values a(v_i) densely (scalar ops).
+	2.	Compute each d(v_i) using the exact laws in section 4.
+	3.	Compute A[i] by applying ZERO(d(v_i)) using an exact predicate.
+	4.	Compute map_out and p via prefix-sum on A (stable packing indices).
+	5.	Write pack_out[map_out[i]] = d(v_i) for active i.
+Inactive i perform no packed write.
 
-  AND(u,w):
-    Determine case by (a_u,a_w):
+This fused specification forbids declaring inactivity without an exact ZERO proof.
+	7.	REPRESENTATION CONTRACTS (IMPLEMENTATION-LEVEL, SEMANTICS-PRESERVING)
 
-    (0,0): active iff INTERSECTS(d_u, d_w)
-    (0,1): active iff NONEMPTY(d_u and not d_w)
-    (1,0): active iff NONEMPTY(d_w and not d_u)
-    (1,1): active iff NONEMPTY(d_u) or NONEMPTY(d_w)
+7.1 Bit-packing
+Let L = ceil(W/64).
+Represent d as L machine words, with lane bit k stored at word floor(k/64), bit (k mod 64).
+If W is not a multiple of 64, the high bits of the last word are padding and MUST be masked to zero after bitwise NOT or any operation that could set them.
 
-Soundness requirement
-  ACTIVE MUST be sound:
-    A_gate[i]=0 implies d(out_i)=0^W.
-  Completeness is optional but increases speedup:
-    d(out_i)=0^W implies A_gate[i]=0.
-```
-
-Phase 2 PROJECT (stable)
-Compute pos via rank/prefix-sum and allocate pack_out with length popcount(A_gate).
-Construct map_out where map_out[i]=pos[i] if active else -1.
-
-Phase 3 EVALUATE-PACKED
-Evaluate only active gates and write their masks into pack_out at stable positions.
-Inactive gates do not store masks.
-
-Semantics invariant
-For each gate i:
-map_out[i] = -1  iff d(out_i) = 0^W
-map_out[i] = r >= 0 implies pack_out[r] = d(out_i)
-
-6. EXECUTION SCHEDULE
-   Levelized execution (typical)
-   For level t:
-   Inputs are a_prev dense, pack_prev packed, map_prev dense->packed
-   Compute a_t dense for all gates
-   Compute A_gate_t using ACTIVE
-   PROJECT to get pack_t and map_t
-   EVALUATE-PACKED fills pack_t
-   Repeat.
-
-General DAG execution
-COMPACT is defined for any batch of mutually independent gates whose operands are already known.
-A scheduler MAY choose batches to maximize locality and compaction benefit.
-
-7. COMPLEXITY
-   Definitions
-   N total gates, D levels, m_t gates at level t, sum m_t = N
-   W lanes, L words, L = ceil(W/64)
-   p_t = popcount(A_gate_t) / m_t (active ratio)
-   q_t = fraction of gates in ACTIVE that require full-word predicates (both operands active and ambiguous)
-
-Baseline (no compaction)
-Time: O(N * L)
-Space (two levels): O(max_t m_t * L)
-
-Strict COMPACT
-Time per level:
-base a computation: O(m_t)
-ACTIVE: O(m_t) + O(q_t * m_t * L)
-PROJECT: O(m_t)
-EVALUATE-PACKED: O(p_t * m_t * L)
-Total:
-O(N) + O(N*L*(p_bar + q_bar)) where p_bar, q_bar are level-weighted averages
-
-```
-Worst case:
-  p_bar approx 1 and q_bar approx 1 gives O(N*L), same order as baseline
-
-Freezing regime:
-  p_bar and q_bar small yields near O(N) + O(N*L*small)
-
-Space per level:
-  a dense: O(m_t)
-  map dense: O(m_t)
-  packed masks: O(p_t * m_t * L)
-  Total peak: O(max_t m_t * (1 + p_t * L))
-```
-
-8. OPTIMIZATION STACK (EXACTNESS PRESERVING)
-All optimizations in this section preserve exactness.
-The central constraint is no false negatives in ACTIVE.
-
-8.1 Zero-rule first
-Before any full-word predicate, apply structural rules that are always exact:
-if an operand is inactive (map=-1) then its mask is 0^W
-many activity outcomes become trivial under the exact gate laws
-This reduces q_t in freezing regimes.
-
-8.2 Fingerprint gatekeeper (sound with verification)
-Maintain a per-mask fingerprint fp(d) (e.g., 64-bit hash) updated when a mask is produced.
-Use it to avoid full-word EQUAL and other predicates:
-If fp(d_u) != fp(d_w), then EQUAL is false, so XOR is active (sound).
-If fp matches, equality is unknown, so verify with full-word EQUAL.
-This never introduces false negatives because inactivity is declared only after full verification.
-The expected number of full-word predicates becomes proportional to the collision rate rho_t.
-
-```
-Effect on complexity
-  ACTIVE full-word predicate term becomes O(q_t * rho_t * m_t * L) in expectation.
-```
-
-8.3 Exact interning (optional) for O(1) equality
-Maintain an exact canonicalization table over packed masks (interning):
-masks are keyed by their exact word content, with collision resolution by full compare
-Assign a stable mask_id to each distinct mask value.
-Then EQUAL(d_u,d_w) can be answered by comparing mask_id in O(1).
-This can drive the XOR contribution to q_t toward zero.
-Correctness is preserved because interning is exact, not approximate.
-
-```
-Tradeoff
-  Interning adds memory proportional to the number of distinct packed masks and CPU for table maintenance.
-```
-
-8.4 Witness-carrying masks (exact certificates)
-Maintain with each packed mask an exact witness bit position widx such that d[widx]=1.
-Update rules:
-for OR, witness can be inherited from any nonzero operand
-for AND/ANDNOT, witness may be found by scanning the first nonzero word produced
-for XOR, witness can be inherited unless canceled; cancellation requires repair scan
-Use witness to certify activity cheaply:
-For INTERSECTS(d_u,d_w), if witness_u bit is also 1 in d_w then active.
-For d_u and not d_w, if witness_u bit is 1 in d_u and 0 in d_w then active.
-If certificate fails, fall back to full-word predicate.
-This reduces q_t for AND cases.
-
-8.5 Block summaries (exact or sound-above)
-Maintain block-level OR summaries of each mask, e.g., summary[b] = OR over words in block b.
+7.2 Exact nonzero predicate via summary trees (optional but recommended)
+Implement ZERO(d) and NONZERO(d) using a maintained root OR summary:
+root_or(d) = OR over all L words.
 Then:
-DISJOINT can be disproved quickly if any block has both summaries nonzero (sound to mark active)
-SUBSET violations can be witnessed when u has a nonzero block where w is all-ones in that block is not sufficient; therefore summaries primarily help to find likely witnesses and reduce scans
-Summaries are exact information (lossless OR), but coarse; they are best combined with witness and fallback.
+ZERO(d) iff root_or(d) == 0.
+This is exact.
 
-8.6 Packing and allocation
-PROJECT is implemented as:
-pos = prefix_sum(A) - 1
-map[A]=pos[A], map[not A]=-1
-pack_out allocated from a pool with capacity m_t
-Avoid INJECT:
-Keep masks packed across levels; only a and map remain dense.
+Maintain root_or for each produced d:
+either compute it alongside word generation (streaming OR),
+or maintain a k-ary segment-OR tree where internal nodes store OR of children, enabling polylog span updates and queries.
 
-8.7 Locality and gate reordering within a level
-Gates in a level are independent; their evaluation order may be permuted without changing semantics.
-Group gates by operand packed indices (or blocks of indices) to reduce gather misses:
-bucket_key = (block(map_u), block(map_w), opcode, basecase)
-Use linear-time bucketization rather than comparison sorting to keep O(m_t) per level.
-This reduces constant factors for packed gather and scattered writes.
+7.3 Exact equality via interning (optional)
+Maintain an exact canonicalization table mapping the full word sequence of a mask to a unique id(d).
+Then EQUAL(d1,d2) can be answered by id(d1) == id(d2), which is exact.
+Interning MUST resolve collisions by full word comparison and MUST never merge unequal masks.
 
-8.8 Adaptive mode switching (dense fallback)
-Packed evaluation can lose when the active ratio is high and predicate work dominates.
-Define thresholds tau_low and tau_high.
-If p_t <= tau_low, use strict packed COMPACT.
-If p_t >= tau_high, use dense evaluation for that level (compute all masks).
-Otherwise, use packed with predicate reduction (fingerprints, witness).
-This does not affect correctness and ensures worst-case performance does not degrade.
+7.4 Witness certificates (optional)
+Store with each nonzero mask a witness index widx such that d[widx]=1.
+Witnesses may accelerate proofs of NONZERO for intersections or differences but MUST never be used to prove ZERO.
+Any failure of witness-based short-circuit MUST fall back to exact predicates.
+	8.	SCHEDULING AND GLOBAL EXECUTION
 
-9. PRACTICAL NOTES
-   Mask width handling
-   If W is not a multiple of 64, the last word must be masked after NOT.
+8.1 Topological execution
+Evaluate the circuit in any topological order.
+Compaction is defined on any batch of nodes whose operands are already available.
+A scheduler MAY choose batches to optimize locality or active density, provided that data dependencies are respected.
 
-Early exits
-Full-word predicates should early-exit on the first discriminating word:
-EQUAL exits on first mismatch
-DISJOINT exits on first nonzero AND
-SUBSET exits on first nonzero (u and not w)
+8.2 Dense-to-packed operand access
+Operands may be stored as:
+base values a(u) densely indexed by node id,
+difference vectors d(u) as packed values plus map(u) to locate the packed entry.
 
-Verification and testing
-For development, verify:
-final (a(out), d(out)) matches dense baseline for many random seeds
-spot-check random gates: packed mask equals dense mask whenever map>=0
+When an operand u has map(u) = -1, it MUST be treated as d(u)=0^W.
+	9.	COMPLEXITY PARAMETERS
 
-10. CONCLUSION
-    CFC provides an exact counterfactual execution model based on local Boolean mask laws. COMPACT turns semantic inactivity into physical elimination of mask storage and computation, preserving correctness without approximation. The remaining costs shift to predicate work and packed gathers. The optimization stack presented here reduces full-word predicate frequency through sound gatekeeping (fingerprints), optional exact O(1) equality (interning), and witness certificates for set relations, while improving locality through stable packing, pooling, and level-local reordering. With adaptive dense fallback, the system approaches O(N*L*p) time when masks freeze, and retains O(N*L) worst-case behavior when they do not.
+Let n_g be total gate count.
+Let W be lane count and L=ceil(W/64).
+Let p be the fraction of active nodes whose d is nonzero at a given batch or level.
 
-END OF PAPER
+Baseline (no compaction):
+Work: O(n_g * L) word ops
+Span: depends on depth and word-parallelization; without additional structure, per-node d cost is O(1) span if words are processed in parallel, but work remains O(L).
+
+With exact compaction:
+Work reduces by avoiding storage and downstream processing for nodes proven to have d=0^W.
+The model does not change worst-case asymptotics; it changes the effective active set size.
+
+If nonzero testing uses root summaries, ZERO checks are O(1).
+Stable packing uses prefix-sum with span O(log m) per batch size m.
+	10.	IDENTITY STATEMENT
+
+This model is exactly:
+multi-direction forward-mode automatic differentiation over GF(2), where the derivative is the discrete difference Delta_i,
+augmented with semantics-preserving elimination and stable compaction of zero dual components.
+
+END OF SPECIFICATION
