@@ -1,24 +1,25 @@
-Title: Canonical Join-DAG with Admission-Controlled Evidence Checkpoints and Materialized Derived Indices
-Specification v0.0.1
+Title: Canonical Join-DAG with Declaration-Based Reads, Local Modules, and Commitment-Abstraction Checkpoints
+Specification v0.01
 Status: Draft (semantics frozen; no implementation-defined behavior permitted)
-
-1. Goals
+	1.	Goals
 
 1.1 Primary goals
 
-A. Partial-order world: the base history is a DAG of events with a causal partial order, not a total order.
+A. Partial-order world: the base history is a DAG of events with a causal partial order (links), while authoritative state evolution is confluent and order-independent.
 
-B. Confluence and idempotence by construction: authoritative state updates are pointwise joins over join-semilattices, so evaluation is order-independent and replay-safe.
+B. Confluence and idempotence by construction: authoritative updates are pointwise joins over join-semilattices, so evaluation is replay-safe and order-independent.
 
-C. Constant-time hot-path validation: accepting and relaying high-frequency DeltaEvents is bounded by protocol constants and does not require reading prior state beyond the canonical previous checkpoint root and epoch parameters.
+C. Constant-time hot-path validation: accepting and relaying high-frequency DeltaEvents is bounded by protocol constants and does not require reading prior state beyond known epoch anchors (prev state root and transcript).
 
-D. Fast verifiable reads: clients verify values using a canonical checkpoint root plus bounded membership and non-membership proofs.
+D. Declaration-based reads: all state reads performed by protocol-defined evaluation MUST be declared in advance by the event/module footprint and MUST be bounded by constants.
 
-E. Non-regressing extensibility: evolution occurs via bounded join-based indices and governance tags; adding new derived indices MUST NOT increase per-DeltaEvent validation cost.
+E. Module locality: derived indices and system effects are computed by a fixed set of local modules whose read/write footprints are state-independent (depend only on epoch, body bytes, and constants), enabling deterministic closure and bounded proofs.
 
-F. Optimization-closed semantics: admission, bandwidth allocation, and ranking influence are deterministic functions of protocol constants, canonical roots, and event bytes.
+F. Commitment abstraction: the state commitment is specified by a closed, identity-bound commitment scheme instance, while the core semantics are expressed over an abstract key-value state.
 
-G. Mathematical closure: all normative choices (encoding, admission, inclusion caps, canonical selection, fold semantics, derived materialization) are deterministic and leave no implementation-defined degrees of freedom.
+G. Non-regressing extensibility: adding a new module in a future version MUST NOT increase per-DeltaEvent admission cost; it MAY increase per-checkpoint evaluation cost only by bounded constants.
+
+H. Optimization-closed semantics: admission, ranking, and selection are deterministic functions of protocol constants, epoch anchors, and canonical bytes.
 
 1.2 Non-goals
 
@@ -28,11 +29,11 @@ B. Confidentiality/privacy beyond authenticity and integrity.
 
 C. Minimizing total global work across all participants; the protocol bounds per-node protocol work, not global economic cost.
 
-2. Normative language
+D. Implementation-defined pluggable verification logic. v0.01 is closed.
+	2.	Normative language
 
 MUST, MUST NOT, SHOULD, SHOULD NOT, MAY are as in RFC 2119.
-
-3. Notation
+	3.	Notation
 
 3.1 Bitstrings
 {0,1}^n denotes n-bit strings.
@@ -52,34 +53,44 @@ clz256(x) is the number of leading zero bits of a 256-bit value x.
 3.6 Lex order
 For equal-length byte strings, lex order is unsigned byte lexicographic.
 
-4. Protocol identity constants (v0.0.1)
+3.7 Sets and sorting
+All sets serialized on the wire MUST be sorted by canonical bytes and MUST be unique.
+	4.	Protocol identity constants (v0.01)
 
-All constants in this section are part of the v0.0.1 identity and MUST be identical across compliant implementations.
+All constants in this section are part of the v0.01 identity and MUST be identical across compliant implementations.
 
-4.1 Address space and neighborhood
+4.1 Address space and neighborhood (optional, non-consensus utility)
 
 SPACE_BITS = 256
 DEGREE_D = 8
-NEIGHBOR_CONST[i] = H("nbr" || U32LE(i)) for i in 0..DEGREE_D-1
+NEIGHBOR_CONST[i] = H(“nbr” || U32LE(i)) for i in 0..DEGREE_D-1
 
 NEIGHBOR_PERM is a public permutation P: {0,1}^256 -> {0,1}^256 defined as an 8-round Feistel network:
 
 Let v = L || R where L,R are 128-bit.
 For r = 0..7:
-F = Trunc128(H("F" || U32LE(r) || R))
+F = Trunc128(H(“F” || U32LE(r) || R))
 (L, R) = (R, L xor F)
 Then P(v) = L || R.
 
 Neighbor function:
 N_i(v) = P(v xor NEIGHBOR_CONST[i])
 
-4.2 Event limits
+4.2 Size limits
 
-MAX_PARENTS = 8
+MAX_LINKS = 8
+MAX_READS = 32
 MAX_OPS = 8
 MAX_EVENT_BYTES = 2048
 
-4.3 Epoch and inclusion limits
+MAX_BODY_DELTAS = 64
+
+MAX_META_BYTES = 64
+
+MAX_BUNDLE_BYTES = 1048576
+MAX_AUDIT_BYTES = 1048576
+
+4.3 Epoch and categories
 
 EPOCH_GENESIS = 0
 
@@ -90,32 +101,20 @@ CAT_RANK = 1
 CAT_GOV = 2
 CAT_RESERVED = 3
 
-Targets and slack (fixed):
+4.4 Inclusion caps (per checkpoint)
 
-TARGET[CAT_DATA] = 24
-SLACK[CAT_DATA] = 8
 CAP[CAT_DATA] = 32
-
-TARGET[CAT_RANK] = 12
-SLACK[CAT_RANK] = 4
 CAP[CAT_RANK] = 16
-
-TARGET[CAT_GOV] = 12
-SLACK[CAT_GOV] = 4
 CAP[CAT_GOV] = 16
-
-TARGET[CAT_RESERVED] = 0
-SLACK[CAT_RESERVED] = 0
 CAP[CAT_RESERVED] = 0
 
-MAX_INCLUDED = CAP[CAT_DATA] + CAP[CAT_RANK] + CAP[CAT_GOV] = 64
+MAX_INCLUDED = 64
 
-Additional per-tag caps inside CAT_GOV (enforced during checkpoint verification only):
+Additional per-tag caps inside CAT_GOV (enforced during checkpoint verification):
 
 CAP_TX = 8
-CAP_VMRES = 4
 
-4.4 Admission thresholds
+4.5 Admission thresholds
 
 Threshold bounds:
 
@@ -131,52 +130,33 @@ T0[RANK]=12
 T0[GOV]=12
 T0[RES]=0
 
-Target boundary z-values for feedback control (on z_eff, defined in Section 11.5):
+Target boundary z-values for feedback control (on z_eff, defined in Section 11.6):
 
 TargetZ[DATA]=16
 TargetZ[RANK]=18
 TargetZ[GOV]=18
 TargetZ[RES]=0
 
-4.5 Cost weights
+4.6 Cost weights
 
 COST_BASE = 1
 COST_PER_OP = 1
 COST_PER_256B = 1
 COST_HEAVY = 2
 
-4.6 Signal diffusion parameters
-
-SIG_T = 3
-SIG_RHO_NUM = 1
-SIG_RHO_DEN = 2
-
-Numeric format: signed fixed-point Q32.32 in int64. Division rounds toward zero.
-
-4.7 Score stabilization
+4.7 Surplus stabilization
 
 SURPLUS_CAP = 8
 
-4.8 Value and proof bounds
+4.8 Commitment instance
 
-MAX_META_BYTES = 128
-MAX_PROOF_BYTES = 524288
-MAX_CHECKPOINT_BYTES = 589824
-
-VM_PROOF_MAX = 131072
-VM_MAX_OUTPUTS = 8
-VM_MAX_OUTPUT_BYTES = 256
-
-TX_MAX_ITEMS = 8
-TX_MAX_LOCKS = 4
-TX_MAX_UNIQS = 4
-TX_MAX_CAS = 4
+STATE_COMMITMENT = SMT256 over SHA-256 as specified in Appendix C.
+All state audit proofs and membership/non-membership proofs MUST use this instance in v0.01.
 
 4.9 Genesis transcript constant
 
-TR_MINUS_1 = H("tr_genesis" || B32(0x00..00))
-
-5. Cryptographic primitives
+TR_MINUS_1 = H(“tr_genesis” || B32(0x00..00))
+	5.	Cryptographic primitives
 
 5.1 Hash
 H is SHA-256.
@@ -188,8 +168,7 @@ pk encoding: 32 bytes
 sig encoding: 64 bytes
 
 SIGCHECK(pk, msg, sig) returns true iff sig is a valid Ed25519 signature of msg under pk.
-
-6. Canonical encoding
+	6.	Canonical encoding
 
 6.1 Primitive encodings
 
@@ -197,12 +176,12 @@ U8(x): 1 byte
 U16LE(x): 2 bytes
 U32LE(x): 4 bytes
 U64LE(x): 8 bytes
-I64LE(x): 8 bytes two's complement
+I64LE(x): 8 bytes two’s complement
 B32(x): 32 bytes
 
 BYTES(b): U16LE(len(b)) || b, where 0 <= len(b) <= 65535
 
-VEC_T(xs): U16LE(n) || ENC_T(x1) || ... || ENC_T(xn)
+VEC_T(xs): U16LE(n) || ENC_T(x1) || … || ENC_T(xn)
 
 STR(s): BYTES(ASCII(s)), ASCII bytes MUST be in 0x20..0x7E.
 
@@ -210,12 +189,11 @@ STR(s): BYTES(ASCII(s)), ASCII bytes MUST be in 0x20..0x7E.
 For every structure type in this specification, its canonical byte encoding is exactly the concatenation of its fields encoded in the specified order using the primitives above. No alternative representation is permitted.
 
 6.3 Canonical sorting rule
-When a field is specified as "sorted", the sort order MUST be lexicographic on the canonical bytes of items.
+When a field is specified as “sorted unique”, the order MUST be lexicographic on canonical bytes and duplicates MUST be rejected.
 
 6.4 Canonical hash binding
 All hashes and signature messages are computed over canonical bytes defined by this section and the event canonicalization rules.
-
-7. Key derivation and tag IDs
+	7.	Keys, tags, and value models (normative)
 
 7.1 Key space
 K = {0,1}^256. Keys are exactly 32 bytes.
@@ -224,18 +202,16 @@ K = {0,1}^256. Keys are exactly 32 bytes.
 For any key k, tag_id(k) = k[0] (first byte). This is authoritative.
 
 7.3 Truncation
-Trunc248(x) is the last 31 bytes of the 32-byte value x.
+Trunc248(x) is the last 31 bytes of a 32-byte value x.
 
 7.4 KeyDerive
 For any tag_id t and canonical parts bytes P:
-KeyDerive(t, P) = U8(t) || Trunc248(H("k" || U8(t) || P))
+KeyDerive(t, P) = U8(t) || Trunc248(H(“k” || U8(t) || P))
 
-7.5 Reserved tags
-Any tag_id not explicitly listed as standard in Section 8.2 MUST be rejected if used in a DeltaEvent op.
+7.5 Categories
+Category(tag) is fixed by Table in Section 7.8.
 
-8. TagSpec and value models (normative)
-
-8.1 Value model family (closed)
+7.6 Value model family (closed)
 
 All tags use exactly one of the following value models; each yields a join-semilattice.
 
@@ -248,71 +224,67 @@ State is a set S of records with |S| <= K. Join is TopK_K(S union T) by a comple
 Model C: TOPK_MAP(K)
 State is a set S of records with |S| <= K. Each record has an mkey. BestByKey selects exactly one record per mkey by a complete total order (best_key). Then TopK_K is applied by a complete total order (order_key).
 
-8.2 Standard tags (v0.0.1)
+7.7 TagSpec interface (normative)
 
-User-writable tags (DeltaEvents MAY write only these):
-
-0x01 OBJ
-0x02 LOG
-0x03 TOP
-0x04 KEEP
-0x05 CMD
-0x06 CMDVOTE
-0x07 SCHEMA
-0x08 SCHEMAVOTE
-0x09 PTR
-0x0A POS
-0x0B IDX
-0x0C UNIQ
-0x0D LOCK
-0x0E TX
-0x0F TOMB
-0x10 VMRES
-
-System-derived tags (DeltaEvents MUST NOT write):
-
-0xE0 SIG
-0xE1 CMDIDX
-0xE2 SCHEMAIDX
-0xE3 SIGIDX
-0xE4 TXIDX
-0xE5 VMIDX
-
-8.3 TagSpec interface (normative)
-
-Each tag t has:
+Each user-writable tag t defines:
 
 Parse_t(payload_bytes) -> payload_struct or FAIL
 KeyCheck_t(payload_struct) -> key k_expected
 Normalize_t(ctx0, payload_struct) -> payload_norm or FAIL
 CapRule_t(ctx0, payload_norm) -> bool
 AuthRule_t(pk, key, payload_norm) -> bool
-Lift_t(ctx1, payload_norm) -> record in X_t
+Reads_t(ctx0, payload_norm) -> sorted unique VEC(B32) of keys (may be empty)
+Lift_t(ctx1, payload_norm, tie256) -> record in X_t
 DefaultBytes_t -> canonical empty value bytes
 MaxValueBytes_t -> U16 bound
 
-Constraint: Normalize/CapRule/AuthRule MUST depend only on ctx0 (Section 11.1). They MUST NOT depend on id, ticket, z, z_eff, surplus, or any value derived from them.
+Constraints:
 
-8.4 Category mapping
+A. Normalize/CapRule/AuthRule/Reads MUST depend only on ctx0. They MUST NOT depend on delta_id, ticket, z, z_eff, surplus, or any value derived from them.
 
-Category(t):
+B. Reads_t MUST include every state key that any protocol-defined evaluation may read as a consequence of this op in v0.01. Reads_t MUST NOT include CAT_RESERVED keys.
 
-OBJ, LOG, PTR, POS, IDX are CAT_DATA
-TOP is CAT_RANK
-KEEP, CMD, CMDVOTE, SCHEMA, SCHEMAVOTE, UNIQ, LOCK, TX, TOMB, VMRES are CAT_GOV
-System-derived tags are CAT_RESERVED
+C. Lift_t MUST be pure and MUST NOT read state; it may use ctx1 values (ticket, surplus, etc.) and tie256.
 
-Any DeltaEvent op with CAT_RESERVED MUST be rejected.
+7.8 Standard tags (v0.01)
 
-9. Events
+User-writable tags (DeltaEvents MAY write only these):
 
-9.1 DeltaEvent fields
+0x01 OBJ (DATA)
+0x02 LOG (DATA)
+0x03 TOP (RANK)
+0x04 KEEP (GOV)
+0x05 CMD (GOV)
+0x06 CMDVOTE (GOV)
+0x07 SCHEMA (GOV)
+0x08 SCHEMAVOTE (GOV)
+0x09 PTR (DATA)
+0x0A POS (DATA)
+0x0B IDX (DATA)
+0x0C UNIQ (GOV)
+0x0D LOCK (GOV)
+0x0E TX (GOV)
+0x0F TOMB (GOV)
+
+System-derived tags (user-writable MUST NOT write):
+
+0xE0 SIG (RESERVED)
+0xE1 CMDIDX (RESERVED)
+0xE2 SCHEMAIDX (RESERVED)
+0xE3 SIGIDX (RESERVED)
+0xE4 TXIDX (RESERVED)
+
+Any op with CAT_RESERVED MUST be rejected by CanonDelta.
+	8.	Events and wire messages
+
+8.1 DeltaEvent (wire)
 
 DeltaEvent is transmitted as canonical bytes of:
 
 type_tag: U8(0x01)
 epoch: U32LE
-parents: VEC(B32)
+links: VEC(B32) sorted unique (length <= MAX_LINKS)
+reads: VEC(B32) sorted unique (length <= MAX_READS)
 ops: VEC(Op)
 pk: B32
 nonce_incl: B32
@@ -325,113 +297,128 @@ payload: BYTES(payload_bytes)
 
 Total encoded size MUST be <= MAX_EVENT_BYTES.
 
-9.2 CheckpointEvent fields
+8.2 CheckpointHeader (wire)
 
-CheckpointEvent is transmitted as canonical bytes of:
+CheckpointHeader is transmitted as canonical bytes of:
 
 type_tag: U8(0x02)
 epoch: U32LE
-prev_root: B32
-batch_commit: B32
-cut_commit: B32
-meta: BYTES(meta_bytes)
-root: B32
-proof: BYTES(proof_bytes)
+prev_state_root: B32
+body_commit: B32
+state_root: B32
+meta: BYTES(meta_bytes) (len <= MAX_META_BYTES)
 pk: B32
 sig: 64 bytes
 
+8.3 BodyBundle (wire)
+
+BodyBundle is transmitted as canonical bytes of:
+
+type_tag: U8(0x03)
+epoch: U32LE
+body_commit: B32
+deltas: VEC(DeltaBytes) where each DeltaBytes is BYTES(delta_event_bytes)
+
 Constraints:
 
-len(meta_bytes) <= MAX_META_BYTES
-len(proof_bytes) <= MAX_PROOF_BYTES
-Total checkpoint bytes <= MAX_CHECKPOINT_BYTES
+A. Total bytes MUST be <= MAX_BUNDLE_BYTES.
+B. |deltas| MUST be <= MAX_BODY_DELTAS.
+C. Each delta_event_bytes MUST decode as a DeltaEvent structure and MUST be canonical under CanonDelta (Section 9).
 
-10. Canonicalization, IDs, and signature messages
+8.4 AuditBundle (wire)
 
-10.1 Delta canonicalization
+AuditBundle is transmitted as canonical bytes of:
 
-Define CanonDelta(d_raw) -> d or FAIL:
+type_tag: U8(0x04)
+epoch: U32LE
+prev_state_root: B32
+body_commit: B32
+keys_need_old: VEC(B32) sorted unique
+state_proof: BYTES(proof_bytes)
 
-A. Decode d_raw as DeltaEvent structure; if fail, FAIL.
-B. parents: sort ascending, deduplicate; if length > MAX_PARENTS, FAIL.
-C. ops: decode; for each op, let t = tag_id(k). Require t is a user-writable standard tag. Otherwise FAIL.
-D. For each op: payload_struct = Parse_t(payload_bytes). If fail, FAIL.
-E. KeyCheck: require KeyCheck_t(payload_struct) == k. Else FAIL.
-F. Define ctx0 as in Section 11.1. Compute payload_norm = Normalize_t(ctx0, payload_struct). If fail, FAIL.
-G. Require CapRule_t(ctx0, payload_norm) == true. Else FAIL.
-H. Require AuthRule_t(pk, k, payload_norm) == true. Else FAIL.
-I. Canonical payload bytes MUST be produced by re-encoding payload_norm using the tag's canonical payload encoding. Replace op.payload_bytes with these canonical bytes.
-J. ops: sort ascending by k. Reject if any duplicate k exists. Reject if op count is 0 or > MAX_OPS.
-K. Re-encode the event with canonicalized parents and ops; ensure size <= MAX_EVENT_BYTES.
+Constraints:
+
+A. Total bytes MUST be <= MAX_AUDIT_BYTES.
+B. keys_need_old MUST be sorted unique.
+C. proof_bytes MUST be a valid SMT256 multiproof against prev_state_root for exactly keys_need_old as specified in Appendix C.
+	9.	Canonicalization and delta digest
+
+9.1 CanonDelta(d_raw) -> d or FAIL
+
+A. Decode d_raw as DeltaEvent. If fail, FAIL.
+B. Enforce links sorted unique and length <= MAX_LINKS.
+C. Decode ops; require 1 <= ops_count <= MAX_OPS.
+D. For each op, let t = tag_id(k). Require t is a user-writable standard tag. Otherwise FAIL.
+E. For each op: payload_struct = Parse_t(payload_bytes). If fail, FAIL.
+F. KeyCheck: require KeyCheck_t(payload_struct) == k. Else FAIL.
+G. Define ctx0 as in Section 10.1. Compute payload_norm = Normalize_t(ctx0, payload_struct). If fail, FAIL.
+H. Require CapRule_t(ctx0, payload_norm) == true. Else FAIL.
+I. Require AuthRule_t(pk, k, payload_norm) == true. Else FAIL.
+J. Replace op.payload_bytes with the canonical re-encoding of payload_norm as defined by the tag spec.
+K. Sort ops ascending by k. Reject duplicates.
+L. Compute the required read set R_req as the sorted unique union over ops of Reads_t(ctx0, payload_norm) for that op.
+M. Require that reads field equals R_req exactly. Otherwise FAIL.
+N. Re-encode the event with canonical links, reads, and ops; ensure size <= MAX_EVENT_BYTES.
 
 CanonDelta returns the canonicalized DeltaEvent d.
 
-10.2 Core digest, Delta ID, and Delta signature message
+9.2 Delta digest and signature message
 
 Let bytes_without_sig(d) be the canonical encoding of d with sig field omitted (type_tag through nonce_incl).
-Define delta_core(d) = H("core" || bytes_without_sig(d)).
+Define delta_digest(d) = H(“delta” || bytes_without_sig(d)).
 
-id(d) = H("id" || delta_core(d)).
+Define:
 
-sigmsg_delta(d) = H("sigmsg" || delta_core(d)).
+id(d) = delta_digest(d)
+sigmsg_delta(d) = delta_digest(d)
+	10.	ctx0/ctx1, category, cost, ticket, and ordering
 
-10.3 Checkpoint core digest, ID, and signature message
-
-Let cp_bytes_without_sig be the canonical encoding of the checkpoint with sig field omitted (type_tag through pk).
-Define cp_core(cp) = H("cpcore" || cp_bytes_without_sig).
-
-id(cp) = H("id" || cp_core(cp)).
-sigmsg_cp(cp) = H("cpsig" || cp_core(cp)).
-
-11. Admission: category, cost, ticket, and ctx
-
-11.1 ctx0 and ctx1 (non-circular)
+10.1 ctx0 and ctx1
 
 For any op within a DeltaEvent at epoch e:
 
 ctx0 contains:
+
 e
-prev_root = root_star(e-1) for e>0, else B32(0x00..00)
+prev_state_root = state_root_star(e-1) for e>0, else B32(0x00..00)
 TR_prev = TR_{e-1} for e>0, else TR_MINUS_1
 pk (from the DeltaEvent)
-pk_hash = H("pk" || pk)
+pk_hash = H(“pk” || pk)
 k (the op key)
-op_rank = H("oprank" || k || payload_bytes_canonical) interpreted as B32 for tie-breaking only
+op_rank = H(“oprank” || k || payload_bytes_canonical) interpreted as B32 for tie-breaking only
 
 ctx1 extends ctx0 with:
+
 delta_id = id(d)
 cat = cat(d)
 cost = C(d)
 ticket, z, reqbits, surplus, surplus_clip, z_eff (defined below)
 
-Constraint: TagSpec Normalize/Cap/Auth MUST use only ctx0.
+10.2 Delta category
 
-11.2 Delta category
-
-cat(d) is the maximum precedence among categories of its ops' tags under precedence:
+cat(d) is the maximum precedence among categories of its ops’ tags under precedence:
 
 CAT_RANK > CAT_GOV > CAT_DATA > CAT_RESERVED.
 
 If any op is CAT_RESERVED, reject.
 
-11.3 Cost
+10.3 Cost
 
 Let bytes(d) be the length of canonical bytes of d including sig.
 heavy_count is the number of ops whose tag is TOP (0x03).
 
 C(d) = COST_BASE
+	•	COST_PER_OP * ops_count
+	•	COST_PER_256B * ceil(bytes(d)/256)
+	•	COST_HEAVY * heavy_count
 
-* COST_PER_OP * ops_count
-* COST_PER_256B * ceil(bytes(d)/256)
-* COST_HEAVY * heavy_count
+10.4 Threshold parameters
 
-11.4 Threshold parameters
+T_e[cat] are the thresholds for epoch e (Section 15). Genesis is Section 4.5.
 
-T_e[cat] are the thresholds for epoch e (Section 16). Genesis is Section 4.4.
+10.5 Ticket and work bits
 
-11.5 Ticket, work bits, and z_eff
-
-ticket(d,e) = H("incl" || U32LE(e) || U8(cat(d)) || ctx0.prev_root || ctx0.TR_prev || id(d) || nonce_incl)
+ticket(d,e) = H(“incl” || U32LE(e) || U8(cat(d)) || ctx0.prev_state_root || ctx0.TR_prev || id(d) || nonce_incl)
 
 z(d,e) = clz256(ticket(d,e))
 
@@ -441,90 +428,846 @@ ceil_log2(n) is the smallest integer r such that 2^r >= n, n>=1.
 
 workvalid(d,e) holds iff z(d,e) >= reqbits(d,e)
 
+10.6 Surplus and z_eff
+
 surplus(d,e) = z(d,e) - reqbits(d,e)
 surplus_clip(d,e) = min(surplus(d,e), SURPLUS_CAP)
 
 Define z_eff(d,e) = reqbits(d,e) + surplus_clip(d,e).
 Equivalently, z_eff(d,e) = min(z(d,e), reqbits(d,e) + SURPLUS_CAP).
 
-11.6 Canonical tie primitives (op_tie256 unified)
+10.7 Canonical tie primitive
 
-Define op_tie256(d,e,op) = H("optie" || ticket(d,e) || id(d) || op.k || H(op.payload_bytes_canonical)).
+Define op_tie256(d,e,op) = H(“optie” || ticket(d,e) || id(d) || op.k || H(op.payload_bytes_canonical)).
+
+10.8 Delta order key
 
 Define delta_order(d,e) as the complete total order key:
+
 delta_order(d,e) = ( z_eff(d,e) desc, ticket(d,e) asc, id(d) asc )
 
-All bounded selections and deterministic TopK procedures in this specification MUST end in a complete order; delta_order and op_tie256 provide such closure.
+All deterministic TopK procedures and bounded selections in v0.01 MUST end in a complete order; delta_order and op_tie256 provide such closure.
+	11.	Admission rules
 
-12. Acceptance rules
-
-12.1 AcceptDelta
+11.1 AcceptDelta
 
 A node MUST accept and MAY relay a DeltaEvent d_raw for epoch e iff:
 
 A. CanonDelta(d_raw) succeeds producing canonical d.
 B. SIGCHECK(pk, sigmsg_delta(d), sig) == true.
-C. Node knows root_star(e-1) and TR_{e-1} (or genesis for e=0), can compute T_e, and workvalid(d,e) holds.
+C. Node knows state_root_star(e-1) and TR_{e-1} (or genesis for e=0), can compute T_e, and workvalid(d,e) holds.
 D. cat(d) is not CAT_RESERVED.
 
 Otherwise it MUST reject. Nodes SHOULD deduplicate by id(d) and MUST NOT relay duplicates.
 
-12.2 AcceptCheckpoint
+11.2 Receipt set (local, normative for optimization)
 
-A node MUST accept and MAY relay a CheckpointEvent cp iff:
+A node MAY maintain a local Receipt_e set of delta ids accepted by AcceptDelta for epoch e.
 
-A. cp decodes; meta/proof lengths and total size satisfy bounds.
-B. SIGCHECK(cp.pk, sigmsg_cp(cp), cp.sig) == true.
-C. For e=0, cp.prev_root is all-zero; for e>0, cp.prev_root == root_star(e-1) once root_star(e-1) is known.
-D. VerifyCheckpointProof(cp) == true (Section 14).
+Receipt_e is not a wire object. It is a local cache that MAY be used to avoid re-verifying signature/work for deltas whose id is already in Receipt_e. Using Receipt_e MUST NOT change the acceptance semantics of CheckpointHeader validity as defined in Section 13.
+	12.	Body commitment
 
-Otherwise it MUST reject.
+12.1 Body leaf and root
 
-13. Commitments
+For a canonical DeltaEvent d, define delta_bytes(d) as its full canonical bytes including sig.
 
-13.1 Merkle root
+Define leaf(d) = H(“bleaf” || delta_bytes(d)).
 
-A Merkle tree uses SHA-256:
+Given a list of included deltas B = [d1..dn], define BodyCommit(B) as:
 
-leaf = H("mleaf" || leaf_bytes)
-parent = H("mnode" || left || right)
+A. Compute leaves L = [leaf(di)] for all di.
+B. Sort L ascending lex and reject duplicates.
+C. body_commit = MerkleRoot(L) using SHA-256:
+
+leaf_node = H(“mleaf” || leaf_bytes)
+parent = H(“mnode” || left || right)
 If odd count at a level, duplicate the last.
+MerkleRoot([]) = H(“mempty”)
 
-MerkleRoot([]) = H("mempty")
+12.2 Canonical BodyBundle ordering
 
-13.2 batch_commit
+A BodyBundle MUST include deltas such that, when parsed into canonical deltas, their leaf list equals exactly the leaves used in body_commit, and the bundle deltas MUST be ordered by ascending leaf (lex on B32 leaf values). This is a canonical ordering rule.
+	13.	Checkpoints: validity, evaluation, and selection
 
-batch_commit is MerkleRoot of the sorted list of included delta ids (ascending B32). List length MUST be <= MAX_INCLUDED.
+13.1 Meta format (derived, normative)
 
-13.3 cut_commit
+meta_bytes encode:
 
-Let B be the included delta id set. For x,y in B, define an induced edge x -> y if y lists x as a parent.
-Frontier(B) is the subset of B with no outgoing edge in the induced relation.
-cut_commit is MerkleRoot of the sorted list of Frontier(B) ids.
+meta.count_data: U16LE
+meta.count_rank: U16LE
+meta.count_gov: U16LE
+meta.kthZeff_data: U8
+meta.kthZeff_rank: U8
+meta.kthZeff_gov: U8
+meta.surplus_sum_clip: U64LE
 
-14. Checkpoint proof: SMT256, multi-update, deterministic recomputation
+Definitions (for epoch e and body B):
 
-14.1 State root structure (SMT256)
+count_cat is the number of included deltas with category cat.
+
+Let IncludedCat[cat] be included deltas filtered by cat(d). Sort IncludedCat[cat] by delta_order(d,e) best-first.
+
+If |IncludedCat[cat]| < CAP[cat], kthZeff_cat = 0.
+Else kthZeff_cat = z_eff value of the element at position CAP[cat] (1-based) in that order.
+
+surplus_sum_clip is sum over all included deltas of surplus_clip(d,e), computed in mathematical integers; if the sum exceeds 2^64-1 the checkpoint is invalid.
+
+13.2 CheckpointHeader digest and signature message
+
+Let hdr_bytes_without_sig be the canonical encoding of the header with sig omitted (type_tag through pk).
+Define hdr_digest = H(“hdr” || hdr_bytes_without_sig).
+sigmsg_hdr = hdr_digest.
+
+13.3 AcceptCheckpointHeader (syntax-only)
+
+A node MUST accept and MAY relay a CheckpointHeader hdr iff:
+
+A. hdr decodes and meta length <= MAX_META_BYTES.
+B. SIGCHECK(hdr.pk, sigmsg_hdr(hdr), hdr.sig) == true.
+C. For e=0, hdr.prev_state_root is all-zero; for e>0, hdr.prev_state_root == state_root_star(e-1) once known.
+
+This is a syntax-and-link check only. Full validity requires verification with the corresponding bundles (Section 13.4).
+
+13.4 VerifyCheckpoint (full validity)
+
+A checkpoint for epoch e consists of:
+	•	CheckpointHeader hdr
+	•	BodyBundle body (with matching epoch and body_commit)
+	•	Either:
+	•	Stateful evaluation using a locally stored state S_{e-1}, or
+	•	Stateless audit using AuditBundle audit
+
+A node MUST consider hdr fully valid iff all conditions below hold.
+
+13.4.1 Body verification
+
+A. body.epoch == hdr.epoch == e.
+B. body.body_commit == hdr.body_commit.
+C. Parse all body.deltas and canonicalize with CanonDelta, producing canonical deltas B ordered by ascending leaf. Require bundle ordering is correct and leaves are unique.
+D. Require BodyCommit(B) == hdr.body_commit.
+
+13.4.2 Delta validity and caps
+
+A. For each d in B: require d.epoch == e.
+B. Require SIGCHECK(d.pk, sigmsg_delta(d), d.sig) == true.
+C. Require workvalid(d,e) == true.
+D. Enforce inclusion caps by category: |IncludedCat[cat]| <= CAP[cat].
+E. Enforce per-tag caps in GOV: the number of included deltas containing a TX op MUST be <= CAP_TX.
+
+13.4.3 KeysNeedOld (declaration-based)
+
+Define per-delta write keys:
+
+W_delta(d) = { op.k | op in d.ops }
+
+Define per-delta read keys:
+
+R_delta(d) = d.reads (already enforced equal to union of Reads_t over ops)
+
+Let Modules be the fixed module set in Appendix B. For each module M, define its declared footprint:
+
+(R_M, W_M) = Footprint_M(e, B, const)
+
+Footprint_M MUST depend only on (e, B, const), not on any state bytes.
+
+Define:
+
+R_body = union over d in B of R_delta(d) union union over M of R_M
+W_body = union over d in B of W_delta(d) union union over M of W_M
+
+KeysNeedOld = sorted unique union of (R_body union W_body).
+
+13.4.4 Audit precondition for stateless verification
+
+If verifying statelessly, require:
+
+A. audit.epoch == e, audit.prev_state_root == hdr.prev_state_root, audit.body_commit == hdr.body_commit.
+B. audit.keys_need_old equals KeysNeedOld exactly.
+C. audit.state_proof is a valid SMT256 multiproof opening exactly KeysNeedOld against hdr.prev_state_root (Appendix C), producing OldBytes[k] for all keys.
+
+If verifying statefully, the node MUST have OldBytes[k] for all keys in KeysNeedOld from its local S_{e-1}.
+
+13.4.5 Phase 1: user delta fold
+
+For each included delta d and each op in d.ops:
+
+A. Build ctx0 and ctx1 for that op. ctx1 values (ticket, surplus, z_eff, etc.) use e and hdr.prev_state_root and TR_{e-1}.
+B. Compute tie256 = op_tie256(d,e,op).
+C. Compute record = Lift_t(ctx1, payload_norm, tie256).
+D. Join record into Δ_user[op.k] under that tag’s value model join. Omit keys whose delta equals the empty element.
+
+Then compute Phase 1 intermediate state:
+
+S’(k) = Join( Decode(OldBytes[k]), Δ_user[k] ) for keys where applicable, else Decode(OldBytes[k]).
+Encode S’(k) back to bytes NewBytes1[k] as needed by modules.
+
+Phase 1 MUST NOT read any key outside KeysNeedOld.
+
+13.4.6 Phase 2: module evaluation
+
+For each module M in Modules:
+
+A. Let (R_M, W_M) be its footprint.
+B. Provide the module the projection S’|{R_M} using the Phase 1 bytes for those keys (using OldBytes for keys not written in Phase 1).
+C. Compute Δ_M = Eval_M(e, B, S’|{R_M}, const).
+D. Require dom(Δ_M) ⊆ W_M.
+
+Combine all module deltas by key-wise join:
+
+Δ_sys = ⊔_M Δ_M
+
+Compute final bytes for keys in W_body:
+
+NewBytes[k] = Encode( Join( Decode(OldBytes[k]), Δ_user[k], Δ_sys[k] ) ) as defined by tag value models, with omitted deltas treated as empty.
+
+13.4.7 State root recomputation
+
+Using SMT256 multi-update recomputation (Appendix C):
+	•	Starting from hdr.prev_state_root and the multiproof sibling set (stateless) or from the locally stored SMT (stateful), recompute the new root after updating exactly the keys in W_body to NewBytes[k] with present=1.
+	•	The computed root MUST equal hdr.state_root.
+
+13.4.8 Meta verification
+
+Recompute meta_bytes from B and e per Section 13.1 and require exact equality with hdr.meta.
+
+If all checks pass, hdr is fully valid.
+
+13.5 Canonical checkpoint selection and transcript
+
+13.5.1 Candidate set
+
+For epoch e, Q_e is the set of fully valid checkpoint headers for epoch e under Section 13.4 (i.e., headers for which required bundles were obtained and verified).
+
+13.5.2 Score and tie
+
+Define hdr_tie = H(“hdr_tie” || U32LE(e) || hdr.prev_state_root || TR_{e-1} || hdr.body_commit || hdr.state_root || H(“pk”||hdr.pk))
+Define inv_tie = bitwise-not(hdr_tie) interpreted as 256-bit unsigned.
+
+Score(hdr) = lexicographic tuple:
+
+( meta.surplus_sum_clip, meta.kthZeff_rank, meta.kthZeff_gov, meta.kthZeff_data, inv_tie )
+
+13.5.3 CanonicalCheckpoint
+
+CanonicalCheckpoint(e) is the hdr in Q_e with maximal Score(hdr). Ties cannot remain due to inv_tie.
+
+Define state_root_star(e) = CanonicalCheckpoint(e).state_root.
+
+13.5.4 Transcript
+
+TR_e = H(“tr” || U32LE(e) || state_root_star(e) || CanonicalCheckpoint(e).meta || CanonicalCheckpoint(e).body_commit)
+
+For e=0, TR_{-1} is TR_MINUS_1.
+	14.	Client reads (state commitment)
+
+A client selects an epoch e and uses state_root_star(e) as anchor.
+
+Membership/non-membership proofs MUST be SMT256 openings as specified in Appendix C.
+Absent keys are representable and verifiable via present==0 openings.
+	15.	Threshold update rule
+
+Genesis: T_0[cat] = T0[cat].
+
+For e >= 0, after state_root_star(e) is established:
+
+T_{e+1}[cat] = clamp( T_e[cat] + sign( kthZeff_e[cat] - TargetZ[cat] ), TMIN[cat], TMAX[cat] )
+
+kthZeff_e[cat] is taken from meta of CanonicalCheckpoint(e).
+All arithmetic in the sign argument is done in mathematical integers.
+
+sign(x) = +1 if x>0, 0 if x==0, -1 if x<0.
+	16.	Networking and availability
+
+16.1 Relay policy
+
+Nodes MUST relay accepted CheckpointHeader messages subject to local rate limits.
+
+Nodes SHOULD relay accepted DeltaEvents subject to local resource controls. Nodes MUST be able to validate and decide relay using only the delta bytes plus known (state_root_star(e-1), TR_{e-1}, thresholds).
+
+16.2 Bundle retrieval
+
+BodyBundle and AuditBundle MAY be fetched on demand. A node MUST NOT treat a CheckpointHeader as fully valid unless it has verified the required bundles per Section 13.4.
+
+16.3 Availability failure handling
+
+If a node cannot obtain bundles for a header, that header is not in Q_e for that node and cannot be selected as canonical by that node. This is an availability constraint and is explicitly in scope.
+	17.	Security considerations (normative consequences)
+
+17.1 No encoding ambiguity
+
+All digests, tickets, and signatures depend on canonical bytes. CanonDelta re-emits payloads canonically. Any alternative encoding is non-compliant.
+
+17.2 No circular definitions
+
+Normalize/Cap/Auth/Reads depend only on ctx0. Ticket/z/surplus appear only in ctx1 and are used only after canonicalization.
+
+17.3 Declaration-based reads are enforced
+
+CanonDelta requires reads field equals the union of Reads_t across ops. Modules have declared, state-independent footprints. Any evaluation that would read outside declared footprints is non-compliant.
+
+17.4 DoS surfaces are bounded by constants
+
+All per-event and per-checkpoint work is bounded by MAX_* constants and CAP_* caps. Nodes MAY apply local relay/storage rate limits, but MUST NOT change verification semantics.
+
+Appendix A. TagSpec payloads, key checks, read declarations, value models, and defaults (normative)
+
+Common helper:
+
+Owner(pk) = H(“pk” || pk) (32 bytes)
+
+All value encodings below are canonical and MUST be used.
+
+A.1 OBJ (0x01)
+
+Category: DATA
+Value model: MAX_BY
+
+Key parts: B32(obj_id)
+Key: KeyDerive(0x01, B32(obj_id))
+
+Payload: B32(obj_id) || B32(blob_hash)
+
+Parse: exactly 64 bytes.
+KeyCheck: KeyDerive(0x01, B32(obj_id)).
+Normalize: identity.
+CapRule: true.
+AuthRule: true.
+Reads: empty.
+
+Lift(ctx1, payload_norm, tie256):
+record = (blob_hash:B32, tie:B32) where tie = tie256
+order_key = (bitwise-not(blob_hash) asc, tie asc)
+
+State value bytes: present==0 means absent; if present, vbytes = B32(blob_hash).
+DefaultBytes: empty (absent treated as no blob).
+MaxValueBytes: 32.
+
+A.2 LOG (0x02)
+
+Category: DATA
+Value model: TOPK_SET with K=64
+
+Key parts: B32(scope) || B32(topic)
+Key: KeyDerive(0x02, parts)
+
+Payload: B32(scope) || B32(topic) || U64LE(ord) || BYTES(item) with len(item) <= 64
+
+Normalize: identity.
+CapRule: len(item) <= 64.
+AuthRule: true.
+Reads: empty.
+
+Lift:
+weight = min(surplus_clip(d,e), 255) using ctx1
+record = (ord:u64, item:bytes<=64, weight:u8, tie:B32, src:B32)
+src = id(d), tie = tie256
+order_key = (weight desc, tie asc, ord asc, H(item) asc, src asc)
+
+DefaultBytes: empty vector.
+MaxValueBytes: 8192.
+
+A.3 TOP (0x03)
+
+Category: RANK
+Value model: TOPK_SET with K=32
+
+Key parts: B32(scope) || B32(metric)
+Key: KeyDerive(0x03, parts)
+
+Payload: B32(scope) || B32(metric) || I64LE(score) || BYTES(item), len(item) <= 64
+
+Normalize: identity.
+CapRule: len(item) <= 64.
+AuthRule: true.
+Reads: empty.
+
+Lift:
+weight = min(surplus_clip(d,e), 255)
+record = (score:i64, item:bytes<=64, weight:u8, tie:B32, src:B32)
+order_key = (weight desc, tie asc, score desc, H(item) asc, src asc)
+
+DefaultBytes: empty vector.
+MaxValueBytes: 8192.
+
+A.4 KEEP (0x04)
+
+Category: GOV
+Value model: MAX_BY
+
+Key parts: B32(obj_id)
+Key: KeyDerive(0x04, B32(obj_id))
+
+Payload: B32(obj_id)
+
+Normalize: identity.
+CapRule: true.
+AuthRule: true.
+Reads: empty.
+
+Lift:
+weight = min(surplus_clip(d,e), 255)
+record = (weight:u8, tie:B32) where tie = tie256
+order_key = (weight desc, tie asc)
+
+State bytes: U8(weight).
+DefaultBytes: U8(0).
+MaxValueBytes: 1.
+
+A.5 CMD (0x05)
+
+Category: GOV
+Value model: MAX_BY
+
+Key parts: B32(cmdh)
+Key: KeyDerive(0x05, B32(cmdh))
+
+Payload: B32(cmdh) || B32(obj_id) || B32(schema_id) || BYTES(cost_vec) with len(cost_vec) <= 64
+
+Normalize: identity.
+CapRule: len(cost_vec) <= 64.
+AuthRule: true.
+Reads: empty.
+
+Lift:
+weight = min(surplus_clip(d,e), 255)
+record = (obj_id:B32, schema_id:B32, cost_vec:bytes, weight:u8, tie:B32)
+order_key = (weight desc, tie asc)
+
+State bytes: B32(obj_id) || B32(schema_id) || BYTES(cost_vec).
+DefaultBytes: empty.
+MaxValueBytes: 130.
+
+A.6 CMDVOTE (0x06)
+
+Category: GOV
+Value model: MAX_BY
+
+Key parts: B32(cmdh)
+Key: KeyDerive(0x06, B32(cmdh))
+
+Payload: B32(cmdh)
+
+Normalize: identity.
+CapRule: true.
+AuthRule: true.
+Reads: empty.
+
+Lift:
+weight = min(surplus_clip(d,e), 255)
+record = (weight:u8, tie:B32)
+order_key = (weight desc, tie asc)
+
+State bytes: U8(weight).
+DefaultBytes: U8(0).
+MaxValueBytes: 1.
+
+A.7 SCHEMA (0x07)
+
+Category: GOV
+Value model: MAX_BY
+
+Key parts: B32(schema_id)
+Key: KeyDerive(0x07, B32(schema_id))
+
+Payload: B32(schema_id) || B32(obj_id)
+
+Normalize: identity.
+CapRule: true.
+AuthRule: true.
+Reads: empty.
+
+Lift:
+weight = min(surplus_clip(d,e), 255)
+record = (obj_id:B32, weight:u8, tie:B32)
+order_key = (weight desc, tie asc)
+
+State bytes: B32(obj_id).
+DefaultBytes: empty.
+MaxValueBytes: 32.
+
+A.8 SCHEMAVOTE (0x08)
+
+Category: GOV
+Value model: MAX_BY
+
+Key parts: B32(schema_id)
+Key: KeyDerive(0x08, B32(schema_id))
+
+Payload: B32(schema_id)
+
+Normalize: identity.
+CapRule: true.
+AuthRule: true.
+Reads: empty.
+
+Lift:
+weight = min(surplus_clip(d,e), 255)
+record = (weight:u8, tie:B32)
+order_key = (weight desc, tie asc)
+
+State bytes: U8(weight).
+DefaultBytes: U8(0).
+MaxValueBytes: 1.
+
+A.9 PTR (0x09)
+
+Category: DATA
+Value model: TOPK_MAP with K=8, mkey=owner
+
+Key parts: B32(scope) || BYTES(name)
+Key: KeyDerive(0x09, parts)
+
+Payload: B32(scope) || BYTES(name) || U8(mode) || U32LE(until) || B32(ref) || BYTES(aux)
+Constraints: len(name) <= 64, len(aux) <= 64, mode in {0,1}
+
+Normalize: identity.
+CapRule: constraints.
+AuthRule: true.
+Reads: empty.
+
+Lift:
+owner = Owner(pk)
+level = min(surplus_clip(d,e), 255)
+aux_hash = H(“aux”||aux)
+record = (owner:B32, mode:u8, level:u8, until:u32, ref:B32, aux_hash:B32, tie:B32)
+best_key within owner = (mode desc, level desc, until desc, tie asc)
+order_key across owners = same tuple
+
+DefaultBytes: empty vector.
+MaxValueBytes: 8192.
+
+A.10 POS (0x0A)
+
+Category: DATA
+Value model: TOPK_MAP with K=8, mkey=owner
+
+Key parts: B32(owner)
+Key: KeyDerive(0x0A, B32(owner))
+
+Payload: B32(owner) || BYTES(pos) with len(pos) <= 64
+
+Normalize: identity.
+CapRule: len(pos) <= 64.
+AuthRule: require owner == Owner(pk).
+Reads: empty.
+
+Lift:
+level = min(surplus_clip(d,e), 255)
+pos_hash = H(“pos”||pos)
+record = (owner:B32, level:u8, pos_hash:B32, tie:B32)
+best_key = (level desc, tie asc)
+order_key = same
+
+DefaultBytes: empty vector.
+MaxValueBytes: 4096.
+
+A.11 IDX (0x0B)
+
+Category: DATA
+Value model: TOPK_MAP with K=8, mkey=owner
+
+Key parts: B32(vertex)
+Key: KeyDerive(0x0B, B32(vertex))
+
+Payload: B32(vertex) || B32(owner) || U32LE(until) || BYTES(endpoint) with len(endpoint) <= 128
+
+Normalize: identity.
+CapRule: len(endpoint) <= 128.
+AuthRule: require owner == Owner(pk).
+Reads: empty.
+
+Lift:
+level = min(surplus_clip(d,e), 255)
+ep_hash = H(“ep”||endpoint)
+record = (owner:B32, level:u8, until:u32, ep_hash:B32, tie:B32)
+best_key = (level desc, until desc, tie asc)
+order_key = same
+
+DefaultBytes: empty vector.
+MaxValueBytes: 4096.
+
+A.12 UNIQ (0x0C)
+
+Category: GOV
+Value model: MAX_BY
+
+Key parts: B32(namespace) || B32(value_hash)
+Key: KeyDerive(0x0C, parts)
+
+Payload: B32(namespace) || B32(value_hash)
+
+Normalize: identity.
+CapRule: true.
+AuthRule: true.
+Reads: empty.
+
+Lift:
+owner = Owner(pk)
+lvl = min(surplus_clip(d,e), 255)
+src = id(d)
+record = (owner:B32, lvl:u8, src:B32, tie:B32)
+order_key = (lvl desc, src asc, tie asc)
+
+State bytes: B32(owner) || U8(lvl) || B32(src).
+DefaultBytes: empty.
+MaxValueBytes: 65.
+
+A.13 LOCK (0x0D)
+
+Category: GOV
+Value model: MAX_BY
+
+Key parts: B32(lock_id)
+Key: KeyDerive(0x0D, B32(lock_id))
+
+Payload: B32(lock_id) || U32LE(lease_until_epoch)
+
+Normalize: identity.
+CapRule: true.
+AuthRule: true.
+Reads: empty.
+
+Lift:
+owner = Owner(pk)
+lvl = min(surplus_clip(d,e), 255)
+src = id(d)
+record = (owner:B32, until:u32, lvl:u8, src:B32, tie:B32)
+order_key = (lvl desc, until desc, src asc, tie asc)
+
+State bytes: B32(owner) || U32LE(until) || U8(lvl) || B32(src).
+DefaultBytes: empty.
+MaxValueBytes: 69.
+
+A.14 TOMB (0x0F)
+
+Category: GOV
+Value model: MAX_BY
+
+Key parts: B32(target_k)
+Key: KeyDerive(0x0F, B32(target_k))
+
+Payload: B32(target_k) || U8(kind) || U32LE(until_epoch)
+kind: 0=DEL, 1=UNDEL
+
+Normalize: identity.
+CapRule: true.
+AuthRule: true.
+Reads: empty.
+
+Lift:
+lvl = min(surplus_clip(d,e), 255)
+src = id(d)
+record = (kind:u8, until:u32, lvl:u8, src:B32, tie:B32)
+order_key = (lvl desc, kind desc, until desc, src asc, tie asc) where DEL > UNDEL for kind desc
+
+State bytes: U8(kind) || U32LE(until) || U8(lvl) || B32(src).
+DefaultBytes: empty.
+MaxValueBytes: 38.
+
+Effective deletion rule (normative):
+Let tomb be the decoded TOMB value for target key k at epoch e.
+If tomb.kind==DEL and (tomb.until==0xFFFFFFFF or e <= tomb.until) then k is logically deleted at epoch e; otherwise it is not deleted.
+
+A.15 TX (0x0E)
+
+Category: GOV
+Value model: MAX_BY
+
+Key parts: U32LE(epoch) || B32(tx_id)
+Key: KeyDerive(0x0E, parts)
+
+Payload encoding (canonical):
+
+U32LE(epoch) || B32(tx_id) || U8(kind) ||
+VEC(B32, locks_sorted_unique) ||
+VEC(B32, uniq_keys_sorted_unique) ||
+VEC(CAS, cas_sorted_unique_by_key) ||
+VEC(TxItem, items_sorted_unique_by_k)
+
+CAS = B32(k) || B32(expect_val_hash)
+TxItem = B32(k) || BYTES(item_payload_bytes)
+
+Constraints (CapRule):
+
+A. epoch MUST equal ctx0.e
+B. kind in {0,1} where 0=APPLY, 1=CANCEL
+C. |locks| <= 4, |uniq_keys| <= 4, |cas| <= 4, |items| <= 8
+D. If kind==CANCEL then items MUST be empty
+E. Each TxItem.k MUST be a user-writable standard tag and MUST NOT be CAT_RESERVED
+F. Each item_payload_bytes MUST pass Parse/KeyCheck/Normalize/Cap/Auth for its target tag using ctx0 derived from the outer ctx0 with k=TxItem.k, and MUST be re-emitted in canonical form inside TX.
+
+AuthRule: true (per-item AuthRule enforced during Normalize).
+
+Reads_t (declaration):
+
+If kind==CANCEL: Reads is empty.
+If kind==APPLY: Reads is the sorted unique union of:
+	•	KeyDerive(0x0D, B32(lock_id)) for each lock_id in locks
+	•	each uniq_key in uniq_keys (these are UNIQ keys)
+	•	each k in cas (the CAS target keys)
+	•	KeyDerive(0x0F, B32(item.k)) for each item target key item.k
+
+Lift:
+
+lvl = min(surplus_clip(d,e), 255)
+src = id(d)
+record = (kind:u8, lvl:u8, src:B32, tie:B32, locks, uniq_keys, cas, items)
+order_key = (lvl desc, kind desc, src asc, tie asc) where CANCEL > APPLY for kind desc
+
+State bytes: canonical re-encoding of fields excluding order_key.
+DefaultBytes: empty.
+MaxValueBytes: 2048 (MUST be enforced).
+
+Appendix B. System modules (normative, v0.01 closed set)
+
+All system effects are computed as local modules. Modules MUST satisfy:
+	•	Footprint_M depends only on (epoch e, included body B canonical bytes, constants)
+	•	Eval_M reads only keys in R_M and writes only keys in W_M
+	•	Both footprints are bounded by constants implied by MAX_INCLUDED, MAX_OPS, MAX_READS, and CAP_*.
+
+Modules in v0.01:
+
+B.1 CMDIDX module
+
+Key: k_cmdidx = KeyDerive(0xE1, U32LE(e))
+Value model: TOPK_SET(MAX_INDEX) with MAX_INDEX = 32
+
+Footprint:
+
+W_M = { k_cmdidx }
+R_M includes:
+	•	For each included delta containing CMD or CMDVOTE ops, the corresponding CMDVOTE keys (0x06) for cmdh found in those ops.
+	•	The previous epoch index key KeyDerive(0xE1, U32LE(e-1)) if e>0.
+
+Eval:
+
+Candidate cmdh set = cmdh values appearing in included CMD or CMDVOTE ops union cmdh values listed in previous CMDIDX value (if present).
+Weight for cmdh is the u16 value stored at CMDVOTE(cmdh) in S’ (absent => 0).
+Record = (cmdh, weight, tie) where tie = H(“cmdidx”||cmdh)
+order_key = (weight desc, tie asc)
+Output is TopK_SET(MAX_INDEX).
+
+B.2 SCHEMAIDX module
+
+Analogous to CMDIDX using SCHEMAVOTE (0x08) and SCHEMA/SCHEMAVOTE ops.
+Key: k_schemaidx = KeyDerive(0xE2, U32LE(e))
+Previous key KeyDerive(0xE2, U32LE(e-1)) if e>0.
+
+B.3 SIG module (SIG and SIGIDX)
+
+Constants: WINDOW_MAX = 64, MAX_INDEX = 32
+
+Define for each included delta id x:
+
+v(x) = H(“sigv” || x) interpreted as 256-bit vertex
+ord(x) = low64(H(“sigo” || x)) as u64
+mass(x) = surplus_clip(x,e) as non-negative integer
+
+SIG key for vertex v:
+
+k_sig(e,v) = KeyDerive(0xE0, U32LE(e) || v)
+
+SIGIDX key:
+
+k_sigidx = KeyDerive(0xE3, U32LE(e))
+
+Footprint:
+
+W_M includes:
+	•	k_sigidx
+	•	k_sig(e,v) for each vertex v that appears among {v(x) | x in included deltas}
+
+R_M is empty.
+
+Eval:
+
+For each vertex v, define SigWindow(v) = multiset of pairs (ord(x), x) for included x with v(x)=v.
+Let b(v) be sum of mass(x) over the WINDOW_MAX smallest elements of SigWindow(v) by (ord asc, x asc).
+
+Write SIG at k_sig(e,v) as MAX_BY of record (b:i64, tie:B32) where tie = H(“sig”||U32LE(e)||v), order_key = (b desc, tie asc). If v has no entries, SIG key MAY be absent (no write).
+
+Write SIGIDX as TOPK_SET(MAX_INDEX) over records (v, b, tie) for all v that appear, ordered by (b desc, tie asc), with tie = H(“sigidx”||v).
+
+B.4 TX module (TX effects and TXIDX)
+
+TXIDX key: k_txidx = KeyDerive(0xE4, U32LE(e))
+MAX_INDEX = 32
+
+Footprint:
+
+W_M includes:
+	•	k_txidx
+	•	For each winning TX record (defined below), all item target keys written by that record (the TxItem.k keys)
+
+R_M includes, for each winning TX record r of kind APPLY:
+	•	All LOCK keys KeyDerive(0x0D, B32(lock_id)) referenced by r.locks
+	•	All UNIQ keys referenced by r.uniq_keys
+	•	All CAS target keys referenced by r.cas
+	•	All TOMB keys KeyDerive(0x0F, B32(item.k)) for each item target key item.k
+
+Winning TX record extraction (state-independent):
+
+For each TX key k_tx = KeyDerive(0x0E, U32LE(e)||B32(tx_id)), the Phase 1 TX value is MAX_BY over records contributed in included deltas. Since TX keys are epoch-scoped, the default is empty and the winner depends only on included deltas.
+
+Let WinningTX be the set of (k_tx, r, d_src) where r is the winning record and d_src is the included delta that contributed it (ties resolved by order_key already).
+
+Eval:
+
+For each winning record r:
+
+If r.kind == CANCEL: it produces no item effects.
+
+If r.kind == APPLY: evaluate eligibility on S’ using only the declared reads:
+
+A. Locks: for each lock key, require LOCK exists with owner == Owner(d_src.pk) and until_epoch >= e.
+B. Uniq claims: for each uniq key, require UNIQ exists with owner == Owner(d_src.pk).
+C. CAS: for each (k, expect_hash), require val_hash(S’(k)) == expect_hash (absent uses DefaultBytes_tag(k)).
+D. Tomb: for each item target key k, if TOMB(k) indicates deleted at epoch e, TX fails.
+
+Conflict resolution (wins-all, deterministic):
+
+Let lvl_src = min(surplus_clip(d_src,e),255).
+
+For each target key k, define BestTX(k) as the eligible APPLY TX with maximal (lvl_src desc, id(d_src) asc) that writes k.
+A TX is Accepted iff for every item key it writes, BestTX(k) equals that TX.
+
+Application:
+
+For each Accepted TX, apply each item (k, item_payload_bytes_canonical) as a virtual op at key k:
+	•	Use ctx0_item derived from d_src ctx0 with k = item.k, and payload bytes as provided (already canonical in TX payload).
+	•	Compute payload_norm_item by re-parsing and normalizing under the target tag rules (MUST succeed, else treat as no-op).
+	•	Compute record = Lift_tag(k)(ctx1 derived from d_src, payload_norm_item, tie computed as H(“txitem”||id(d_src)||k||H(payload))).
+	•	Join into Δ_tx[k].
+
+TXIDX:
+
+Write TXIDX as TOPK_SET(MAX_INDEX) over records (tx_key, status, lvl, src_id, tie) ordered by (lvl desc, src_id asc, tie asc).
+status encodes APPLY_ACCEPTED, APPLY_REJECTED, or CANCEL.
+tie = H(“txidx”||tx_key||src_id).
+
+Appendix C. SMT256 commitment, openings, and multiproofs (normative)
+
+C.1 SMT256 root
 
 The authoritative state is a sparse Merkle tree over 256-bit keys.
 
-val_hash(vbytes) = H("val" || vbytes)
+val_hash(vbytes) = H(“val” || vbytes)
 
 leaf_hash(k, present, vbytes) =
-if present==1 then H("leaf" || k || val_hash(vbytes))
-else H("leaf" || k || B32(0x00..00))
+if present==1 then H(“leaf” || k || val_hash(vbytes))
+else H(“leaf” || k || B32(0x00..00))
 
-node_hash(left, right) = H("node" || left || right)
+node_hash(left, right) = H(“node” || left || right)
 
 Bits of key are MSB-first. Root is depth 0. Leaves are depth 256.
 
 Absent keys are representable and verifiable via present==0 proofs.
 
-14.2 Default value bytes
+C.2 Default value bytes
 
-For any key k, its tag is t=tag_id(k). DefaultBytes_t MUST be used as the value bytes when a key is absent in the SMT and needs decoding for join.
+For any key k, its tag is t=tag_id(k). DefaultBytes_t MUST be used as the value bytes when a key is absent in the SMT and the protocol needs a decoded value for join.
 
-14.3 SMT multiproof format (for a set of keys)
+C.3 SMT multiproof format
 
 Given a sorted unique key list K = [k1..km], an SMT multiproof consists of:
 
@@ -543,722 +1286,31 @@ prefix_bytes is ceil(d/8) bytes containing the first d bits (MSB-first within ea
 
 Canonical order for node identifiers is increasing by (d, prefix_bytes lex).
 
-14.4 Deterministic multiproof verification algorithm
+C.4 Deterministic multiproof verification algorithm
 
 Given root R, key list K, leaf values, and siblings:
-
-1. For each i, compute Li = leaf_hash(ki, present_i, vbytes_i). Insert into a map M keyed by node-id at depth 256 with prefix=ki.
-2. For each sibling entry (d,p)->h: insert into a map S keyed by node-id. If an entry already exists with a different hash, FAIL.
-3. For depth d from 255 down to 0: for each node-id (d,p) that is a parent of any node-id already in M:
-   Let left child id = (d+1,p||0), right child id = (d+1,p||1).
-   Let left hash be M[left] if present, else S[left] must exist. Similarly for right.
-   Compute parent hash = node_hash(left_hash, right_hash). Insert into M[(d,p)] ensuring no conflicting hash.
-4. Require M[(0,empty)] == R.
-
-This algorithm is deterministic and MUST be used.
-
-14.5 Checkpoint proof structure (self-contained)
-
-Checkpoint proof bytes decode as ProofV001:
-
-included: VEC(IncludedDelta, items_sorted_ascending_by_id)
-IncludedDelta = B32(delta_id) || BYTES(delta_bytes)
-
-keys: VEC(B32, keys_sorted_unique)
-prev_smt: SMTMultiproof over (keys, leaves, siblings) against cp.prev_root
-
-Constraints:
-len(included) <= MAX_INCLUDED
-included ids MUST be sorted unique
-Each delta_bytes length MUST be <= MAX_EVENT_BYTES
-keys MUST be sorted unique
-prev_smt.keys MUST equal keys exactly
-
-14.6 System-derived materialization (virtual ops)
-
-Each checkpoint MUST include deterministic virtual ops computed from (epoch e, prev_root, included deltas, protocol constants) as follows.
-
-Define MAX_INDEX = 32 (protocol constant).
-
-Phase 1 uses only included deltas (user ops). Phase 2 adds system ops and system effects.
-
-Phase 1 state: S' = S_{e-1} join Δ_user(e).
-Phase 2 state: S_e = S' join Δ_sys(e,S').
-
-Δ_sys includes:
-
-A. SIG and SIGIDX (Section 18.4)
-B. CMDIDX (Section 18.2)
-C. SCHEMAIDX (Section 18.3)
-D. TX system effects and TXIDX (Section 18.6)
-E. VMRES system effects and VMIDX (Section 18.7)
-
-All system-derived keys MUST appear in the checkpoint touched key set if they are updated (i.e., if their Δ is non-empty under the tag's semilattice).
-
-14.7 VerifyCheckpointProof(cp) (normative)
-
-Let e = cp.epoch. Verification MUST proceed:
-
-1. Decode ProofV001. If decode fails, return false.
-2. Extract included ids and bytes from ProofV001.included. For each item:
-   Run CanonDelta(delta_bytes) to produce canonical d. Require id(d) equals included delta_id. Require d.epoch == e. Require SIGCHECK(d.pk, sigmsg_delta(d), d.sig) == true. Require workvalid(d,e) == true. If any fails, return false.
-   Let IncludedDeltas be the resulting list, ordered by ascending id. Let IncludedIDs be their ids.
-3. Verify cp.batch_commit equals MerkleRoot(IncludedIDs).
-   Verify cp.cut_commit equals MerkleRoot(Frontier(IncludedIDs)) computed using the parent lists from IncludedDeltas.
-4. Enforce inclusion caps: Let IncludedCat[cat] be IncludedDeltas by cat(d). Require |IncludedCat[cat]| <= CAP[cat] for each cat.
-   Also enforce per-tag caps inside CAT_GOV: count of included deltas containing a TX op MUST be <= CAP_TX; count of included deltas containing a VMRES op MUST be <= CAP_VMRES.
-5. Recompute meta fields and require exact equality with cp.meta (Section 14.8).
-6. Compute the touched key set KeysTouched deterministically:
-   KeysTouched_user = union of all op.k in IncludedDeltas.
-   Compute Phase1 deltas Δ_user (step 9) and Phase1 state S' on demand for bounded keys.
-   Compute KeysTouched_sys = union of all keys updated or read by Δ_sys(e,S') as specified in Section 18.
-   KeysTouched = sorted unique union of KeysTouched_user and KeysTouched_sys.
-   Require ProofV001.keys == KeysTouched exactly. Otherwise return false.
-7. Verify prev_smt multiproof against cp.prev_root using Section 14.4. If fails, return false.
-   Let OldBytes[k] be the decoded leaf vbytes if present==1, else DefaultBytes_tag(k).
-8. Build Δ_user (key -> delta value) from IncludedDeltas:
-   For each IncludedDelta d and each op within d: build ctx0 and then ctx1 for that op. payload_norm is already enforced by CanonDelta.
-   Compute record = Lift_t(ctx1,payload_norm) and fold into Δ_user[k] using the tag's value model join.
-   Omit keys whose delta is the empty element.
-9. Compute S' (Phase 1) on KeysTouched_user:
-   For each key k in KeysTouched_user: decode OldBytes[k] as OldValue under the tag's value model. Decode Δ_user[k] (or empty) as DeltaValue. NewValue' = OldValue join DeltaValue. Encode to NewBytes'[k].
-   For keys not in KeysTouched_user, NewBytes' is OldBytes.
-10. Compute Δ_sys and Phase 2 state bytes NewBytes[k] for all KeysTouched per Section 18, using S' (NewBytes') as input.
-11. SMT multi-update root recomputation:
-    Recompute the new root by replacing leaf hashes for KeysTouched with leaf_hash(k, present=1, NewBytes[k]) and re-hashing upward consistently using the siblings map from prev_smt. The computed root MUST equal cp.root.
-12. If all checks pass, return true.
-
-14.8 Meta format (normative)
-
-cp.meta bytes encode:
-
-meta.count_data: U16LE
-meta.count_rank: U16LE
-meta.count_gov: U16LE
-meta.kthZeff_data: U8
-meta.kthZeff_rank: U8
-meta.kthZeff_gov: U8
-meta.surplus_sum_clip: U64LE
-
-Definitions:
-
-count_cat is the number of included deltas with category cat.
-
-kthZeff_cat:
-Order IncludedCat[cat] by delta_order(d,e).
-If |IncludedCat[cat]| < CAP[cat], kthZeff_cat = 0.
-Else kthZeff_cat = z_eff value of the element at position CAP[cat] (1-based) in that order.
-
-surplus_sum_clip is sum over all included deltas of surplus_clip(d,e), computed in mathematical integers; if the sum exceeds 2^64-1 the checkpoint MUST be rejected.
-
-The verifier MUST recompute these values and require exact match.
-
-15. Canonical checkpoint selection and transcript
-
-15.1 Candidate set
-For epoch e, Q_e is the set of accepted checkpoints with cp.epoch==e and VerifyCheckpointProof(cp)==true.
-
-15.2 Score vector (MUST be circular-free)
-
-Define cp_tie = H("cp_tie" || U32LE(e) || cp.prev_root || TR_{e-1} || cp.batch_commit || cp.cut_commit || cp.root || H("pk"||cp.pk))
-Define inv_tie = bitwise-not(cp_tie) interpreted as 256-bit unsigned.
-
-Score(cp) = lexicographic tuple:
-( meta.surplus_sum_clip, meta.kthZeff_rank, meta.kthZeff_gov, meta.kthZeff_data, inv_tie )
-
-15.3 CanonicalCheckpoint
-CanonicalCheckpoint(e) is the cp in Q_e with maximal Score(cp). Ties cannot remain due to inv_tie.
-Define root_star(e) = CanonicalCheckpoint(e).root.
-
-15.4 Transcript
-TR_e = H("tr" || U32LE(e) || root_star(e) || meta_bytes || batch_commit || cut_commit), where meta_bytes and commits are from CanonicalCheckpoint(e).
-For e=0, TR_{-1} is TR_MINUS_1.
-
-16. Threshold update rule
-
-Genesis: T_0[cat] = T0[cat].
-
-For e >= 0, after root_star(e) is established:
-
-T_{e+1}[cat] = clamp( T_e[cat] + sign( kthZeff_e[cat] - TargetZ[cat] ), TMIN[cat], TMAX[cat] )
-
-kthZeff_e[cat] is taken from meta of CanonicalCheckpoint(e).
-All arithmetic in the sign argument is done in mathematical integers.
-
-sign(x) = +1 if x>0, 0 if x==0, -1 if x<0.
-
-17. Reads
-
-17.1 Read anchor
-A client MUST select an epoch e and use root_star(e) as the read anchor.
-
-17.2 Membership proof
-A client reads key k by obtaining (present, vbytes, smt_proof) and verifying it against root_star(e) using the deterministic SMT multiproof verification specialized to a single key (equivalent to Section 14.4). Non-membership is present==0. Clients MUST NOT trust unverified values.
-
-17.3 Logical deletion view (TOMB)
-If the client also reads tomb_k = KeyDerive(0x0F, B32(k)) and verifies its value, then it MAY apply the TOMB effective rule defined in Appendix A.16 to treat k as logically deleted at epoch e. This does not change the underlying SMT semantics.
-
-18. Derived materialization and indices (deterministic)
-
-18.1 Principle
-Derived indices and signal fields are deterministic functions of (e, prev_root, included deltas, protocol constants, and S' on bounded keys). They are not written by DeltaEvents. They are materialized into state during checkpoint evaluation (Phase 2) and therefore are verifiable by membership proofs.
-
-18.2 CMDIDX (system-derived)
-
-CMD candidates are cmdh values (B32).
-
-Candidate set for epoch e:
-CmdCand = (all cmdh appearing in included CMD or CMDVOTE ops in epoch e) union (cmdh listed in previous epoch's CMDIDX value, if present)
-
-Vote weight for cmdh is the current value stored at key CMDVOTE(cmdh) in S' (Phase 1 state), interpreted as a u16 weight (Appendix A).
-
-CMDIDX value is TOPK_SET(MAX_INDEX) of records (cmdh, weight, tie):
-tie = H("cmdidx"||cmdh)
-order_key = (weight desc, tie asc)
-
-CMDIDX key:
-k_cmdidx = KeyDerive(0xE1, U32LE(e))
-
-18.3 SCHEMAIDX (system-derived)
-
-Analogous to CMDIDX using schema_id (B32) and SCHEMAVOTE weights.
-
-SCHEMAIDX key:
-k_schemaidx = KeyDerive(0xE2, U32LE(e))
-
-18.4 SIG and SIGIDX (system-derived)
-
-For each included delta id x:
-
-v(x) = H("sigv" || x) interpreted as 256-bit vertex
-ord(x) = low64(H("sigo" || x)) as u64
-mass(x) = surplus_clip(x,e) as non-negative integer
-
-For each vertex v, define SigWindow(v) as the multiset of pairs (ord(x), x) for included x with v(x)=v.
-
-Define b(v) as the sum of mass(x) over the WINDOW_MAX smallest elements of SigWindow(v) by (ord asc, x asc), where WINDOW_MAX = 64.
-
-SIG key for a vertex v in epoch e:
-k_sig(e,v) = KeyDerive(0xE0, U32LE(e) || v)
-
-SIG value at k_sig(e,v) is MAX_BY containing record (b:i64, tie:B32) where tie = H("sig"||U32LE(e)||v).
-order_key = (b desc, tie asc)
-
-If a vertex v does not appear in SigWindow, SIG key MAY be absent; its b(v) is treated as 0 by clients (non-membership).
-
-SIGIDX is TOPK_SET(MAX_INDEX) over records (v, b, tie) for all v that appear in this epoch, ordered by (b desc, tie asc).
-Key: k_sigidx = KeyDerive(0xE3, U32LE(e))
-
-18.5 Client diffusion (derived, non-authoritative)
-
-Given root_star(e), clients MAY compute diffusion potential using b(v) read from SIG keys and the neighborhood function N_i, with fixed parameters DEGREE_D, SIG_T, SIG_RHO.
-
-18.6 TX system effects and TXIDX (system-derived)
-
-18.6.1 TX winner extraction (Phase 2 input)
-Let TxKeys be the set of TX op keys appearing in IncludedDeltas (tag 0x0E).
-Compute the Phase 1 TX state at those keys under MAX_BY to obtain at most one winning TX record per TX key.
-
-18.6.2 Preconditions (deterministic, evaluated on S')
-For a candidate TX record r associated with source delta d_src (the delta that contributed the winning record), define owner_src = Owner(d_src.pk) and lvl_src = min(surplus_clip(d_src,e),255).
-
-Let r.kind be APPLY or CANCEL.
-
-If r.kind == CANCEL: it produces no item effects; it only contributes to TXIDX.
-
-If r.kind == APPLY: it is eligible only if all conditions hold:
-
-A. Locks: for each lock_id in r.locks, the current LOCK value at key KeyDerive(0x0D,B32(lock_id)) in S' exists and has owner == owner_src and until_epoch >= e.
-B. Uniq claims: for each uniq_key in r.uniq_keys (each is a UNIQ key), the current UNIQ value in S' exists and has owner == owner_src.
-C. CAS: for each (k, expect_val_hash) in r.cas, compute cur = S'(k) value bytes (absent uses DefaultBytes_tag(k)); require val_hash(cur) == expect_val_hash.
-D. Tomb: for each target key k in r.items, read tomb_k = KeyDerive(0x0F,B32(k)) in S'. If tomb indicates deleted at epoch e per Appendix A.16, then TX fails.
-
-18.6.3 Conflict resolution and atomicity (wins-all, deterministic)
-Let EligibleTX be the set of APPLY TX records passing preconditions.
-
-For each target key k, define BestTX(k) as the eligible TX whose source delta has maximal key:
-( lvl_src desc, id(d_src) asc ), and that contains an item for k. If no eligible TX writes k, BestTX(k) is none.
-
-A TX is Accepted iff for every item key k it writes, BestTX(k) equals that TX. This is a deterministic wins-all rule that forbids partial commit.
-
-18.6.4 Application
-For each Accepted TX, apply each item (k, payload_bytes_canonical) as a virtual op to key k:
-Build ctx0_item and ctx1_item for the source delta d_src, with op.k = k and payload_bytes_canonical as specified.
-Compute record = Lift_tag(k)(ctx1_item, payload_norm_item) and join it into the Phase 2 delta for k under that tag's value model.
-
-18.6.5 TXIDX
-TXIDX is TOPK_SET(MAX_INDEX) of records (tx_key, status, lvl, src_id, tie), ordered by (lvl desc, src_id asc, tie asc), where status encodes APPLY_ACCEPTED, APPLY_REJECTED, or CANCEL.
-tx_key is the TX key. src_id is id(d_src). tie = H("txidx"||tx_key||src_id).
-Key: k_txidx = KeyDerive(0xE4, U32LE(e)).
-
-18.6.6 KeysTouched_sys contributions for TX
-KeysTouched_sys MUST include, for each winning TX record r (even if later rejected by preconditions):
-A. All referenced LOCK keys.
-B. All referenced UNIQ keys.
-C. All referenced CAS keys.
-D. All referenced item target keys.
-E. All referenced TOMB keys for item target keys.
-F. k_txidx for epoch e.
-
-18.7 VMRES system effects and VMIDX (system-derived)
-
-18.7.1 VMRES winner extraction
-Let VmKeys be VMRES keys in IncludedDeltas (tag 0x10). Under MAX_BY, obtain at most one winning VMRES record per VMRES key.
-
-18.7.2 Output commit and bounded verification
-Each VMRES record contains: program_hash, input_commit, output_commit, proof_bytes, outputs.
-
-The verifier MUST check:
-A. len(proof_bytes) <= VM_PROOF_MAX and |outputs| <= VM_MAX_OUTPUTS and each output payload length <= VM_MAX_OUTPUT_BYTES.
-B. output_commit equals MerkleRoot of the sorted list of H("vmout"||k||payload_bytes_canonical) for outputs.
-C. VerifyVMProof(program_hash, input_commit, output_commit, proof_bytes) == true, where VerifyVMProof is a deterministic bounded-time verifier fixed by this specification. If this check fails, the VMRES produces no outputs.
-
-This specification defines VerifyVMProof as a pluggable but identity-bound verifier whose exact algorithm and parameters MUST be included in v0.0.1 Appendix B. If Appendix B is absent, VMRES MUST be treated as always failing verification. (This avoids implementation-defined behavior.)
-
-18.7.3 Application with tomb filter
-For each verified VMRES record, for each output (k, payload_bytes_canonical):
-If TOMB(k) indicates deleted at epoch e, ignore that output; otherwise apply it as a virtual op using Lift_tag(k) with ctx1 derived from the source delta of the VMRES.
-
-18.7.4 VMIDX
-VMIDX is TOPK_SET(MAX_INDEX) of records (job_key, program_hash, lvl, src_id, tie) ordered by (lvl desc, src_id asc, tie asc).
-job_key is the VMRES key. tie = H("vmidx"||job_key||src_id).
-Key: k_vmidx = KeyDerive(0xE5, U32LE(e)).
-
-18.7.5 KeysTouched_sys contributions for VMRES
-KeysTouched_sys MUST include, for each winning VMRES record:
-A. All output target keys.
-B. All referenced TOMB keys for output target keys.
-C. k_vmidx for epoch e.
-
-19. Networking and relay
-
-19.1 Relay policy
-Nodes MUST relay accepted CheckpointEvents subject to local rate limits.
-Nodes SHOULD relay accepted DeltaEvents subject to local resource controls. Nodes MUST be able to validate and decide relay using only the delta bytes plus known (root_star(e-1), TR_{e-1}, thresholds).
-
-19.2 Bounded candidate buffers (recommended)
-Nodes SHOULD maintain per-category buffers of size at most CAP[cat] (or a small multiple) keyed by delta_order(d,e), retaining the best deltas and dropping worse ones. This affects relay behavior only, not correctness.
-
-20. Security considerations (normative consequences)
-
-20.1 No encoding ambiguity
-All IDs, tickets, costs, and signature messages depend on canonical bytes, and CanonDelta re-encodes payloads canonically. Any alternative encoding is non-compliant.
-
-20.2 No tag recovery ambiguity
-Category, parsing, key checks, normalization, caps, auth, lifting, and value bounds are derived from tag_id(k)=k[0] and fixed TagSpec rules. Tag recovery from strings is forbidden.
-
-20.3 No circular definitions
-TagSpec Normalize/Cap/Auth depend only on ctx0. id/ticket/z/surplus appear only in ctx1 and are used only in Lift and derived computations after canonicalization.
-
-20.4 Checkpoint transition correctness is enforced
-The checkpoint proof binds the included set and provides an SMT multiproof sufficient to reconstruct prev_root and deterministically recompute the post-update root. Untouched keys cannot be altered without breaking recomputation equality.
-
-20.5 DoS surfaces are bounded by constants
-All per-event and per-checkpoint work is bounded by MAX_* constants and CAP_* caps. Nodes MAY apply local relay/storage rate limits, but MUST NOT change verification semantics.
-
-21. Compliance requirements
-
-A v0.0.1 compliant implementation MUST:
-
-A. Implement CanonDelta, core digests, IDs, and signature messages exactly (Sections 10–12).
-B. Implement SHA-256, Ed25519, MerkleRoot, and SMT256 exactly (Sections 5, 13, 14).
-C. Implement VerifyCheckpointProof exactly, including Phase 1/2 semantics and root recomputation (Section 14) and derived semantics (Section 18).
-D. Implement canonical checkpoint selection and transcript exactly (Section 15).
-E. Implement threshold update exactly (Section 16).
-F. Reject any DeltaEvent op with a non-standard or system-derived tag (Section 8.2).
-G. Enforce all explicit bounds (Sections 4, 9, 14, 18).
-
-Appendix A. TagSpec payloads, key checks, value models, and defaults (normative)
-
-Common helper:
-Owner(pk) = H("pk" || pk) (32 bytes)
-
-A.1 OBJ (0x01)
-
-Category: DATA
-Value model: MAX_BY
-
-Key parts: B32(obj_id)
-Key: KeyDerive(0x01, B32(obj_id))
-
-Payload: B32(obj_id) || B32(blob_hash)
-Parse: exactly 64 bytes.
-KeyCheck: KeyDerive(0x01, B32(obj_id)).
-Normalize: identity. CapRule: true. AuthRule: true.
-
-Lift(ctx1):
-tie = op_tie256(d,e,op)
-record = (blob_hash:B32, tie:B32)
-order_key = (bitwise-not(blob_hash) asc, tie asc)
-
-State value encoding: present==0 means absent. If present, vbytes = B32(blob_hash).
-DefaultBytes: empty (absent treated as no blob).
-MaxValueBytes: 32.
-
-A.2 LOG (0x02)
-
-Category: DATA
-Value model: TOPK_SET with K=64
-
-Key parts: B32(scope) || B32(topic)
-Key: KeyDerive(0x02, parts)
-
-Payload: B32(scope) || B32(topic) || U64LE(ord) || BYTES(item)
-Constraint: len(item) <= 64
-
-Parse/KeyCheck accordingly. Normalize: identity. CapRule: len(item)<=64. AuthRule: true.
-
-Lift(ctx1):
-weight = min(surplus_clip(d,e), 255)
-tie = op_tie256(d,e,op)
-src = id(d)
-record = (ord:u64, item:bytes<=64, weight:u8, tie:B32, src:B32)
-order_key = (weight desc, tie asc, ord asc, H(item) asc, src asc)
-
-State value encoding: VEC of records sorted by order_key best-first, truncated to K.
-DefaultBytes: empty vector.
-MaxValueBytes: 8192.
-
-A.3 TOP (0x03)
-
-Category: RANK
-Value model: TOPK_SET with K=32
-
-Key parts: B32(scope) || B32(metric)
-Key: KeyDerive(0x03, parts)
-
-Payload: B32(scope) || B32(metric) || I64LE(score) || BYTES(item)
-Constraint: len(item) <= 64
-
-Lift(ctx1):
-weight = min(surplus_clip(d,e), 255)
-tie = op_tie256(d,e,op)
-src = id(d)
-record = (score:i64, item:bytes<=64, weight:u8, tie:B32, src:B32)
-order_key = (weight desc, tie asc, score desc, H(item) asc, src asc)
-
-DefaultBytes: empty vector.
-MaxValueBytes: 8192.
-
-A.4 KEEP (0x04)
-
-Category: GOV
-Value model: MAX_BY
-
-Key parts: B32(obj_id)
-Key: KeyDerive(0x04, B32(obj_id))
-
-Payload: B32(obj_id)
-
-Lift(ctx1):
-weight = min(surplus_clip(d,e), 255)
-tie = op_tie256(d,e,op)
-record = (weight:u8, tie:B32)
-order_key = (weight desc, tie asc)
-
-State value encoding: vbytes = U8(weight)
-DefaultBytes: U8(0)
-MaxValueBytes: 1
-
-A.5 CMD (0x05)
-
-Category: GOV
-Value model: MAX_BY
-
-Key parts: B32(cmdh)
-Key: KeyDerive(0x05, B32(cmdh))
-
-Payload: B32(cmdh) || B32(obj_id) || B32(schema_id) || BYTES(cost_vec)
-Constraint: len(cost_vec) <= 64
-
-Lift(ctx1):
-weight = min(surplus_clip(d,e), 255)
-tie = op_tie256(d,e,op)
-record = (obj_id:B32, schema_id:B32, cost_vec:bytes, weight:u8, tie:B32)
-order_key = (weight desc, tie asc)
-
-State value encoding: vbytes = B32(obj_id) || B32(schema_id) || BYTES(cost_vec)
-DefaultBytes: empty (absent means undeclared).
-MaxValueBytes: 130.
-
-A.6 CMDVOTE (0x06)
-
-Category: GOV
-Value model: MAX_BY
-
-Key parts: B32(cmdh)
-Key: KeyDerive(0x06, B32(cmdh))
-
-Payload: B32(cmdh)
-
-Lift(ctx1):
-weight = min(surplus_clip(d,e), 255)
-tie = op_tie256(d,e,op)
-record = (weight:u8, tie:B32)
-order_key = (weight desc, tie asc)
-
-State value encoding: vbytes = U8(weight)
-DefaultBytes: U8(0)
-MaxValueBytes: 1
-
-A.7 SCHEMA (0x07)
-
-Category: GOV
-Value model: MAX_BY
-
-Key parts: B32(schema_id)
-Key: KeyDerive(0x07, B32(schema_id))
-
-Payload: B32(schema_id) || B32(obj_id)
-
-Lift(ctx1):
-weight = min(surplus_clip(d,e), 255)
-tie = op_tie256(d,e,op)
-record = (obj_id:B32, weight:u8, tie:B32)
-order_key = (weight desc, tie asc)
-
-State value encoding: vbytes = B32(obj_id)
-DefaultBytes: empty
-MaxValueBytes: 32
-
-A.8 SCHEMAVOTE (0x08)
-
-Category: GOV
-Value model: MAX_BY
-
-Key parts: B32(schema_id)
-Key: KeyDerive(0x08, B32(schema_id))
-
-Payload: B32(schema_id)
-
-Lift(ctx1):
-weight = min(surplus_clip(d,e), 255)
-tie = op_tie256(d,e,op)
-record = (weight:u8, tie:B32)
-order_key = (weight desc, tie asc)
-
-State value encoding: vbytes = U8(weight)
-DefaultBytes: U8(0)
-MaxValueBytes: 1
-
-A.9 PTR (0x09)
-
-Category: DATA
-Value model: TOPK_MAP with K=8, mkey=owner
-
-Key parts: B32(scope) || BYTES(name)
-Key: KeyDerive(0x09, parts)
-
-Payload: B32(scope) || BYTES(name) || U8(mode) || U32LE(until) || B32(ref) || BYTES(aux)
-Constraints: len(name) <= 64, len(aux) <= 64, mode in {0,1}
-
-Lift(ctx1):
-owner = Owner(pk)
-level = min(surplus_clip(d,e), 255)
-tie = op_tie256(d,e,op)
-aux_hash = H("aux"||aux)
-record = (owner:B32, mode:u8, level:u8, until:u32, ref:B32, aux_hash:B32, tie:B32)
-best_key within owner = (mode desc, level desc, until desc, tie asc)
-order_key across owners = same tuple
-
-State value encoding: VEC of up to K records sorted best-first.
-DefaultBytes: empty vector.
-MaxValueBytes: 8192.
-
-A.10 POS (0x0A)
-
-Category: DATA
-Value model: TOPK_MAP with K=8, mkey=owner
-
-Key parts: B32(owner)
-Key: KeyDerive(0x0A, B32(owner))
-
-Payload: B32(owner) || BYTES(pos)
-Constraint: len(pos) <= 64
-
-AuthRule: require owner == Owner(pk).
-
-Lift(ctx1):
-level = min(surplus_clip(d,e), 255)
-tie = op_tie256(d,e,op)
-pos_hash = H("pos"||pos)
-record = (owner:B32, level:u8, pos_hash:B32, tie:B32)
-best_key = (level desc, tie asc)
-order_key = same
-
-DefaultBytes: empty vector.
-MaxValueBytes: 4096.
-
-A.11 IDX (0x0B)
-
-Category: DATA
-Value model: TOPK_MAP with K=8, mkey=owner
-
-Key parts: B32(vertex)
-Key: KeyDerive(0x0B, B32(vertex))
-
-Payload: B32(vertex) || B32(owner) || U32LE(until) || BYTES(endpoint)
-Constraint: len(endpoint) <= 128
-
-AuthRule: require owner == Owner(pk).
-
-Lift(ctx1):
-level = min(surplus_clip(d,e), 255)
-tie = op_tie256(d,e,op)
-ep_hash = H("ep"||endpoint)
-record = (owner:B32, level:u8, until:u32, ep_hash:B32, tie:B32)
-best_key = (level desc, until desc, tie asc)
-order_key = same
-
-DefaultBytes: empty vector.
-MaxValueBytes: 4096.
-
-A.12 UNIQ (0x0C)
-
-Category: GOV
-Value model: MAX_BY
-
-Key parts: B32(namespace) || B32(value_hash)
-Key: KeyDerive(0x0C, parts)
-
-Payload: B32(namespace) || B32(value_hash)
-
-Lift(ctx1):
-owner = Owner(pk)
-lvl = min(surplus_clip(d,e), 255)
-src = id(d)
-tie = op_tie256(d,e,op)
-record = (owner:B32, lvl:u8, src:B32, tie:B32)
-order_key = (lvl desc, src asc, tie asc)
-
-State value encoding: vbytes = B32(owner) || U8(lvl) || B32(src)
-DefaultBytes: empty (absent means unclaimed)
-MaxValueBytes: 65
-
-A.13 LOCK (0x0D)
-
-Category: GOV
-Value model: MAX_BY
-
-Key parts: B32(lock_id)
-Key: KeyDerive(0x0D, B32(lock_id))
-
-Payload: B32(lock_id) || U32LE(lease_until_epoch)
-
-Lift(ctx1):
-owner = Owner(pk)
-lvl = min(surplus_clip(d,e), 255)
-src = id(d)
-tie = op_tie256(d,e,op)
-record = (owner:B32, until:u32, lvl:u8, src:B32, tie:B32)
-order_key = (lvl desc, until desc, src asc, tie asc)
-
-State value encoding: vbytes = B32(owner) || U32LE(until) || U8(lvl) || B32(src)
-DefaultBytes: empty (absent means unlocked)
-MaxValueBytes: 69
-
-A.14 TX (0x0E)
-
-Category: GOV
-Value model: MAX_BY
-
-Key parts: U32LE(epoch) || B32(tx_id)
-Key: KeyDerive(0x0E, parts)
-
-Payload encoding (canonical):
-U32LE(epoch) || B32(tx_id) || U8(kind) ||
-VEC(B32, locks_sorted_unique) ||
-VEC(B32, uniq_keys_sorted_unique) ||
-VEC(CAS, cas_sorted_unique_by_key) ||
-VEC(TxItem, items_sorted_unique_by_k)
-
-CAS = B32(k) || B32(expect_val_hash)
-TxItem = B32(k) || BYTES(item_payload_bytes)
-
-Constraints (CapRule):
-epoch MUST equal ctx0.e
-kind in {0,1} where 0=APPLY, 1=CANCEL
-|locks| <= TX_MAX_LOCKS, |uniq_keys| <= TX_MAX_UNIQS, |cas| <= TX_MAX_CAS, |items| <= TX_MAX_ITEMS
-If kind==CANCEL then items MUST be empty
-Each TxItem.k MUST be a user-writable standard tag and MUST NOT be CAT_RESERVED
-Each item_payload_bytes MUST pass Parse/KeyCheck/Normalize/Cap/Auth for its target tag using ctx0 derived from the outer ctx0 with k=TxItem.k, and MUST be re-emitted in canonical form inside TX.
-
-AuthRule: true (per-item AuthRule enforced during Normalize).
-
-Lift(ctx1):
-lvl = min(surplus_clip(d,e), 255)
-src = id(d)
-tie = op_tie256(d,e,op)
-record = (kind:u8, lvl:u8, src:B32, tie:B32, locks, uniq_keys, cas, items)
-order_key = (lvl desc, kind desc, src asc, tie asc) where CANCEL > APPLY for kind desc
-
-State value encoding: canonical re-encoding of the record fields excluding order_key
-DefaultBytes: empty
-MaxValueBytes: 2048 (MUST be enforced)
-
-A.15 TOMB (0x0F)
-
-Category: GOV
-Value model: MAX_BY
-
-Key parts: B32(target_k)
-Key: KeyDerive(0x0F, B32(target_k))
-
-Payload: B32(target_k) || U8(kind) || U32LE(until_epoch)
-kind: 0=DEL, 1=UNDEL
-
-Lift(ctx1):
-lvl = min(surplus_clip(d,e), 255)
-src = id(d)
-tie = op_tie256(d,e,op)
-record = (kind:u8, until:u32, lvl:u8, src:B32, tie:B32)
-order_key = (lvl desc, kind desc, until desc, src asc, tie asc) where DEL > UNDEL for kind desc
-
-State value encoding: vbytes = U8(kind) || U32LE(until) || U8(lvl) || B32(src)
-DefaultBytes: empty
-MaxValueBytes: 38
-
-Effective rule (normative):
-Let tomb be the decoded TOMB value for target key k at epoch e.
-If tomb.kind==DEL and (tomb.until==0xFFFFFFFF or e <= tomb.until) then k is logically deleted at epoch e; otherwise it is not deleted.
-
-A.16 VMRES (0x10)
-
-Category: GOV
-Value model: MAX_BY
-
-Key parts: U32LE(epoch) || B32(job_id)
-Key: KeyDerive(0x10, parts)
-
-Payload:
-U32LE(epoch) || B32(job_id) || B32(program_hash) || B32(input_commit) || B32(output_commit) || BYTES(proof_bytes) || VEC(VMOut, outputs_sorted_unique_by_k)
-VMOut = B32(k) || BYTES(payload_bytes_canonical)
-
-Constraints (CapRule):
-epoch MUST equal ctx0.e
-len(proof_bytes) <= VM_PROOF_MAX
-|outputs| <= VM_MAX_OUTPUTS
-each output payload length <= VM_MAX_OUTPUT_BYTES
-each output MUST pass Parse/KeyCheck/Normalize/Cap/Auth for its target tag using ctx0 derived from the outer ctx0 with k=VMOut.k, and MUST be re-emitted in canonical form
-output_commit MUST equal MerkleRoot(sorted list of H("vmout"||k||payload_bytes_canonical))
-
-Lift(ctx1):
-lvl = min(surplus_clip(d,e), 255)
-src = id(d)
-tie = op_tie256(d,e,op)
-record = (lvl:u8, src:B32, tie:B32, program_hash, input_commit, output_commit, proof_bytes, outputs)
-order_key = (lvl desc, src asc, tie asc)
-
-State value encoding: canonical re-encoding of the record fields excluding order_key
-DefaultBytes: empty
-MaxValueBytes: 2048 (MUST be enforced)
-
-A.17 System-derived tags
-
-SIG (0xE0), CMDIDX (0xE1), SCHEMAIDX (0xE2), SIGIDX (0xE3), TXIDX (0xE4), VMIDX (0xE5) are not user-writable; CanonDelta MUST reject any op with these tags. Their keys and values are produced only during checkpoint Phase 2 per Section 18 and MUST be included in KeysTouched when updated.
-
-Appendix B. VerifyVMProof (normative, v0.0.1 identity)
-
-This appendix MUST define a deterministic bounded-time verifier VerifyVMProof(program_hash, input_commit, output_commit, proof_bytes). If this appendix is not present in an implementation, VMRES verification MUST always fail.
-
-End of Specification v0.0.1
+	1.	For each i, compute Li = leaf_hash(ki, present_i, vbytes_i). Insert into a map M keyed by node-id at depth 256 with prefix=ki.
+	2.	For each sibling entry (d,p)->h: insert into a map S keyed by node-id. If an entry already exists with a different hash, FAIL.
+	3.	For depth d from 255 down to 0: for each node-id (d,p) that is a parent of any node-id already in M:
+Let left child id = (d+1,p||0), right child id = (d+1,p||1).
+Let left hash be M[left] if present, else S[left] must exist. Similarly for right.
+Compute parent hash = node_hash(left_hash, right_hash). Insert into M[(d,p)] ensuring no conflicting hash.
+	4.	Require M[(0,empty)] == R.
+
+C.5 Deterministic multi-update recomputation (stateless)
+
+Given:
+	•	prev_root R_prev
+	•	a multiproof that opens KeysNeedOld and provides siblings sufficient to recompute paths
+	•	a set of updated keys U (subset of KeysNeedOld) and their NewBytes[k]
+
+Compute:
+	1.	Verify the multiproof against R_prev using C.4, yielding OldBytes for KeysNeedOld.
+	2.	For each k in U, define the new leaf hash Lk_new = leaf_hash(k, present=1, NewBytes[k]).
+	3.	Replace the corresponding leaf entries in M at depth 256 with Lk_new for k in U, leaving other opened leaves as-is.
+	4.	Recompute upward hashes deterministically using the same sibling map S as in C.4.
+	5.	The resulting root is the recomputed new root.
+
+This recomputation MUST be used for stateless verification in Section 13.4.7.
+
+End of Specification v0.01
