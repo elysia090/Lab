@@ -1,20 +1,23 @@
 cff-version: 1.2.0
-title: Junks
+title: Lab
 authors:
-  - name: Junks Contributors
+  - name: Lab Contributors
 abstract: >-
-  Junks aggregates research prototypes and utilities across finance, machine learning,
-  systems, cryptography, quantum computing, and general-purpose tooling. Cite this
-  project when using any of the included modules or experiments in academic or
-  policy-oriented work.
+  Lab is a public research sandbox that collects exploratory Python prototypes,
+  design notes, and experiments across finance, machine learning, attention
+  systems, compiler and runtime work, cryptography, quantum computing,
+  rendering, and general-purpose utilities.
 keywords:
   - finance
   - machine learning
   - systems
   - cryptography
   - quantum computing
+  - rendering
   - tooling
 license: Apache-2.0 OR MIT
+repository-code: "https://github.com/elysia090/Lab"
 message: >-
-  If you use this repository in your work, please cite it using the metadata provided
-  in this file and include a reference to the dual Apache-2.0 / MIT licensing terms.
+  If you use this repository in research or policy work, please cite Lab using
+  the metadata in this file and reference the dual Apache-2.0 / MIT licensing
+  terms.
