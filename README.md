@@ -1,51 +1,58 @@
-TL;DR: Multi-domain research prototypes spanning finance, ML, systems, cryptography, quantum, and utilities.
-Quickstart:
-1. Clone the repository and change into the project root.
-2. Use Python 3.9+ in your environment of choice.
-3. Export PYTHONPATH="$(pwd)/src:$PYTHONPATH" to expose the packages.
-4. Run pytest to validate the finance market simulation suite.
+# Lab
 
-# Repository Overview
+Lab is a public research sandbox for Python prototypes across finance, machine learning, attention systems, cryptography, quantum computing, rendering, and general utilities.
 
-[![Pytest](https://img.shields.io/badge/tests-pytest-blue.svg)](#testing)
-[![Coverage](https://img.shields.io/badge/coverage-report-brightgreen.svg)](#testing)
-[![Ruff](https://img.shields.io/badge/lint-ruff-5B4FE9.svg)](#testing)
+## What This Repository Is
 
-This repository is a grab bag of research prototypes and utilities spanning finance, machine learning, systems, cryptography, quantum computing, and general-purpose tooling.  Each subpackage under `src/` is self-contained and can be imported once the project root is added to `PYTHONPATH`.
+- A broad, exploratory codebase rather than a packaged library.
+- `src/` contains standalone modules and subpackages.
+- `docs/` contains design notes, working papers, and archived research writeups.
+- `tests/` covers the parts of the repository that currently have regression protection.
 
-## Directory Structure
+## Repository Map
 
-```
-src/
-├── finance/                 # Pricing analytics, econometrics pipelines, corporate finance models, and market simulations
-├── machine_learning/        # Classical ML experiments, state-space models, NLP pipelines, and time-series demos
-├── attention/               # Implementations of custom and fast attention mechanisms
-├── compiler_and_systems/    # LLVM→PTX tooling, GPU acceleration utilities, native stubs, and virtual CPU experiments
-├── cryptography/            # PLONK-inspired zero-knowledge proof simulations and helpers
-├── quantum/                 # Minimal quantum gate simulation utilities
-└── utilities/               # Miscellaneous helpers including fractal generators and network/game theory tools
-```
+- `src/finance`: market simulation, analytics, econometrics, and corporate finance utilities.
+- `src/machine_learning`: classical ML, deep learning, NLP, state-space, time-series, and O(1) stack experiments.
+- `src/attention`: custom attention, fast attention, and Sera variants.
+- `src/compiler_and_systems`: LLVM/PTX, GPU, native, and simulation experiments.
+- `src/cryptography`: SymPLONK-style notes and utilities.
+- `src/quantum`: minimal gate simulation utilities.
+- `src/rendering`: rendering experiments and checked-in visual artifacts.
+- `src/utilities`: constant-time algorithms, fractals, graph/network utilities, and misc helpers.
+- `docs`: indexed research notes. Start with `docs/README.md`.
+- `tests`: pytest coverage for finance, utilities, compiler/system simulation, and cryptography.
 
-Every directory contains an `__init__.py` so modules can be imported directly (for example, `from finance.market_simulation import market_model`).  The repository is intentionally broad; there is no single entry point, so consult individual modules for details and example usage.
+## Quickstart
 
-## Getting Started
-
-1. Ensure you are using Python 3.9+.
-2. Add the project to your module search path, e.g. `export PYTHONPATH="$(pwd)/src:$PYTHONPATH"`.
-3. Import the modules you need inside your own scripts or interactive sessions.
+1. Create and activate a Python 3.9+ virtual environment.
+2. Install development dependencies with `python -m pip install -r requirements-dev.txt`.
+3. Add `src` to `PYTHONPATH`.
+   - PowerShell: `$env:PYTHONPATH = "$PWD/src"`
+   - Bash: `export PYTHONPATH="$(pwd)/src:${PYTHONPATH}"`
+4. Run `python -m pytest` from the repository root.
 
 ## Documentation
 
-Detailed usage notes for the market simulation utilities are available in
-`docs/market_simulation.md`.
+Use `docs/README.md` as the entry point for the research notes.
+Useful starting points:
+
+- `docs/unit-08-market-simulation.md`
+- `docs/TCM-Core.md`
+- `docs/SDPR.md`
+- `docs/VEEN001.md`
 
 ## Testing
 
-The test suite currently covers the market simulation utilities, including the
-analytics helpers introduced in the latest update.
+Current tests exercise:
 
-```
-pytest
-```
+- finance market simulation and statistics helpers
+- constant-time differentiation and periodic convolution utilities
+- hypercube CPU and assembler simulation
+- SymPLONK serialization and validation behavior
 
-Run tests from the repository root after setting `PYTHONPATH` as shown above.
+Some modules remain exploratory and do not yet have dedicated tests.
+
+## Notes
+
+- Some filenames are historical and have not been normalized yet.
+- Several directories mix polished modules with active experiments; use the docs index when orienting yourself for the first time.
